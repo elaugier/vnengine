@@ -1,0 +1,23 @@
+[package]
+name = "vnengine-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vnengine-core = { workspace = true }
+vnengine-script = { workspace = true }
+vnengine-render = { workspace = true }
+vnengine-audio = { workspace = true }
+glyphon = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+gilrs = { workspace = true }
+glam = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+pollster = { workspace = true }
+parking_lot = { workspace = true }
+ahash = { workspace = true }
+chrono = "0.4"
+serde_json = { workspace = true }

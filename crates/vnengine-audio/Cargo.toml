@@ -1,0 +1,11 @@
+[package]
+name = "vnengine-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vnengine-core = { workspace = true }
+kira = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }

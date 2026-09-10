@@ -1,0 +1,21 @@
+title = "vnengine Demo"
+width = 1280
+height = 720
+fullscreen = false
+vsync = true
+entry_script = "script/main.vn"
+image_dir = "images"
+audio_dir = "audio"
+voice_dir = "voice"
+save_dir = "saves"
+text_speed = 40.0
+
+[[characters]]
+id = "e"
+name = "Eileen"
+color = [1.0, 0.2, 0.2]
+
+[[characters]]
+id = "n"
+name = "Narrator"
+color = [0.8, 0.8, 0.8]

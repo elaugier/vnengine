@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vnengine-core",
+    "crates/vnengine-script",
+    "crates/vnengine-render",
+    "crates/vnengine-audio",
+    "crates/vnengine-app",
+    "crates/vnengine-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["vnengine contributors"]
+repository = "https://github.com/example/vnengine"
+
+[workspace.dependencies]
+# Rendering
+wgpu = { version = "30", features = ["wgsl"] }
+winit = "0.30"
+glyphon = "0.12"
+bytemuck = { version = "1.25", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+glam = "0.33"
+
+# Audio
+kira = "0.12"
+
+# Input
+gilrs = "0.11"
+
+# Serialization / data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors / logging
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+
+# Misc
+pollster = "1"
+clap = { version = "4", features = ["derive"] }
+parking_lot = "0.12"
+ahash = "0.8"
+
+# Internal crates
+vnengine-core = { path = "crates/vnengine-core" }
+vnengine-script = { path = "crates/vnengine-script" }
+vnengine-render = { path = "crates/vnengine-render" }
+vnengine-audio = { path = "crates/vnengine-audio" }
+vnengine-app = { path = "crates/vnengine-app" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

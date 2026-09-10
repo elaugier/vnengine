@@ -1,0 +1,19 @@
+[package]
+name = "vnengine-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vnengine"
+path = "src/main.rs"
+
+[dependencies]
+vnengine-core = { workspace = true }
+vnengine-app = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+pollster = { workspace = true }
+toml = "0.8"

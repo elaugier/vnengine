@@ -1,0 +1,219 @@
+# vnengine demo script
+# A short visual novel demonstrating dialogue, choices, branches,
+# variables, audio, transitions, and multiple characters.
+
+define e = Character("Eileen", color = "#ff4040")
+define r = Character("Ren", color = "#4080ff")
+define n = Character("Narrator", color = "#cccccc")
+
+label start:
+    scene bg school with dissolve 1.5
+    play music "bgm_school.ogg" fade 2.0
+    n "The sun was setting over Sakura High, painting everything in gold."
+    n "A gentle breeze carried the scent of cherry blossoms through the air."
+    play sfx "sfx_wind.ogg" volume 0.6
+    n "I was running late, as usual."
+    n "Eileen had texted me to meet her after class, but the teacher kept us behind."
+    pause 1.0
+    n "When I finally reached the school gate, she was already there."
+
+    show eileen happy at center with dissolve
+    e "Hey! You're finally here."
+    e "I've been waiting for you, you know."
+    play sfx "sfx_footstep.ogg" volume 0.8
+    n "She bounced on her heels, her smile bright despite the wait."
+    $ met_eileen = True
+
+    menu:
+        "Sorry I'm late! The teacher kept us.":
+            $ apology = True
+            show eileen surprised at center
+            e "The teacher? Again?"
+            e "You should learn to sneak out like I do."
+            show eileen happy at center
+            e "It's okay though. I'm just glad you came."
+            jump talk
+        "I got held up. It wasn't my fault.":
+            $ apology = False
+            show eileen thinking at center
+            e "Hmm... you always have an excuse, don't you?"
+            e "Well, I'll let it slide this time."
+            show eileen happy at center
+            e "Just don't make a habit of it!"
+            jump talk
+
+label talk:
+    e "So, what do you want to do today?"
+    n "She looked at me expectantly, her eyes sparkling in the evening light."
+    menu:
+        "Let's go to the library.":
+            $ went_library = True
+            jump library
+        "Let's watch the sunset from the rooftop.":
+            $ went_library = False
+            jump sunset
+        "Actually, I need to head home.":
+            $ went_library = False
+            $ went_home = True
+            jump home
+
+label library:
+    stop music fade 1.5
+    scene bg library with dissolve 1.0
+    play music "bgm_library.ogg" fade 2.0
+    n "The library was quiet, the air thick with the smell of old books."
+    n "Dust motes floated in the golden light streaming through the windows."
+    play sfx "sfx_door.ogg" volume 0.7
+    show eileen thinking at left
+    e "I love this place. It's so peaceful."
+    e "Do you come here often?"
+    n "She traced her finger along a row of book spines, lost in thought."
+
+    menu:
+        "All the time. It's my favorite spot.":
+            show eileen happy at left
+            e "Really? Maybe we should come here together more often."
+            $ eileen_affection = 2
+        "Not really. I prefer being outside.":
+            show eileen thinking at left
+            e "I see. Well, maybe I can change your mind."
+            $ eileen_affection = 0
+        "Only when I need to study for exams.":
+            show eileen surprised at left
+            e "So practical! You're so different from me."
+            $ eileen_affection = 1
+
+    n "We found a quiet corner and sat down across from each other."
+    show eileen happy at left
+    e "You know, I don't usually invite people here."
+    e "This is kind of my secret spot."
+
+    if apology:
+        e "I forgive you for being late, by the way."
+        e "I know the teacher can be tough sometimes."
+    else:
+        e "Don't worry about earlier. It doesn't matter."
+        e "I'm just happy we're here now."
+
+    n "We spent the afternoon reading in comfortable silence."
+    n "The sound of pages turning was the only thing breaking the stillness."
+    pause 1.5
+    n "Before we knew it, the library was closing."
+    play sfx "sfx_door.ogg" volume 0.7
+    jump ending
+
+label sunset:
+    stop music fade 1.5
+    scene bg rooftop with dissolve 1.0
+    play music "bgm_rooftop.ogg" fade 2.0
+    n "We climbed the stairs to the rooftop, the city spreading out beneath us."
+    n "The sky was a canvas of orange, pink, and deep purple."
+    show eileen happy at center
+    e "Isn't it beautiful?"
+    e "I could stay up here forever."
+    n "She leaned against the railing, her hair catching the last light."
+
+    menu:
+        "It's stunning. Thank you for bringing me.":
+            show eileen happy at center
+            e "I'm glad you like it."
+            e "I wanted to share this with someone special."
+            $ eileen_affection = 2
+        "The view is nice, but it's kind of windy.":
+            show eileen thinking at center
+            e "You're always so practical."
+            e "Can't you just enjoy the moment?"
+            $ eileen_affection = 0
+        "I prefer the library, honestly.":
+            show eileen surprised at center
+            e "What? The sunset is right there!"
+            e "You're hopeless, you know that?"
+            $ eileen_affection = -1
+
+    n "The sky turned from gold to pink to deep purple."
+    n "The first stars began to appear, faint but persistent."
+    show eileen thinking at center
+    e "Hey... can I ask you something?"
+
+    if apology:
+        e "Thank you for being here with me."
+        e "Even after you were late, you still came."
+    else:
+        e "You always know how to make me happy."
+        e "Even when you're difficult, I enjoy your company."
+
+    n "The moment felt fragile, like it could shatter at any second."
+    pause 1.5
+    n "But it was perfect."
+    jump ending
+
+label home:
+    stop music fade 1.5
+    scene bg street with dissolve 1.0
+    play music "bgm_rooftop.ogg" fade 2.0
+    n "I turned to leave, but something made me hesitate."
+    show eileen thinking at center
+    e "Oh... you're leaving already?"
+    e "I was hoping we could spend some time together."
+    play sfx "sfx_phone.ogg" volume 0.8
+    n "My phone buzzed in my pocket. I ignored it."
+
+    menu:
+        "Actually, maybe I can stay a bit longer.":
+            show eileen happy at center
+            e "Really? You mean it?"
+            e "Great! Let's go to the rooftop. The sunset is amazing."
+            $ eileen_affection = 1
+            jump sunset
+        "I really have to go. Sorry, Eileen.":
+            show eileen sad at center
+            e "I understand. Family comes first."
+            e "Text me when you get home, okay?"
+            $ eileen_affection = -1
+            n "She waved as I walked away, her smile fading."
+            jump ending_sad
+
+label ending:
+    stop music fade 2.0
+    scene bg black with fade 2.0
+    play music "bgm_ending.ogg" fade 3.0
+    pause 1.0
+
+    if eileen_affection >= 2:
+        n "That day marked the beginning of something new."
+        n "Eileen and I grew closer with each passing week."
+        n "The library became our place, the rooftop our secret."
+        n "And the sunset we shared that evening..."
+        n "...was the first of many."
+        n ""
+        n "THE END - True Ending"
+    elif eileen_affection >= 0:
+        n "That day was one I wouldn't soon forget."
+        n "Eileen and I remained friends, though nothing more."
+        n "Sometimes I wonder what would have happened if I'd made different choices."
+        n ""
+        n "THE END - Normal Ending"
+    else:
+        n "That day ended quietly."
+        n "Eileen and I drifted apart after that."
+        n "I sometimes see her in the hallway, but we only nod."
+        n "Some moments only come once."
+        n ""
+        n "THE END - Bad Ending"
+
+    pause 2.0
+    end
+
+label ending_sad:
+    stop music fade 2.0
+    scene bg black with fade 2.0
+    play music "bgm_ending.ogg" fade 3.0
+    n "I walked home alone that evening."
+    n "The streetlights flickered on one by one as the sun disappeared."
+    n "I couldn't help but feel I'd missed something important."
+    n "Maybe next time, I told myself."
+    n "Maybe next time."
+    n ""
+    n "THE END - Lonely Ending"
+    pause 2.0
+    end

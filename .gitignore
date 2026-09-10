@@ -1,0 +1,7 @@
+/target
+/demo/saves
+*.png
+*.jpg
+*.ogg
+*.wav
+*.mp3
