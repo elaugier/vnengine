@@ -47,6 +47,12 @@ pub enum Token {
     Stop,
     Voice,
     Set,     // `set` keyword (unused alias for `$`)
+    Default, // `default` keyword
+    While,   // `while` keyword
+    For,     // `for` keyword
+    In,      // `in` keyword (for loops)
+    Def,     // `def` keyword (user functions)
+    Transform, // `transform` keyword
     End,
     // Literals
     Ident(String),
@@ -55,6 +61,11 @@ pub enum Token {
     FloatLit(f64),
     // Operators / punctuation
     Assign,    // =
+    PlusAssign,  // +=
+    MinusAssign, // -=
+    StarAssign,  // *=
+    SlashAssign, // /=
+    PercentAssign, // %=
     Eq,        // ==
     Neq,       // !=
     Lt,
@@ -309,6 +320,12 @@ impl<'a> Lexer<'a> {
                     "stop" => Token::Stop,
                     "voice" => Token::Voice,
                     "set" => Token::Set,
+                    "default" => Token::Default,
+                    "while" => Token::While,
+                    "for" => Token::For,
+                    "in" => Token::In,
+                    "def" => Token::Def,
+                    "transform" => Token::Transform,
                     "end" => Token::End,
                     "and" => Token::And,
                     "or" => Token::Or,
@@ -338,6 +355,11 @@ impl<'a> Lexer<'a> {
                     "!=" => Some(Token::Neq),
                     "<=" => Some(Token::Le),
                     ">=" => Some(Token::Ge),
+                    "+=" => Some(Token::PlusAssign),
+                    "-=" => Some(Token::MinusAssign),
+                    "*=" => Some(Token::StarAssign),
+                    "/=" => Some(Token::SlashAssign),
+                    "%=" => Some(Token::PercentAssign),
                     _ => None,
                 };
                 if let Some(tok) = tok {

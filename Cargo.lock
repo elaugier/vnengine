@@ -3063,6 +3063,7 @@ dependencies = [
  "gilrs",
  "glam",
  "glyphon",
+ "image",
  "log",
  "parking_lot",
  "pollster",

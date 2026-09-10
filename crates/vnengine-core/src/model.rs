@@ -6,6 +6,20 @@
 use crate::command::{Anchor, SpriteSpec};
 use serde::{Deserialize, Serialize};
 
+/// Rendering layer for organizing sprites.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Layer {
+    /// Background layer (behind everything).
+    #[default]
+    Background,
+    /// Midground layer (behind characters).
+    Midground,
+    /// Foreground layer (characters/sprites).
+    Foreground,
+    /// Overlay layer (in front of everything).
+    Overlay,
+}
+
 /// A sprite currently displayed on screen.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSprite {
@@ -19,6 +33,10 @@ pub struct ActiveSprite {
     pub opacity: f32,
     /// Current pixel offset used for transitions (slide).
     pub offset: [f32; 2],
+    /// Rotation in radians (ATL transform).
+    pub rotation: f32,
+    /// Which layer this sprite belongs to.
+    pub layer: Layer,
 }
 
 impl From<&SpriteSpec> for ActiveSprite {
@@ -32,6 +50,8 @@ impl From<&SpriteSpec> for ActiveSprite {
             z: s.z.unwrap_or(0),
             opacity: 1.0,
             offset: [0.0, 0.0],
+            rotation: 0.0,
+            layer: Layer::Foreground,
         }
     }
 }
@@ -46,7 +66,7 @@ pub struct Scene {
     /// Previous background kept around during a transition.
     pub prev_background: Option<String>,
     pub prev_bg_opacity: f32,
-    /// Sprites currently on screen, sorted by z ascending.
+    /// Sprites currently on screen, sorted by layer then z.
     pub sprites: Vec<ActiveSprite>,
 }
 
@@ -57,10 +77,12 @@ impl Scene {
         // Preserve transition opacity if replacing the same character.
         if let Some(existing) = self.sprites.iter().find(|s| s.character == spec.character) {
             active.opacity = existing.opacity;
+            active.layer = existing.layer;
+            active.rotation = existing.rotation;
         }
         self.sprites.retain(|s| s.character != spec.character);
         self.sprites.push(active);
-        self.sprites.sort_by_key(|s| s.z);
+        self.sprites.sort_by_key(|s| (s.layer, s.z));
     }
 
     /// Remove a character's sprite.
@@ -79,6 +101,11 @@ impl Scene {
 
     pub fn sprite_mut(&mut self, character: &str) -> Option<&mut ActiveSprite> {
         self.sprites.iter_mut().find(|s| s.character == character)
+    }
+
+    /// Get all sprites on a specific layer.
+    pub fn sprites_on_layer(&self, layer: Layer) -> impl Iterator<Item = &ActiveSprite> {
+        self.sprites.iter().filter(move |s| s.layer == layer)
     }
 }
 

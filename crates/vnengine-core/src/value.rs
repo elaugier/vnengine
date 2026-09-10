@@ -11,6 +11,7 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -21,6 +22,7 @@ impl Value {
             Value::Int(i) => *i != 0,
             Value::Float(f) => *f != 0.0,
             Value::Str(s) => !s.is_empty(),
+            Value::List(items) => !items.is_empty(),
         }
     }
 
@@ -48,6 +50,17 @@ impl Value {
             Value::Float(f) => Some(f.to_string()),
             Value::Bool(b) => Some(b.to_string()),
             Value::None => Some("None".to_string()),
+            Value::List(items) => Some(format!(
+                "[{}]",
+                items.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+            )),
+        }
+    }
+
+    pub fn as_list(&self) -> Option<&Vec<Value>> {
+        match self {
+            Value::List(items) => Some(items),
+            _ => None,
         }
     }
 }
@@ -60,6 +73,16 @@ impl fmt::Display for Value {
             Value::Int(i) => write!(f, "{i}"),
             Value::Float(n) => write!(f, "{n}"),
             Value::Str(s) => write!(f, "{s}"),
+            Value::List(items) => {
+                write!(f, "[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }

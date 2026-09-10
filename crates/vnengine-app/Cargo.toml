@@ -21,3 +21,4 @@ parking_lot = { workspace = true }
 ahash = { workspace = true }
 chrono = "0.4"
 serde_json = { workspace = true }
+image = { workspace = true }

@@ -87,6 +87,8 @@ pub struct Vm {
     pub character_colors: HashMap<String, [f32; 3]>,
     /// Defined constants.
     pub constants: HashMap<String, Value>,
+    /// Counter for unique synthetic label names.
+    synth_counter: u64,
 }
 
 impl Vm {
@@ -97,6 +99,7 @@ impl Vm {
             character_names: HashMap::new(),
             character_colors: HashMap::new(),
             constants: HashMap::new(),
+            synth_counter: 0,
         };
         vm.process_definitions();
         vm
@@ -109,7 +112,7 @@ impl Vm {
         vm
     }
 
-    fn process_definitions(&mut self) {
+    pub fn process_definitions(&mut self) {
         for def in &self.script.definitions.clone() {
             match def {
                 Definition::Character { id, name, color } => {
@@ -122,6 +125,15 @@ impl Vm {
                     if let Ok(v) = eval_expr(value, &self.constants) {
                         self.constants.insert(id.clone(), v);
                     }
+                }
+            }
+        }
+        // Process top-level `default` statements: only set if the variable
+        // doesn't already exist (important for save/load restoration).
+        for d in &self.script.defaults.clone() {
+            if !self.state.variables.contains_key(&d.name) {
+                if let Ok(v) = eval_expr(&d.value, &self.state.variables) {
+                    self.state.variables.insert(d.name.clone(), v);
                 }
             }
         }
@@ -343,6 +355,7 @@ impl Vm {
                 text,
                 voice,
             } => {
+                let text = interpolate_text(&text, &self.state.variables);
                 if let Some(id) = &speaker {
                     let speaker_name = self.character_names.get(id).cloned();
                     Ok(ExecOutcome::Command(Command::Say {
@@ -355,6 +368,7 @@ impl Vm {
                 }
             }
             Stmt::Menu { prompt, choices } => {
+                let prompt = prompt.map(|p| interpolate_text(&p, &self.state.variables));
                 let mut filtered = Vec::new();
                 let mut ast_choices = Vec::new();
                 for c in choices {
@@ -365,13 +379,14 @@ impl Vm {
                         None => true,
                     };
                     if selectable {
+                        let interp_text = interpolate_text(&c.text, &self.state.variables);
                         ast_choices.push(MenuChoiceAst {
-                            text: c.text.clone(),
+                            text: interp_text.clone(),
                             condition: None,
                             body: c.body.clone(),
                         });
                         filtered.push(MenuChoice {
-                            text: c.text,
+                            text: interp_text,
                             condition: None,
                         });
                     }
@@ -441,6 +456,290 @@ impl Vm {
                 self.state.variables.insert(name, v);
                 Ok(ExecOutcome::Continue)
             }
+            Stmt::AssignOp { name, op, value } => {
+                let current = self
+                    .state
+                    .variables
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| format!("undefined variable `{name}` for compound assignment"))?;
+                let rhs = eval_expr(&value, &self.state.variables)
+                    .map_err(|e| format!("assignment error: {e}"))?;
+                let result = eval_binop(op, current, rhs)?;
+                self.state.variables.insert(name, result);
+                Ok(ExecOutcome::Continue)
+            }
+            Stmt::Default { name, value } => {
+                // Only assign if the variable doesn't already exist.
+                if !self.state.variables.contains_key(&name) {
+                    let v = eval_expr(&value, &self.state.variables)
+                        .map_err(|e| format!("default error: {e}"))?;
+                    self.state.variables.insert(name, v);
+                }
+                Ok(ExecOutcome::Continue)
+            }
+            Stmt::Transform { character, rotation, scale, offset, opacity, layer } => {
+                let mut cmd = Command::Transform {
+                    character: character.clone(),
+                    rotation: None,
+                    scale: None,
+                    offset: None,
+                    opacity: None,
+                    layer: None,
+                };
+                if let Some(r) = rotation {
+                    let v = eval_expr(&r, &self.state.variables)
+                        .map_err(|e| format!("transform error: {e}"))?;
+                    if let Some(f) = v.as_float() {
+                        cmd = match cmd {
+                            Command::Transform { character, scale, offset, opacity, layer, .. } => {
+                                Command::Transform {
+                                    character,
+                                    rotation: Some(f as f32),
+                                    scale,
+                                    offset,
+                                    opacity,
+                                    layer,
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+                if let Some(s) = scale {
+                    let v = eval_expr(&s, &self.state.variables)
+                        .map_err(|e| format!("transform error: {e}"))?;
+                    if let Some(f) = v.as_float() {
+                        cmd = match cmd {
+                            Command::Transform { character, rotation, offset, opacity, layer, .. } => {
+                                Command::Transform {
+                                    character,
+                                    rotation,
+                                    scale: Some(f as f32),
+                                    offset,
+                                    opacity,
+                                    layer,
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+                if let Some(o) = opacity {
+                    let v = eval_expr(&o, &self.state.variables)
+                        .map_err(|e| format!("transform error: {e}"))?;
+                    if let Some(f) = v.as_float() {
+                        cmd = match cmd {
+                            Command::Transform { character, rotation, scale, offset, layer, .. } => {
+                                Command::Transform {
+                                    character,
+                                    rotation,
+                                    scale,
+                                    offset,
+                                    opacity: Some(f as f32),
+                                    layer,
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+                if let Some((x, y)) = offset {
+                    let xv = eval_expr(&x, &self.state.variables)
+                        .map_err(|e| format!("transform error: {e}"))?;
+                    let yv = eval_expr(&y, &self.state.variables)
+                        .map_err(|e| format!("transform error: {e}"))?;
+                    if let (Some(xf), Some(yf)) = (xv.as_float(), yv.as_float()) {
+                        cmd = match cmd {
+                            Command::Transform { character, rotation, scale, opacity, layer, .. } => {
+                                Command::Transform {
+                                    character,
+                                    rotation,
+                                    scale,
+                                    offset: Some((xf as f32, yf as f32)),
+                                    opacity,
+                                    layer,
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+                if let Some(l) = layer {
+                    let layer_val = match l.as_str() {
+                        "background" => vnengine_core::Layer::Background,
+                        "midground" => vnengine_core::Layer::Midground,
+                        "foreground" => vnengine_core::Layer::Foreground,
+                        "overlay" => vnengine_core::Layer::Overlay,
+                        _ => vnengine_core::Layer::Foreground,
+                    };
+                    cmd = match cmd {
+                        Command::Transform { character, rotation, scale, offset, opacity, .. } => {
+                            Command::Transform {
+                                character,
+                                rotation,
+                                scale,
+                                offset,
+                                opacity,
+                                layer: Some(layer_val),
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                }
+                Ok(ExecOutcome::Command(cmd))
+            }
+            Stmt::While { cond, body } => {
+                // Check condition. If true, push body as a synthetic label
+                // and execute it. When the body finishes, it jumps back to
+                // a check label that re-evaluates the While.
+                if eval_expr(&cond, &self.state.variables)
+                    .map(|v| v.is_truthy())
+                    .unwrap_or(false)
+                {
+                    let id = self.synth_counter;
+                    self.synth_counter += 1;
+                    let label_name = format!("__while_{}", id);
+                    let check_label = format!("__while_check_{}", id);
+                    // Check label re-evaluates the while.
+                    self.script.labels.push(Label {
+                        name: check_label.clone(),
+                        body: vec![Stmt::While {
+                            cond: cond.clone(),
+                            body: body.clone(),
+                        }],
+                    });
+                    // Body label: body + jump back to check.
+                    let mut full_body = body.clone();
+                    full_body.push(Stmt::Jump {
+                        label: check_label,
+                    });
+                    self.script.labels.push(Label {
+                        name: label_name.clone(),
+                        body: full_body,
+                    });
+                    // Use Call outcome so the body frame is pushed without
+                    // the step loop incrementing the body's stmt counter.
+                    return Ok(ExecOutcome::Call(label_name));
+                }
+                Ok(ExecOutcome::Continue)
+            }
+            Stmt::For { var, iterable, body } => {
+                // Check if this is a continuation (re-entry from check label).
+                // We scan for a continuation marker that was set during first entry.
+                let mut cont_id: Option<u64> = None;
+                for (key, val) in &self.state.variables {
+                    if let Some(rest) = key.strip_prefix("__for_continue_") {
+                        if val.is_truthy() {
+                            if let Ok(id) = rest.parse::<u64>() {
+                                cont_id = Some(id);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(id) = cont_id {
+                    // Continuation: advance the index.
+                    let items_key = format!("__for_{}_items", id);
+                    let idx_key = format!("__for_{}_idx", id);
+                    let cont_key = format!("__for_continue_{}", id);
+                    let items = match self.state.variables.get(&items_key) {
+                        Some(Value::List(items)) => items.clone(),
+                        _ => return Ok(ExecOutcome::Continue),
+                    };
+                    let idx = match self.state.variables.get(&idx_key) {
+                        Some(Value::Int(i)) => *i,
+                        _ => 0,
+                    };
+                    let next_idx = idx + 1;
+                    if next_idx >= items.len() as i64 {
+                        // Loop done — clean up and continue.
+                        self.state.variables.remove(&items_key);
+                        self.state.variables.remove(&idx_key);
+                        self.state.variables.remove(&cont_key);
+                        return Ok(ExecOutcome::Continue);
+                    }
+                    // Update index and loop variable.
+                    self.state
+                        .variables
+                        .insert(idx_key, Value::Int(next_idx));
+                    self.state
+                        .variables
+                        .insert(var.clone(), items[next_idx as usize].clone());
+                    // Push body frame again using Call.
+                    let body_id = self.synth_counter;
+                    self.synth_counter += 1;
+                    let label_name = format!("__for_body_{}", body_id);
+                    let current_label = self
+                        .state
+                        .stack
+                        .last()
+                        .map(|f| f.label.clone())
+                        .unwrap_or_default();
+                    let mut full_body = body.clone();
+                    full_body.push(Stmt::Jump {
+                        label: current_label,
+                    });
+                    self.script.labels.push(Label {
+                        name: label_name.clone(),
+                        body: full_body,
+                    });
+                    return Ok(ExecOutcome::Call(label_name));
+                }
+
+                // First entry: evaluate the iterable.
+                let iter_val = eval_expr(&iterable, &self.state.variables)
+                    .map_err(|e| format!("for loop error: {e}"))?;
+                let items: Vec<Value> = match &iter_val {
+                    Value::List(items) => items.clone(),
+                    _ => return Err("for loop iterable must be a list".into()),
+                };
+                if items.is_empty() {
+                    return Ok(ExecOutcome::Continue);
+                }
+
+                let id = self.synth_counter;
+                self.synth_counter += 1;
+                // Set the loop variable to the first item.
+                self.state.variables.insert(var.clone(), items[0].clone());
+                // Store items and index.
+                self.state
+                    .variables
+                    .insert(format!("__for_{}_items", id), Value::List(items));
+                self.state
+                    .variables
+                    .insert(format!("__for_{}_idx", id), Value::Int(0));
+
+                // Create check label.
+                let check_label = format!("__for_check_{}", id);
+                self.script.labels.push(Label {
+                    name: check_label.clone(),
+                    body: vec![Stmt::For {
+                        var: var.clone(),
+                        iterable: iterable.clone(),
+                        body: body.clone(),
+                    }],
+                });
+                // Mark continuation for the check label.
+                self.state
+                    .variables
+                    .insert(format!("__for_continue_{}", id), Value::Bool(true));
+
+                // Body label: body + jump back to check.
+                let body_id = self.synth_counter;
+                self.synth_counter += 1;
+                let label_name = format!("__for_body_{}", body_id);
+                let mut full_body = body.clone();
+                full_body.push(Stmt::Jump {
+                    label: check_label,
+                });
+                self.script.labels.push(Label {
+                    name: label_name.clone(),
+                    body: full_body,
+                });
+                return Ok(ExecOutcome::Call(label_name));
+            }
             Stmt::End => {
                 self.state.finished = true;
                 Ok(ExecOutcome::Command(Command::End))
@@ -475,6 +774,32 @@ pub fn eval_expr(expr: &Expr, vars: &HashMap<String, Value>) -> Result<Value, St
         Expr::Float(f) => Value::Float(*f),
         Expr::Bool(b) => Value::Bool(*b),
         Expr::None => Value::None,
+        Expr::List(items) => {
+            let mut vals = Vec::new();
+            for item in items {
+                vals.push(eval_expr(item, vars)?);
+            }
+            Value::List(vals)
+        }
+        Expr::Index { collection, index } => {
+            let coll = eval_expr(collection, vars)?;
+            let idx = eval_expr(index, vars)?;
+            match (&coll, &idx) {
+                (Value::List(items), Value::Int(i)) => {
+                    if *i < 0 || *i as usize >= items.len() {
+                        return Err(format!("list index out of range: {i}"));
+                    }
+                    items[*i as usize].clone()
+                }
+                (Value::Str(s), Value::Int(i)) => {
+                    if *i < 0 || *i as usize >= s.len() {
+                        return Err(format!("string index out of range: {i}"));
+                    }
+                    Value::Str(s.chars().nth(*i as usize).unwrap_or_default().to_string())
+                }
+                _ => return Err("cannot index non-collection".into()),
+            }
+        }
         Expr::UnaryOp { op, operand } => {
             let v = eval_expr(operand, vars)?;
             match op {
@@ -505,6 +830,11 @@ fn eval_binop(op: BinaryOp, l: Value, r: Value) -> Result<Value, String> {
             (Value::Str(a), Value::Str(b)) => Value::Str(a + &b),
             (Value::Str(a), other) => Value::Str(a + &other.as_str().unwrap_or_default()),
             (other, Value::Str(b)) => Value::Str(other.as_str().unwrap_or_default() + &b),
+            (Value::List(a), Value::List(b)) => {
+                let mut combined = a;
+                combined.extend(b);
+                Value::List(combined)
+            }
             _ => return Err("invalid operands for `+`".into()),
         },
         Sub => num_op(l, r, |a, b| a - b, |a, b| a - b)?,
@@ -559,4 +889,53 @@ fn cmp(l: &Value, r: &Value) -> Result<std::cmp::Ordering, String> {
         (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
         _ => Err("cannot compare these values".into()),
     }
+}
+
+/// Replace `[var_name]` references in a text string with variable values.
+/// `[[` produces a literal `[` and `]]` produces a literal `]`.
+pub fn interpolate_text(text: &str, vars: &HashMap<String, Value>) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '[' {
+            // Escaped: [[ → [
+            if i + 1 < chars.len() && chars[i + 1] == '[' {
+                out.push('[');
+                i += 2;
+                continue;
+            }
+            // Find closing ]
+            if let Some(close) = chars[i + 1..].iter().position(|&c| c == ']') {
+                let name: String = chars[i + 1..i + 1 + close].iter().collect();
+                let name = name.trim();
+                if let Some(val) = vars.get(name) {
+                    out.push_str(&val.to_string());
+                } else {
+                    // Unknown variable: leave as-is
+                    out.push('[');
+                    out.push_str(name);
+                    out.push(']');
+                }
+                i += 1 + close + 1;
+            } else {
+                // No closing bracket: literal
+                out.push('[');
+                i += 1;
+            }
+        } else if chars[i] == ']' {
+            // Escaped: ]] → ]
+            if i + 1 < chars.len() && chars[i + 1] == ']' {
+                out.push(']');
+                i += 2;
+                continue;
+            }
+            out.push(']');
+            i += 1;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }

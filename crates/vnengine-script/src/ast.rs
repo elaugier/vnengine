@@ -7,8 +7,17 @@ use serde::{Deserialize, Serialize};
 pub struct Script {
     /// Top-level definitions (characters, constants).
     pub definitions: Vec<Definition>,
+    /// Top-level `default` statements.
+    pub defaults: Vec<DefaultStmt>,
     /// Labels keyed by name.
     pub labels: Vec<Label>,
+}
+
+/// A `default <name> = <expr>` declaration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefaultStmt {
+    pub name: String,
+    pub value: Expr,
 }
 
 impl Script {
@@ -100,6 +109,23 @@ pub enum Stmt {
     StopVoice,
     /// `$ <name> = <expr>` or `set <name> = <expr>`
     Assign { name: String, value: Expr },
+    /// `$ <name> += <expr>` etc.
+    AssignOp { name: String, op: BinaryOp, value: Expr },
+    /// `default <name> = <expr>` — only assigns if the variable doesn't exist.
+    Default { name: String, value: Expr },
+    /// `while <cond>: <body>`
+    While { cond: Expr, body: Vec<Stmt> },
+    /// `for <var> in <iterable>: <body>`
+    For { var: String, iterable: Expr, body: Vec<Stmt> },
+    /// `transform <character> <props>`
+    Transform {
+        character: String,
+        rotation: Option<Expr>,
+        scale: Option<Expr>,
+        offset: Option<(Expr, Expr)>,
+        opacity: Option<Expr>,
+        layer: Option<String>,
+    },
     /// `end`
     End,
 }
@@ -141,6 +167,10 @@ pub enum Expr {
     Float(f64),
     Bool(bool),
     None,
+    /// List literal: `[expr, expr, ...]`
+    List(Vec<Expr>),
+    /// Index access: `expr[expr]`
+    Index { collection: Box<Expr>, index: Box<Expr> },
     UnaryOp { op: UnaryOp, operand: Box<Expr> },
     BinaryOp {
         op: BinaryOp,

@@ -91,6 +91,15 @@ pub enum Command {
     PlayTransition(Transition),
     /// Shake the screen for dramatic effect.
     Shake { intensity: f32, duration: f32 },
+    /// Apply a transform to a sprite (ATL-style).
+    Transform {
+        character: String,
+        rotation: Option<f32>,
+        scale: Option<f32>,
+        offset: Option<(f32, f32)>,
+        opacity: Option<f32>,
+        layer: Option<crate::model::Layer>,
+    },
     /// Notify the engine that a CG image was shown (for the gallery).
     RegisterCg { image: String },
     /// Set a global variable.

@@ -18,10 +18,14 @@ mod tests {
 
     #[test]
     fn input_function_keys() {
-        assert_eq!(key_to_action(KeyCode::F5), Some(Action::Save));
-        assert_eq!(key_to_action(KeyCode::F9), Some(Action::Load));
+        assert_eq!(key_to_action(KeyCode::F5), Some(Action::QuickSave));
+        assert_eq!(key_to_action(KeyCode::F9), Some(Action::QuickLoad));
+        assert_eq!(key_to_action(KeyCode::F6), Some(Action::Save));
+        assert_eq!(key_to_action(KeyCode::F7), Some(Action::Load));
         assert_eq!(key_to_action(KeyCode::F11), Some(Action::Fullscreen));
         assert_eq!(key_to_action(KeyCode::F1), Some(Action::Settings));
+        assert_eq!(key_to_action(KeyCode::F2), Some(Action::Gallery));
+        assert_eq!(key_to_action(KeyCode::F3), Some(Action::Backlog));
     }
 
     #[test]

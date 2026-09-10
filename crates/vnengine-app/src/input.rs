@@ -26,6 +26,28 @@ pub enum Action {
     Settings,
     /// Quit the game.
     Quit,
+    /// Navigate up in menus.
+    Up,
+    /// Navigate down in menus.
+    Down,
+    /// Navigate left in menus.
+    Left,
+    /// Navigate right in menus.
+    Right,
+    /// Open the gallery.
+    Gallery,
+    /// Go back to title screen.
+    Title,
+    /// Quick save.
+    QuickSave,
+    /// Quick load.
+    QuickLoad,
+    /// Open backlog (history).
+    Backlog,
+    /// Rollback (go back in history).
+    Rollback,
+    /// Rollforward.
+    Rollforward,
 }
 
 /// Mouse click position in logical pixels.
@@ -128,13 +150,24 @@ pub fn key_to_action(key: winit::keyboard::KeyCode) -> Option<Action> {
     match key {
         KeyCode::Space | KeyCode::Enter | KeyCode::NumpadEnter => Some(Action::Advance),
         KeyCode::Escape | KeyCode::Backspace => Some(Action::Cancel),
-        KeyCode::F5 => Some(Action::Save),
-        KeyCode::F9 => Some(Action::Load),
+        KeyCode::F5 => Some(Action::QuickSave),
+        KeyCode::F9 => Some(Action::QuickLoad),
+        KeyCode::F6 => Some(Action::Save),
+        KeyCode::F7 => Some(Action::Load),
         KeyCode::F11 => Some(Action::Fullscreen),
         KeyCode::KeyA => Some(Action::AutoAdvance),
         KeyCode::KeyS => Some(Action::Skip),
         KeyCode::F1 => Some(Action::Settings),
+        KeyCode::F2 => Some(Action::Gallery),
+        KeyCode::F3 => Some(Action::Backlog),
         KeyCode::F4 | KeyCode::KeyQ => Some(Action::Quit),
+        KeyCode::ArrowUp => Some(Action::Up),
+        KeyCode::ArrowDown => Some(Action::Down),
+        KeyCode::ArrowLeft => Some(Action::Left),
+        KeyCode::ArrowRight => Some(Action::Right),
+        KeyCode::KeyH => Some(Action::Backlog),
+        KeyCode::PageUp => Some(Action::Rollback),
+        KeyCode::PageDown => Some(Action::Rollforward),
         _ => None,
     }
 }

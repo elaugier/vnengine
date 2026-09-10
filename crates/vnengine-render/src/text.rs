@@ -1,5 +1,6 @@
 //! Text rendering via glyphon (cosmic-text + wgpu).
 
+use crate::richtext::RichSegment;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
@@ -56,6 +57,57 @@ impl TextState {
             ))
             .family(Family::SansSerif);
         buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+    }
+
+    /// Set rich text (with formatting tags already parsed into segments) on a
+    /// buffer. Each segment gets its own attributes (bold, italic, color, etc.).
+    pub fn set_rich_text(
+        &mut self,
+        buffer: &mut Buffer,
+        segments: &[RichSegment],
+        default_color: [f32; 3],
+    ) {
+        use glyphon::{Style, Weight};
+
+        // Build owned strings and attrs list. We need the strings to stay alive
+        // while we pass references to set_rich_text.
+        let default_attrs = Attrs::new()
+            .color(Color::rgb(
+                (default_color[0] * 255.0) as u8,
+                (default_color[1] * 255.0) as u8,
+                (default_color[2] * 255.0) as u8,
+            ))
+            .family(Family::SansSerif);
+
+        // Collect (String, Attrs) pairs.
+        let pairs: Vec<(String, Attrs)> = segments
+            .iter()
+            .map(|seg| {
+                let mut attrs = default_attrs.clone();
+                if seg.bold {
+                    attrs = attrs.weight(Weight::BOLD);
+                }
+                if seg.italic {
+                    attrs = attrs.style(Style::Italic);
+                }
+                if let Some(color) = seg.color {
+                    let r = (color[0] * 255.0) as u8;
+                    let g = (color[1] * 255.0) as u8;
+                    let b = (color[2] * 255.0) as u8;
+                    let a = (color[3] * 255.0) as u8;
+                    attrs = attrs.color(Color::rgba(r, g, b, a));
+                }
+                (seg.text.clone(), attrs)
+            })
+            .collect();
+
+        // Build references for set_rich_text.
+        let refs: Vec<(&str, Attrs)> = pairs
+            .iter()
+            .map(|(s, a)| (s.as_str(), a.clone()))
+            .collect();
+        buffer.set_rich_text(refs, &default_attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut self.font_system, false);
     }
 

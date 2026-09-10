@@ -90,6 +90,11 @@ impl Parser {
                     script.definitions.push(def);
                     idx += 1;
                 }
+                Token::Default => {
+                    let (d, _) = self.parse_default_stmt(&line.tokens, line.line_no)?;
+                    script.defaults.push(d);
+                    idx += 1;
+                }
                 Token::Label => {
                     let (label, consumed) = self.parse_label(&lines[idx..])?;
                     script.labels.push(label);
@@ -152,6 +157,19 @@ impl Parser {
             });
         }
         Ok(lines)
+    }
+
+    /// Parse `default <name> = <expr>`.
+    fn parse_default_stmt(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+    ) -> Result<(DefaultStmt, usize), ParseError> {
+        // toks[0] = Default
+        let name = expect_ident(&toks[1], line_no, "variable name")?;
+        expect_token(&toks[2], Token::Assign, line_no, "=")?;
+        let value = self.parse_expr_tokens(&toks[3..], line_no)?;
+        Ok((DefaultStmt { name, value }, 1))
     }
 
     fn parse_definition(&self, line: &Line) -> Result<Definition, ParseError> {
@@ -278,6 +296,9 @@ impl Parser {
             }
             Token::Return => Ok((Stmt::Return, 1)),
             Token::If => self.parse_if_stmt(lines, indent, line_no),
+            Token::While => self.parse_while_stmt(lines, indent, line_no),
+            Token::For => self.parse_for_stmt(lines, indent, line_no),
+            Token::Transform => self.parse_transform_stmt(lines, indent, line_no),
             Token::Pause => {
                 let expr = self.parse_expr_tokens(&toks[1..], line_no)?;
                 Ok((Stmt::Pause { seconds: expr }, 1))
@@ -289,15 +310,33 @@ impl Parser {
                 Ok((Stmt::PlayVoice { track }, 1))
             }
             Token::End => Ok((Stmt::End, 1)),
+            Token::Default => {
+                let (d, _) = self.parse_default_stmt(toks, line_no)?;
+                Ok((
+                    Stmt::Default {
+                        name: d.name,
+                        value: d.value,
+                    },
+                    1,
+                ))
+            }
             Token::Dollar => {
-                // $ name = expr
+                // $ name = expr  OR  $ name += expr  etc.
                 let name = expect_ident(&toks[1], line_no, "variable name")?;
+                if let Some(op) = compound_assign_op(&toks[2].token) {
+                    let value = self.parse_expr_tokens(&toks[3..], line_no)?;
+                    return Ok((Stmt::AssignOp { name, op, value }, 1));
+                }
                 expect_token(&toks[2], Token::Assign, line_no, "=")?;
                 let value = self.parse_expr_tokens(&toks[3..], line_no)?;
                 Ok((Stmt::Assign { name, value }, 1))
             }
             Token::Set => {
                 let name = expect_ident(&toks[1], line_no, "variable name")?;
+                if let Some(op) = compound_assign_op(&toks[2].token) {
+                    let value = self.parse_expr_tokens(&toks[3..], line_no)?;
+                    return Ok((Stmt::AssignOp { name, op, value }, 1));
+                }
                 expect_token(&toks[2], Token::Assign, line_no, "=")?;
                 let value = self.parse_expr_tokens(&toks[3..], line_no)?;
                 Ok((Stmt::Assign { name, value }, 1))
@@ -663,6 +702,145 @@ impl Parser {
         }, consumed))
     }
 
+    fn parse_while_stmt(
+        &self,
+        lines: &[Line],
+        indent: usize,
+        line_no: usize,
+    ) -> Result<(Stmt, usize), ParseError> {
+        // while <cond>:
+        //     body
+        let first = &lines[0];
+        let cond_toks: Vec<Spanned> = first.tokens[1..]
+            .iter()
+            .take_while(|t| !matches!(t.token, Token::Colon))
+            .cloned()
+            .collect();
+        let cond = self.parse_expr_tokens(&cond_toks, first.line_no)?;
+        expect_token(
+            &first.tokens[1 + cond_toks.len()],
+            Token::Colon,
+            first.line_no,
+            ":",
+        )?;
+        let base_indent = indent;
+        let mut consumed = 1;
+        let body = self.parse_block(lines, base_indent, &mut consumed)?;
+        Ok((Stmt::While { cond, body }, consumed))
+    }
+
+    fn parse_for_stmt(
+        &self,
+        lines: &[Line],
+        indent: usize,
+        line_no: usize,
+    ) -> Result<(Stmt, usize), ParseError> {
+        // for <var> in <iterable>:
+        //     body
+        let first = &lines[0];
+        let var = expect_ident(&first.tokens[1], line_no, "loop variable")?;
+        expect_token(&first.tokens[2], Token::In, line_no, "in")?;
+        let iter_toks: Vec<Spanned> = first.tokens[3..]
+            .iter()
+            .take_while(|t| !matches!(t.token, Token::Colon))
+            .cloned()
+            .collect();
+        let iterable = self.parse_expr_tokens(&iter_toks, first.line_no)?;
+        expect_token(
+            &first.tokens[3 + iter_toks.len()],
+            Token::Colon,
+            first.line_no,
+            ":",
+        )?;
+        let base_indent = indent;
+        let mut consumed = 1;
+        let body = self.parse_block(lines, base_indent, &mut consumed)?;
+        Ok((Stmt::For { var, iterable, body }, consumed))
+    }
+
+    fn parse_transform_stmt(
+        &self,
+        lines: &[Line],
+        _indent: usize,
+        line_no: usize,
+    ) -> Result<(Stmt, usize), ParseError> {
+        // transform <character> prop=value prop=value ...
+        let first = &lines[0];
+        let character = expect_ident(&first.tokens[1], line_no, "character name")?;
+
+        let mut rotation = None;
+        let mut scale = None;
+        let mut offset = None;
+        let mut opacity = None;
+        let mut layer = None;
+
+        let mut i = 2;
+        while i < first.tokens.len() {
+            let prop = expect_ident(&first.tokens[i], line_no, "property name")?;
+            i += 1;
+            if i >= first.tokens.len() {
+                return Err(err(line_no, "expected `=` after property name"));
+            }
+            expect_token(&first.tokens[i], Token::Eq, line_no, "=")?;
+            i += 1;
+
+            // Parse value expression(s) until next property or end of line.
+            let mut value_toks = Vec::new();
+            while i < first.tokens.len() {
+                if matches!(first.tokens[i].token, Token::Ident(_))
+                    && i + 1 < first.tokens.len()
+                    && matches!(first.tokens[i + 1].token, Token::Eq)
+                {
+                    break;
+                }
+                value_toks.push(first.tokens[i].clone());
+                i += 1;
+            }
+
+            match prop.as_str() {
+                "rotation" => {
+                    rotation = Some(self.parse_expr_tokens(&value_toks, line_no)?);
+                }
+                "scale" => {
+                    scale = Some(self.parse_expr_tokens(&value_toks, line_no)?);
+                }
+                "opacity" => {
+                    opacity = Some(self.parse_expr_tokens(&value_toks, line_no)?);
+                }
+                "layer" => {
+                    if let Some(Token::Ident(name)) = value_toks.first().map(|t| &t.token) {
+                        layer = Some(name.clone());
+                    }
+                }
+                "offset" => {
+                    // offset = (x, y) or offset = x, y
+                    if value_toks.len() >= 2 {
+                        // Try parsing as (x, y) or x, y
+                        let mut toks = value_toks.clone();
+                        // Remove parens if present
+                        if matches!(toks.first().map(|t| &t.token), Some(Token::LParen)) {
+                            toks.remove(0);
+                        }
+                        if matches!(toks.last().map(|t| &t.token), Some(Token::RParen)) {
+                            toks.pop();
+                        }
+                        // Split on comma
+                        if let Some(comma_pos) = toks.iter().position(|t| matches!(t.token, Token::Comma)) {
+                            let x_toks = &toks[..comma_pos];
+                            let y_toks = &toks[comma_pos + 1..];
+                            let x = self.parse_expr_tokens(x_toks, line_no)?;
+                            let y = self.parse_expr_tokens(y_toks, line_no)?;
+                            offset = Some((x, y));
+                        }
+                    }
+                }
+                _ => {} // Unknown property, ignore
+            }
+        }
+
+        Ok((Stmt::Transform { character, rotation, scale, offset, opacity, layer }, 1))
+    }
+
     /// Parse a block of statements indented more than `parent_indent`.
     /// Updates `consumed` with the number of lines consumed.
     fn parse_block(
@@ -975,7 +1153,7 @@ impl<'a> ExprParser<'a> {
                 _ => {}
             }
         }
-        self.parse_primary()
+        self.parse_postfix()
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
@@ -999,10 +1177,57 @@ impl<'a> ExprParser<'a> {
                 expect_token(close, Token::RParen, line_no, ")")?;
                 e
             }
+            Token::LBracket => {
+                // List literal: [expr, expr, ...]
+                let mut items = Vec::new();
+                if let Some(next) = self.peek() {
+                    if next.token != Token::RBracket {
+                        loop {
+                            let e = self.parse_expr()?;
+                            items.push(e);
+                            if let Some(next) = self.peek() {
+                                if next.token == Token::Comma {
+                                    self.next();
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                let close = self
+                    .next()
+                    .ok_or_else(|| err(line_no, "expected `]`"))?;
+                expect_token(close, Token::RBracket, line_no, "]")?;
+                Expr::List(items)
+            }
             other => {
                 return Err(err(line_no, format!("unexpected token in expression: {other:?}")));
             }
         };
+        Ok(expr)
+    }
+
+    /// Parse postfix index access: expr[expr]
+    fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_primary()?;
+        loop {
+            let is_lbracket = self.peek().map(|t| t.token == Token::LBracket).unwrap_or(false);
+            if !is_lbracket {
+                break;
+            }
+            self.next(); // consume [
+            let index = self.parse_expr()?;
+            let line_no = self.line_no;
+            let close = self
+                .next()
+                .ok_or_else(|| err(line_no, "expected `]`"))?;
+            expect_token(close, Token::RBracket, line_no, "]")?;
+            expr = Expr::Index {
+                collection: Box::new(expr),
+                index: Box::new(index),
+            };
+        }
         Ok(expr)
     }
 }
@@ -1017,6 +1242,18 @@ fn expect_ident(t: &Spanned, line_no: usize, what: &str) -> Result<String, Parse
             got: format!("{other:?}"),
             expected: what.to_string(),
         }),
+    }
+}
+
+/// Map a compound assignment token to its binary operator.
+fn compound_assign_op(token: &Token) -> Option<BinaryOp> {
+    match token {
+        Token::PlusAssign => Some(BinaryOp::Add),
+        Token::MinusAssign => Some(BinaryOp::Sub),
+        Token::StarAssign => Some(BinaryOp::Mul),
+        Token::SlashAssign => Some(BinaryOp::Div),
+        Token::PercentAssign => Some(BinaryOp::Mod),
+        _ => None,
     }
 }
 

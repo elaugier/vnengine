@@ -447,4 +447,452 @@ label start:
             other => panic!("expected Narrate, got {other:?}"),
         }
     }
+
+    // ---- Interpolation tests ----
+
+    use crate::vm::interpolate_text;
+    use vnengine_core::Value;
+    use std::collections::HashMap;
+
+    #[test]
+    fn interpolate_simple_var() {
+        let mut vars = HashMap::new();
+        vars.insert("name".to_string(), Value::Str("Eileen".to_string()));
+        let result = interpolate_text("Hello, [name]!", &vars);
+        assert_eq!(result, "Hello, Eileen!");
+    }
+
+    #[test]
+    fn interpolate_multiple_vars() {
+        let mut vars = HashMap::new();
+        vars.insert("name".to_string(), Value::Str("Alice".to_string()));
+        vars.insert("count".to_string(), Value::Int(42));
+        let result = interpolate_text("[name] has [count] items", &vars);
+        assert_eq!(result, "Alice has 42 items");
+    }
+
+    #[test]
+    fn interpolate_unknown_var_left_as_is() {
+        let vars = HashMap::new();
+        let result = interpolate_text("Hello, [unknown]!", &vars);
+        assert_eq!(result, "Hello, [unknown]!");
+    }
+
+    #[test]
+    fn interpolate_escaped_bracket() {
+        let vars = HashMap::new();
+        let result = interpolate_text("Array [[0]] is first", &vars);
+        assert_eq!(result, "Array [0] is first");
+    }
+
+    #[test]
+    fn interpolate_no_brackets() {
+        let vars = HashMap::new();
+        let result = interpolate_text("Just plain text", &vars);
+        assert_eq!(result, "Just plain text");
+    }
+
+    #[test]
+    fn interpolate_unclosed_bracket() {
+        let vars = HashMap::new();
+        let result = interpolate_text("Hello [name", &vars);
+        assert_eq!(result, "Hello [name");
+    }
+
+    #[test]
+    fn interpolate_float_var() {
+        let mut vars = HashMap::new();
+        vars.insert("pi".to_string(), Value::Float(3.14));
+        let result = interpolate_text("Pi is [pi]", &vars);
+        assert_eq!(result, "Pi is 3.14");
+    }
+
+    #[test]
+    fn interpolate_bool_var() {
+        let mut vars = HashMap::new();
+        vars.insert("ready".to_string(), Value::Bool(true));
+        let result = interpolate_text("Ready: [ready]", &vars);
+        assert_eq!(result, "Ready: true");
+    }
+
+    #[test]
+    fn vm_interpolates_in_say() {
+        let src = r##"
+label start:
+    $ name = "World"
+    e "Hello, [name]!"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        // Skip the assignment (non-blocking), get the Say command.
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Hello, World!"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_interpolates_in_menu() {
+        let src = r##"
+label start:
+    $ item = "sword"
+    menu "Choose your [item]":
+        "Take [item]":
+            end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        // Skip assignment, expect a Menu.
+        let result = vm.step();
+        match result {
+            StepResult::Menu { prompt, choices } => {
+                assert_eq!(prompt.as_deref(), Some("Choose your sword"));
+                assert_eq!(choices[0].text, "Take sword");
+            }
+            other => panic!("expected Menu, got {other:?}"),
+        }
+    }
+
+    // ---- Compound assignment tests ----
+
+    #[test]
+    fn parse_compound_assign_plus() {
+        let src = r##"
+label start:
+    $ x = 5
+    $ x += 3
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let body = &script.labels[0].body;
+        assert!(matches!(&body[1], Stmt::AssignOp { name, op, .. } if name == "x" && *op == BinaryOp::Add));
+    }
+
+    #[test]
+    fn parse_compound_assign_minus() {
+        let src = r##"
+label start:
+    $ x = 5
+    $ x -= 3
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let body = &script.labels[0].body;
+        assert!(matches!(&body[1], Stmt::AssignOp { name, op, .. } if name == "x" && *op == BinaryOp::Sub));
+    }
+
+    #[test]
+    fn parse_compound_assign_star() {
+        let src = r##"
+label start:
+    $ x = 5
+    $ x *= 3
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let body = &script.labels[0].body;
+        assert!(matches!(&body[1], Stmt::AssignOp { name, op, .. } if name == "x" && *op == BinaryOp::Mul));
+    }
+
+    #[test]
+    fn parse_compound_assign_slash() {
+        let src = r##"
+label start:
+    $ x = 6
+    $ x /= 2
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let body = &script.labels[0].body;
+        assert!(matches!(&body[1], Stmt::AssignOp { name, op, .. } if name == "x" && *op == BinaryOp::Div));
+    }
+
+    #[test]
+    fn vm_executes_compound_plus() {
+        let src = r##"
+label start:
+    $ x = 10
+    $ x += 5
+    e "Value is [x]"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        // Skip both assignments (non-blocking), get the Say command.
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Value is 15"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_executes_compound_minus() {
+        let src = r##"
+label start:
+    $ x = 10
+    $ x -= 3
+    e "Value is [x]"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Value is 7"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_executes_compound_string_concat() {
+        let src = r##"
+label start:
+    $ msg = "Hello"
+    $ msg += " World"
+    e "[msg]"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Hello World"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+    }
+
+    // ---- default variable tests ----
+
+    #[test]
+    fn parse_toplevel_default() {
+        let src = r##"
+default affection = 0
+default met_eileen = False
+
+label start:
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        assert_eq!(script.defaults.len(), 2);
+        assert_eq!(script.defaults[0].name, "affection");
+        assert_eq!(script.defaults[1].name, "met_eileen");
+    }
+
+    #[test]
+    fn parse_inline_default_in_label() {
+        let src = r##"
+label start:
+    default score = 100
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let body = &script.labels[0].body;
+        assert!(matches!(&body[0], Stmt::Default { name, .. } if name == "score"));
+    }
+
+    #[test]
+    fn vm_toplevel_default_sets_var() {
+        let src = r##"
+default affection = 5
+
+label start:
+    e "Affection is [affection]"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Affection is 5"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_default_does_not_overwrite_existing() {
+        // Simulate a restored variable by pre-setting it before the VM runs.
+        let src = r##"
+default affection = 0
+
+label start:
+    e "Affection is [affection]"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        // Simulate a save restore: set the variable before processing defaults.
+        vm.state.variables.insert("affection".to_string(), Value::Int(42));
+        // Re-run process_definitions to test the "don't overwrite" logic.
+        vm.process_definitions();
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Affection is 42"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_inline_default_in_label() {
+        let src = r##"
+label start:
+    default score = 100
+    e "Score is [score]"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Score is 100"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_while_loop() {
+        let src = r##"
+label start:
+    $ i = 0
+    while i < 3:
+        $ i += 1
+    e "Done, i = [i]"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        assert_eq!(script.labels[0].body.len(), 4); // assign, while, say, end
+    }
+
+    #[test]
+    fn vm_while_loop() {
+        let src = r##"
+label start:
+    $ i = 0
+    while i < 3:
+        $ i += 1
+    e "Done, i = [i]"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Done, i = 3"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_for_loop() {
+        let src = r##"
+label start:
+    $ total = 0
+    for x in [1, 2, 3]:
+        $ total += x
+    e "Total = [total]"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        // Just verify it parses without error.
+        assert!(script.labels[0].body.len() >= 3);
+    }
+
+    #[test]
+    fn vm_for_loop() {
+        let src = r##"
+label start:
+    $ total = 0
+    for x in [1, 2, 3]:
+        $ total += x
+    e "Total = [total]"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Total = 6"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_list_literal() {
+        use crate::vm::eval_expr;
+        use std::collections::HashMap;
+        use vnengine_core::Value;
+        let expr = Parser::parse_expr("[1, 2, 3]");
+        let vars = HashMap::new();
+        let val = eval_expr(&expr, &vars).unwrap();
+        match val {
+            Value::List(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0], Value::Int(1));
+                assert_eq!(items[2], Value::Int(3));
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_list_index() {
+        use crate::vm::eval_expr;
+        use std::collections::HashMap;
+        use vnengine_core::Value;
+        let expr = Parser::parse_expr("[10, 20, 30][1]");
+        let vars = HashMap::new();
+        let val = eval_expr(&expr, &vars).unwrap();
+        assert_eq!(val, Value::Int(20));
+    }
+
+    #[test]
+    fn vm_list_concat() {
+        use crate::vm::eval_expr;
+        use std::collections::HashMap;
+        use vnengine_core::Value;
+        let expr = Parser::parse_expr("[1, 2] + [3, 4]");
+        let vars = HashMap::new();
+        let val = eval_expr(&expr, &vars).unwrap();
+        match val {
+            Value::List(items) => assert_eq!(items.len(), 4),
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_while_with_say_body() {
+        let src = r##"
+label start:
+    $ i = 0
+    while i < 2:
+        $ i += 1
+        e "Iteration [i]"
+    e "Finished"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        // First say: "Iteration 1"
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Iteration 1"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+        vm.resume(None);
+        // Second say: "Iteration 2"
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Iteration 2"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+        vm.resume(None);
+        // Third say: "Finished"
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Finished"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+    }
 }

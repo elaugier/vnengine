@@ -303,7 +303,12 @@ impl Renderer {
             let mut buffers: Vec<glyphon::Buffer> = Vec::new();
             for t in &ui.text {
                 let mut buf = self.text.new_buffer(t.font_size, self.config.width);
-                self.text.set_text(&mut buf, &t.text, t.color);
+                if t.rich {
+                    let segments = crate::richtext::parse_rich_text(&t.text);
+                    self.text.set_rich_text(&mut buf, &segments, t.color);
+                } else {
+                    self.text.set_text(&mut buf, &t.text, t.color);
+                }
                 buffers.push(buf);
             }
             let mut areas = Vec::new();
@@ -357,6 +362,9 @@ pub struct UiText {
     pub font_size: f32,
     pub color: [f32; 3],
     pub bounds: Option<glyphon::TextBounds>,
+    /// If true, the text contains formatting tags ({b}, {i}, {color=}, etc.)
+    /// and will be parsed as rich text.
+    pub rich: bool,
 }
 
 /// Everything the app wants drawn as UI this frame.
