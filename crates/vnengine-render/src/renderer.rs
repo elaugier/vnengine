@@ -201,6 +201,9 @@ impl Renderer {
             for s in &scene.sprites {
                 self.textures.ensure_loaded(image_root, &s.image);
             }
+            for img in &ui.images {
+                self.textures.ensure_loaded(image_root, &img.path);
+            }
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("vnengine scene"),
@@ -298,6 +301,74 @@ impl Renderer {
             }
         }
 
+        // --- UI Image pass ---
+        for img in &ui.images {
+            if let Some(texture) = self.textures.get(&img.path) {
+                let (iw, ih) = (
+                    texture.width as f32,
+                    texture.height as f32,
+                );
+                let (w, h) = img.size.unwrap_or((iw, ih));
+                let scale = (w / iw).min(h / ih);
+                let draw_w = iw * scale;
+                let draw_h = ih * scale;
+                let px = img.left + (w - draw_w) / 2.0;
+                let py = img.top + (h - draw_h) / 2.0;
+
+                let (screen_w, screen_h) = (self.config.width as f32, self.config.height as f32);
+                let quad = Quad {
+                    x: (px + draw_w / 2.0) / screen_w,
+                    y: (py + draw_h / 2.0) / screen_h,
+                    hw: draw_w / 2.0 / screen_w,
+                    hh: draw_h / 2.0 / screen_h,
+                    color: [1.0, 1.0, 1.0, img.opacity],
+                    offset: [0.0, 0.0],
+                };
+                let verts = quad_vertices_textured(&quad);
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&texture.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                    label: Some("ui image bind group"),
+                });
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("vnengine ui image"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.textured_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                let buf = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("ui image verts"),
+                        contents: bytemuck::cast_slice(&verts),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..verts.len() as u32, 0..1);
+            }
+        }
+
         // --- Text pass ---
         {
             let mut buffers: Vec<glyphon::Buffer> = Vec::new();
@@ -367,10 +438,24 @@ pub struct UiText {
     pub rich: bool,
 }
 
+/// An image to render in the UI layer.
+pub struct UiImage {
+    /// Image path relative to image_root.
+    pub path: String,
+    /// Position in pixels.
+    pub left: f32,
+    pub top: f32,
+    /// Size in pixels (width, height). If None, use natural size.
+    pub size: Option<(f32, f32)>,
+    /// Opacity (0..1).
+    pub opacity: f32,
+}
+
 /// Everything the app wants drawn as UI this frame.
 pub struct UiDraw {
     pub boxes: Vec<UiBox>,
     pub text: Vec<UiText>,
+    pub images: Vec<UiImage>,
 }
 
 impl UiDraw {
@@ -378,6 +463,7 @@ impl UiDraw {
         Self {
             boxes: Vec::new(),
             text: Vec::new(),
+            images: Vec::new(),
         }
     }
 }

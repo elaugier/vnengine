@@ -177,6 +177,7 @@ mod tests {
             speaker: None,
             text: "hi".into(),
             voice: None,
+            side_image: None,
         }
         .is_blocking());
         assert!(Command::Narrate { text: "n".into() }.is_blocking());

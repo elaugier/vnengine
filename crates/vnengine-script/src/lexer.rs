@@ -53,6 +53,7 @@ pub enum Token {
     In,      // `in` keyword (for loops)
     Def,     // `def` keyword (user functions)
     Transform, // `transform` keyword
+    Shake,    // `shake` keyword
     End,
     // Literals
     Ident(String),
@@ -326,6 +327,7 @@ impl<'a> Lexer<'a> {
                     "in" => Token::In,
                     "def" => Token::Def,
                     "transform" => Token::Transform,
+                    "shake" => Token::Shake,
                     "end" => Token::End,
                     "and" => Token::And,
                     "or" => Token::Or,

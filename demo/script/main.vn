@@ -1,16 +1,26 @@
 # vnengine demo script
 # A short visual novel demonstrating dialogue, choices, branches,
-# variables, audio, transitions, and multiple characters.
+# variables, audio, transitions, rich text, loops, transforms,
+# and multiple characters.
 
 define e = Character("Eileen", color = "#ff4040")
 define r = Character("Ren", color = "#4080ff")
 define n = Character("Narrator", color = "#cccccc")
 
+# Default variables (only set if not already restored from a save)
+default eileen_affection = 0
+default met_eileen = False
+
+# User-defined function: display a formatted thought
+def thought:
+    n "{i}A quiet thought crosses my mind...{/i}"
+    return
+
 label start:
     scene bg school with dissolve 1.5
     play music "bgm_school.ogg" fade 2.0
     n "The sun was setting over Sakura High, painting everything in gold."
-    n "A gentle breeze carried the scent of cherry blossoms through the air."
+    n "A gentle breeze carried the scent of {b}cherry blossoms{/b} through the air."
     play sfx "sfx_wind.ogg" volume 0.6
     n "I was running late, as usual."
     n "Eileen had texted me to meet her after class, but the teacher kept us behind."
@@ -23,6 +33,14 @@ label start:
     play sfx "sfx_footstep.ogg" volume 0.8
     n "She bounced on her heels, her smile bright despite the wait."
     $ met_eileen = True
+
+    # Demonstrate rich text and compound assignment
+    $ score = 0
+    e "Let me test something... {color=#ff4040}red text{/color} and {b}bold{/b}!"
+    $ score += 5
+    e "Score is now [score]. That was a compound assignment!"
+    $ score *= 2
+    e "Now it's [score]. Multiplication works too!"
 
     menu:
         "Sorry I'm late! The teacher kept us.":
@@ -45,6 +63,21 @@ label start:
 label talk:
     e "So, what do you want to do today?"
     n "She looked at me expectantly, her eyes sparkling in the evening light."
+
+    # Demonstrate a while loop with countdown
+    $ countdown = 3
+    while countdown > 0:
+        n "Countdown: [countdown]..."
+        $ countdown -= 1
+    n "Time's up!"
+
+    # Demonstrate for loop over a list
+    $ colors = ["red", "blue", "green"]
+    n "Let me list some colors:"
+    for color in colors:
+        n "Color: [color]"
+    n "That's all the colors!"
+
     menu:
         "Let's go to the library.":
             $ went_library = True
@@ -68,6 +101,9 @@ label library:
     e "I love this place. It's so peaceful."
     e "Do you come here often?"
     n "She traced her finger along a row of book spines, lost in thought."
+
+    # Call user-defined function
+    call thought
 
     menu:
         "All the time. It's my favorite spot.":
@@ -107,11 +143,19 @@ label sunset:
     scene bg rooftop with dissolve 1.0
     play music "bgm_rooftop.ogg" fade 2.0
     n "We climbed the stairs to the rooftop, the city spreading out beneath us."
-    n "The sky was a canvas of orange, pink, and deep purple."
+    n "The sky was a canvas of {color=#ff8800}orange{/color}, {color=#ff4080}pink{/color}, and {color=#4040ff}deep purple{/color}."
     show eileen happy at center
     e "Isn't it beautiful?"
     e "I could stay up here forever."
     n "She leaned against the railing, her hair catching the last light."
+
+    # Demonstrate transform (ATL-style)
+    transform eileen scale=1.1
+    e "Look at the horizon..."
+    transform eileen rotation=0.1
+    n "She tilted her head slightly, lost in the view."
+    transform eileen rotation=0.0 scale=1.0
+    e "It's moments like these that make life worth living."
 
     menu:
         "It's stunning. Thank you for bringing me.":
@@ -208,6 +252,7 @@ label ending_sad:
     stop music fade 2.0
     scene bg black with fade 2.0
     play music "bgm_ending.ogg" fade 3.0
+    shake intensity=0.5 duration=0.5
     n "I walked home alone that evening."
     n "The streetlights flickered on one by one as the sun disappeared."
     n "I couldn't help but feel I'd missed something important."

@@ -11,6 +11,16 @@ pub struct Script {
     pub defaults: Vec<DefaultStmt>,
     /// Labels keyed by name.
     pub labels: Vec<Label>,
+    /// User-defined functions.
+    pub functions: Vec<FunctionDef>,
+}
+
+/// A user-defined function: `def name(params): body`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDef {
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: Vec<Stmt>,
 }
 
 /// A `default <name> = <expr>` declaration.
@@ -78,6 +88,7 @@ pub enum Stmt {
         speaker: Option<String>,
         text: String,
         voice: Option<String>,
+        side_image: Option<String>,
     },
     /// `menu [prompt]: <choices>`
     Menu {
@@ -125,6 +136,19 @@ pub enum Stmt {
         offset: Option<(Expr, Expr)>,
         opacity: Option<Expr>,
         layer: Option<String>,
+    },
+    /// `def <name>(<params>): <body>` — user-defined function.
+    Def {
+        name: String,
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
+    /// `return` — return from a function call.
+    ReturnStmt,
+    /// `shake intensity=<expr> duration=<expr>`
+    Shake {
+        intensity: Expr,
+        duration: Expr,
     },
     /// `end`
     End,

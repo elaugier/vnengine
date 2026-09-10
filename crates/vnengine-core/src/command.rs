@@ -66,6 +66,8 @@ pub enum Command {
         speaker: Option<String>,
         text: String,
         voice: Option<String>,
+        /// Optional side image (character portrait next to dialogue box).
+        side_image: Option<String>,
     },
     /// Narration text (no speaker).
     Narrate { text: String },

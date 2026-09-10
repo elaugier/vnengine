@@ -95,6 +95,11 @@ impl Parser {
                     script.defaults.push(d);
                     idx += 1;
                 }
+                Token::Def => {
+                    let (func, consumed) = self.parse_def_stmt(&lines[idx..])?;
+                    script.functions.push(func);
+                    idx += consumed;
+                }
                 Token::Label => {
                     let (label, consumed) = self.parse_label(&lines[idx..])?;
                     script.labels.push(label);
@@ -299,6 +304,8 @@ impl Parser {
             Token::While => self.parse_while_stmt(lines, indent, line_no),
             Token::For => self.parse_for_stmt(lines, indent, line_no),
             Token::Transform => self.parse_transform_stmt(lines, indent, line_no),
+            Token::Shake => self.parse_shake_stmt(toks, line_no),
+            Token::Return => Ok((Stmt::ReturnStmt, 1)),
             Token::Pause => {
                 let expr = self.parse_expr_tokens(&toks[1..], line_no)?;
                 Ok((Stmt::Pause { seconds: expr }, 1))
@@ -356,6 +363,7 @@ impl Parser {
                     speaker: None,
                     text: text.clone(),
                     voice: None,
+                    side_image: None,
                 }, 1))
             }
             Token::Ident(s) => {
@@ -758,6 +766,86 @@ impl Parser {
         Ok((Stmt::For { var, iterable, body }, consumed))
     }
 
+    fn parse_def_stmt(
+        &self,
+        lines: &[Line],
+    ) -> Result<(FunctionDef, usize), ParseError> {
+        // def <name>(<params>):
+        //     body
+        let first = &lines[0];
+        let line_no = first.line_no;
+        let name = expect_ident(&first.tokens[1], line_no, "function name")?;
+        // Parse parameters inside parentheses.
+        let mut params = Vec::new();
+        let mut i = 2;
+        if i < first.tokens.len() && matches!(first.tokens[i].token, Token::LParen) {
+            i += 1;
+            while i < first.tokens.len() && !matches!(first.tokens[i].token, Token::RParen) {
+                if matches!(first.tokens[i].token, Token::Comma) {
+                    i += 1;
+                    continue;
+                }
+                let p = expect_ident(&first.tokens[i], line_no, "parameter name")?;
+                params.push(p);
+                i += 1;
+            }
+            // Skip the RParen
+            i += 1;
+        }
+        // Expect colon at the end.
+        if i < first.tokens.len() {
+            expect_token(&first.tokens[i], Token::Colon, line_no, ":")?;
+        }
+
+        let base_indent = first.indent;
+        let mut consumed = 1;
+        let body = self.parse_block(lines, base_indent, &mut consumed)?;
+        Ok((FunctionDef { name, params, body }, consumed))
+    }
+
+    fn parse_shake_stmt(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+    ) -> Result<(Stmt, usize), ParseError> {
+        // shake intensity=<expr> duration=<expr>
+        let mut intensity = None;
+        let mut duration = None;
+        let mut i = 1;
+        while i < toks.len() {
+            let prop = expect_ident(&toks[i], line_no, "property name")?;
+            i += 1;
+            if i >= toks.len() {
+                return Err(err(line_no, "expected `=` after property name"));
+            }
+            expect_token(&toks[i], Token::Assign, line_no, "=")?;
+            i += 1;
+            let mut value_toks = Vec::new();
+            while i < toks.len() {
+                if matches!(toks[i].token, Token::Ident(_))
+                    && i + 1 < toks.len()
+                    && matches!(toks[i + 1].token, Token::Assign)
+                {
+                    break;
+                }
+                value_toks.push(toks[i].clone());
+                i += 1;
+            }
+            match prop.as_str() {
+                "intensity" => {
+                    intensity = Some(self.parse_expr_tokens(&value_toks, line_no)?);
+                }
+                "duration" => {
+                    duration = Some(self.parse_expr_tokens(&value_toks, line_no)?);
+                }
+                _ => {}
+            }
+        }
+        let intensity = intensity.ok_or_else(|| err(line_no, "shake requires intensity="))?;
+        let duration = duration.ok_or_else(|| err(line_no, "shake requires duration="))?;
+        Ok((Stmt::Shake { intensity, duration }, 1))
+    }
+
     fn parse_transform_stmt(
         &self,
         lines: &[Line],
@@ -781,7 +869,7 @@ impl Parser {
             if i >= first.tokens.len() {
                 return Err(err(line_no, "expected `=` after property name"));
             }
-            expect_token(&first.tokens[i], Token::Eq, line_no, "=")?;
+            expect_token(&first.tokens[i], Token::Assign, line_no, "=")?;
             i += 1;
 
             // Parse value expression(s) until next property or end of line.
@@ -789,7 +877,7 @@ impl Parser {
             while i < first.tokens.len() {
                 if matches!(first.tokens[i].token, Token::Ident(_))
                     && i + 1 < first.tokens.len()
-                    && matches!(first.tokens[i + 1].token, Token::Eq)
+                    && matches!(first.tokens[i + 1].token, Token::Assign)
                 {
                     break;
                 }
@@ -936,13 +1024,23 @@ impl Parser {
     }
 
     fn parse_say_stmt(&self, toks: &[Spanned], line_no: usize) -> Result<(Stmt, usize), ParseError> {
-        // <speaker> "text" [voice "track"]
+        // <speaker> "text" [voice "track"] [side "image"]
         let speaker = expect_ident(&toks[0], line_no, "speaker id")?;
         let text = expect_string(&toks[1], line_no, "dialogue text")?;
         let mut voice = None;
-        if let Some(t) = toks.get(2) {
-            if matches!(t.token, Token::Voice) {
-                voice = Some(expect_string(&toks[3], line_no, "voice track")?);
+        let mut side_image = None;
+        let mut i = 2;
+        while i < toks.len() {
+            match &toks[i].token {
+                Token::Voice => {
+                    voice = Some(expect_string(&toks[i + 1], line_no, "voice track")?);
+                    i += 2;
+                }
+                Token::Ident(s) if s == "side" => {
+                    side_image = Some(expect_string(&toks[i + 1], line_no, "side image")?);
+                    i += 2;
+                }
+                _ => break,
             }
         }
         Ok((
@@ -950,6 +1048,7 @@ impl Parser {
                 speaker: Some(speaker),
                 text,
                 voice,
+                side_image,
             },
             1,
         ))

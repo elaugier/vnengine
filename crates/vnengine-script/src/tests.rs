@@ -199,7 +199,7 @@ label start:
         let mut vm = Vm::new(script);
         let cmd = step_until_command(&mut vm);
         match cmd {
-            Command::Say { speaker, text, voice } => {
+            Command::Say { speaker, text, voice, .. } => {
                 assert_eq!(speaker.as_deref(), Some("Eileen"));
                 assert_eq!(text, "Hello, world!");
                 assert!(voice.is_none());
@@ -893,6 +893,102 @@ label start:
         match cmd {
             Command::Say { text, .. } => assert_eq!(text, "Finished"),
             other => panic!("expected Say, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_user_function() {
+        let src = r##"
+def greet():
+    e "Hello!"
+    return
+
+label start:
+    call greet
+    e "Back in start"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        assert_eq!(script.functions.len(), 1);
+        assert_eq!(script.functions[0].name, "greet");
+        assert_eq!(script.functions[0].params.len(), 0);
+    }
+
+    #[test]
+    fn vm_call_user_function() {
+        let src = r##"
+def greet():
+    e "Hello from function!"
+    return
+
+label start:
+    call greet
+    e "Back in start"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        // First say: from the function
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Hello from function!"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+        vm.resume(None);
+        // Second say: back in start
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Say { text, .. } => assert_eq!(text, "Back in start"),
+            other => panic!("expected Say, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_function_with_params() {
+        let src = r##"
+def set_name(name):
+    $ current_name = name
+    return
+
+label start:
+    $ current_name = "None"
+    call set_name
+    e "Name is [current_name]"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        // Just verify it parses and the function has 1 param.
+        assert_eq!(script.functions[0].params.len(), 1);
+        assert_eq!(script.functions[0].params[0], "name");
+    }
+
+    #[test]
+    fn vm_transform_statement() {
+        let src = r##"
+label start:
+    show eileen happy at center
+    transform eileen rotation=1.57 scale=2.0
+    e "Transformed!"
+    end
+"##;
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        // First command: Show
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Show(_) => {}
+            other => panic!("expected Show, got {other:?}"),
+        }
+        vm.resume(None);
+        // Second command: Transform
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Transform { character, rotation, scale, .. } => {
+                assert_eq!(character, "eileen");
+                assert!(rotation.is_some());
+                assert!(scale.is_some());
+            }
+            other => panic!("expected Transform, got {other:?}"),
         }
     }
 }

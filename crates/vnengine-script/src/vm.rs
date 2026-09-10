@@ -87,18 +87,26 @@ pub struct Vm {
     pub character_colors: HashMap<String, [f32; 3]>,
     /// Defined constants.
     pub constants: HashMap<String, Value>,
+    /// User-defined functions, keyed by name.
+    pub functions: HashMap<String, FunctionDef>,
     /// Counter for unique synthetic label names.
     synth_counter: u64,
 }
 
 impl Vm {
     pub fn new(script: Script) -> Self {
+        let functions: HashMap<String, FunctionDef> = script
+            .functions
+            .iter()
+            .map(|f| (f.name.clone(), f.clone()))
+            .collect();
         let mut vm = Self {
             script,
             state: VmState::new(),
             character_names: HashMap::new(),
             character_colors: HashMap::new(),
             constants: HashMap::new(),
+            functions,
             synth_counter: 0,
         };
         vm.process_definitions();
@@ -354,6 +362,7 @@ impl Vm {
                 speaker,
                 text,
                 voice,
+                side_image,
             } => {
                 let text = interpolate_text(&text, &self.state.variables);
                 if let Some(id) = &speaker {
@@ -362,6 +371,7 @@ impl Vm {
                         speaker: speaker_name.or(Some(id.clone())),
                         text,
                         voice,
+                        side_image,
                     }))
                 } else {
                     Ok(ExecOutcome::Command(Command::Narrate { text }))
@@ -402,7 +412,38 @@ impl Vm {
                 })
             }
             Stmt::Jump { label } => Ok(ExecOutcome::Jump(label)),
-            Stmt::Call { label } => Ok(ExecOutcome::Call(label)),
+            Stmt::Call { label } => {
+                // Check if this is a user-defined function.
+                if let Some(func) = self.functions.get(&label).cloned() {
+                    let id = self.synth_counter;
+                    self.synth_counter += 1;
+                    let func_label = format!("__func_{}", id);
+                    self.script.labels.push(Label {
+                        name: func_label.clone(),
+                        body: func.body,
+                    });
+                    // Don't advance parent stmt — Return will do that.
+                    return Ok(ExecOutcome::Call(func_label));
+                }
+                Ok(ExecOutcome::Call(label))
+            }
+            Stmt::ReturnStmt => Ok(ExecOutcome::Return),
+            Stmt::Shake { intensity, duration } => {
+                let i = eval_expr(&intensity, &self.state.variables)
+                    .map_err(|e| format!("shake error: {e}"))?;
+                let d = eval_expr(&duration, &self.state.variables)
+                    .map_err(|e| format!("shake error: {e}"))?;
+                let intensity = i.as_float().unwrap_or(0.5) as f32;
+                let duration = d.as_float().unwrap_or(0.5) as f32;
+                Ok(ExecOutcome::Command(Command::Shake {
+                    intensity,
+                    duration,
+                }))
+            }
+            Stmt::Def { .. } => {
+                // Function definitions are processed at load time, not executed.
+                Ok(ExecOutcome::Continue)
+            }
             Stmt::Return => Ok(ExecOutcome::Return),
             Stmt::If {
                 branches,

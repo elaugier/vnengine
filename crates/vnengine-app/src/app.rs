@@ -85,6 +85,8 @@ struct BlockingState {
     text: String,
     /// The speaker name (if any).
     speaker: Option<String>,
+    /// Optional side image path.
+    side_image: Option<String>,
 }
 
 /// A transition animation in progress.
@@ -358,7 +360,7 @@ impl App {
                 }
                 false
             }
-            Command::Say { speaker, text, voice } => {
+            Command::Say { speaker, text, voice, side_image } => {
                 if let Some(track) = &voice {
                     let voice_dir = self.project_root.join(&self.config.voice_dir);
                     self.audio.play_voice(&voice_dir, track);
@@ -373,12 +375,14 @@ impl App {
                         speaker: speaker.clone(),
                         text: text.clone(),
                         voice: voice.clone(),
+                        side_image: side_image.clone(),
                     },
                     chars_shown: 0,
                     typewriter_done: false,
                     shown_at: Instant::now(),
                     text,
                     speaker,
+                    side_image,
                 });
                 self.screen = Screen::Dialogue;
                 true
@@ -397,6 +401,7 @@ impl App {
                     shown_at: Instant::now(),
                     text,
                     speaker: None,
+                    side_image: None,
                 });
                 self.screen = Screen::Dialogue;
                 true
@@ -436,6 +441,7 @@ impl App {
                     shown_at: Instant::now(),
                     text: String::new(),
                     speaker: None,
+                    side_image: None,
                 });
                 true
             }
@@ -1201,6 +1207,17 @@ impl App {
                         h: box_h,
                         color: [0.0, 0.0, 0.0, 0.7],
                     });
+
+                    // Side image (character portrait next to dialogue box).
+                    if let Some(side) = &b.side_image {
+                        ui.images.push(vnengine_render::renderer::UiImage {
+                            path: side.clone(),
+                            left: w * 0.75,
+                            top: box_y * h - h * 0.15,
+                            size: Some((w * 0.2, h * 0.2)),
+                            opacity: 1.0,
+                        });
+                    }
 
                     // Namebox (styled speaker name box).
                     if let Some(speaker) = &b.speaker {
