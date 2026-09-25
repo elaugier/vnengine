@@ -6,3 +6,5 @@
 *.wav
 *.mp3
 temp/
+.vscode/
+
