@@ -60,6 +60,12 @@ pub trait AssetSource: Send + Sync {
         }
         Err(not_found(rel))
     }
+
+    /// List project-relative paths under `prefix` (e.g. `plugins`).
+    /// Implementations that cannot enumerate return an empty list.
+    fn list(&self, _prefix: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Loose assets in a project directory (development mode).
@@ -74,5 +80,31 @@ impl AssetSource for DirAssets {
         sanitize_rel(rel)
             .map(|r| self.0.join(r).is_file())
             .unwrap_or(false)
+    }
+
+    fn list(&self, prefix: &str) -> Vec<String> {
+        let Ok(prefix) = sanitize_rel(prefix) else {
+            return Vec::new();
+        };
+        let root = self.0.join(&prefix);
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.is_file() {
+                    if let Ok(rel) = path.strip_prefix(&self.0) {
+                        out.push(rel.to_string_lossy().replace('\\', "/"));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
     }
 }

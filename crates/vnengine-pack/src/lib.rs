@@ -52,6 +52,9 @@ pub struct Manifest {
     pub assets: Vec<AssetEntry>,
     /// License/notice files included in the package.
     pub licenses: Vec<String>,
+    /// Plugin files included in the package (`plugins/*.wasm|.toml`).
+    #[serde(default)]
+    pub plugins: Vec<String>,
 }
 
 /// One file in the manifest's asset index.
@@ -169,6 +172,18 @@ impl AssetSource for Package {
             .map(|r| self.files.contains_key(&format!("assets/{r}")))
             .unwrap_or(false)
     }
+
+    fn list(&self, prefix: &str) -> Vec<String> {
+        let Ok(prefix) = sanitize_rel(prefix) else {
+            return Vec::new();
+        };
+        let full = format!("assets/{prefix}/");
+        self.files
+            .keys()
+            .filter(|k| k.starts_with(&full))
+            .map(|k| k["assets/".len()..].to_string())
+            .collect()
+    }
 }
 
 /// Load and validate `project.toml` for a project directory.
@@ -240,6 +255,22 @@ pub fn build(project: &Path, output: &Path) -> Result<()> {
             Ok(())
         })?;
     }
+    // WASM plugins + their manifests ship under assets/plugins/.
+    let plugins_root = project.join("plugins");
+    let mut plugins = Vec::new();
+    collect_files(&plugins_root, &mut |fs_path| {
+        let rel = fs_path
+            .strip_prefix(&plugins_root)
+            .expect("walked path is under root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel.ends_with(".wasm") || rel.ends_with(".toml") {
+            let key = format!("assets/plugins/{rel}");
+            members.insert(key.clone(), fs::read(fs_path)?);
+            plugins.push(key);
+        }
+        Ok(())
+    })?;
     let mut licenses = Vec::new();
     for fs_path in license_files(project) {
         let name = fs_path
@@ -270,6 +301,7 @@ pub fn build(project: &Path, output: &Path) -> Result<()> {
         resolution: [config.width, config.height],
         assets: index,
         licenses,
+        plugins,
     };
 
     if let Some(parent) = output.parent() {

@@ -10,6 +10,7 @@ vnengine-script = { workspace = true }
 vnengine-runtime = { workspace = true }
 vnengine-render = { workspace = true }
 vnengine-audio = { workspace = true }
+vnengine-plugins = { workspace = true }
 glyphon = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }

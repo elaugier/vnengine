@@ -17,7 +17,19 @@
 - `vnengine-render`: wgpu renderer (sprites, backgrounds, text, UI)
 - `vnengine-audio`: kira audio engine (BGM/SFX/voice)
 - `vnengine-app`: Main loop, input, scene management, UI
-- `vnengine-cli`: Command-line runner (`--project` dir or `--package` .vnpkg)
+- `vnengine-cli`: Command-line runner
+- `vnengine-pack`: `.vnpkg` build/validate/open (lib + `vnengine-pack` bin)
+- `vnengine-plugins`: sandboxed WASM plugins (wasmtime 48)
+
+## Plugins
+- A plugin is `plugins/<name>.wasm` + `plugins/<name>.toml` manifest
+  (`name`, `version`, `permissions` = `log`/`kv`, `fuel_per_tick`,
+  `memory_max_bytes`). Permissions are enforced: unlisted `env.*`
+  imports are rejected at load time.
+- Exports: `memory`, `vn_init()`, `vn_tick(f32)`, `vn_on_choice(i32)`.
+- Imports: `env.vn_log`, `env.vn_kv_get`, `env.vn_kv_set` — KV keys are
+  namespaced `<plugin>.<key>` and live in `Runtime::plugin_kv`, which is
+  part of saves and rollback snapshots. (`--project` dir or `--package` .vnpkg)
 - `vnengine-pack`: `.vnpkg` builder/reader (manifest, asset index with sha256, licenses)
 
 ## Key Dependencies

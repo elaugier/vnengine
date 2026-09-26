@@ -50,6 +50,10 @@ pub struct SaveState {
     /// Player inputs recorded so far, for deterministic replay.
     #[serde(default)]
     pub journal: Vec<JournalEntry>,
+    /// Plugin key/value state (`<plugin>.<key>`), so plugin data
+    /// restores with the save and rollback.
+    #[serde(default)]
+    pub plugin_kv: std::collections::BTreeMap<String, String>,
     /// Thumbnail image path (PNG bytes) of the scene.
     pub thumbnail: Option<Vec<u8>>,
     /// Real-world save time (Unix timestamp).

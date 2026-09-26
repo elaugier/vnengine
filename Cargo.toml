@@ -9,6 +9,7 @@ members = [
     "crates/vnengine-app",
     "crates/vnengine-cli",
     "crates/vnengine-pack",
+    "crates/vnengine-plugins",
 ]
 
 [workspace.package]
@@ -58,6 +59,7 @@ vnengine-render = { path = "crates/vnengine-render" }
 vnengine-audio = { path = "crates/vnengine-audio" }
 vnengine-app = { path = "crates/vnengine-app" }
 vnengine-pack = { path = "crates/vnengine-pack" }
+vnengine-plugins = { path = "crates/vnengine-plugins" }
 
 [profile.release]
 opt-level = 3

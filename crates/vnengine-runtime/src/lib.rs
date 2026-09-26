@@ -50,6 +50,7 @@ struct RollbackSnapshot {
     scene: Scene,
     history_len: usize,
     music: Option<String>,
+    plugin_kv: std::collections::BTreeMap<String, String>,
 }
 
 /// Everything needed to resume a game, as stored in a save file.
@@ -61,6 +62,8 @@ pub struct RuntimeSnapshot {
     pub music: Option<String>,
     /// Player inputs recorded so far (deterministic replay).
     pub journal: Vec<JournalEntry>,
+    /// Plugin key/value state (persisted with the game).
+    pub plugin_kv: std::collections::BTreeMap<String, String>,
 }
 
 /// The headless runtime.
@@ -78,6 +81,10 @@ pub struct Runtime {
     pub music_fade: f32,
     /// Player inputs recorded for deterministic replay.
     pub journal: Vec<JournalEntry>,
+    /// Shared plugin key/value state. The host passes it to plugin
+    /// calls (`PluginHost::tick_all` etc.); it is part of saves and
+    /// rollback so plugin state restores with the game.
+    pub plugin_kv: std::collections::BTreeMap<String, String>,
     /// Remaining time of a `pause` command, driven by
     /// [`Runtime::update`] — the runtime's logical clock, not wall time.
     pause_remaining: Option<f32>,
@@ -102,6 +109,7 @@ impl Runtime {
             music: None,
             music_fade: 1.0,
             journal: Vec::new(),
+            plugin_kv: std::collections::BTreeMap::new(),
             pause_remaining: None,
             rollback_stack: Vec::new(),
             rollforward_stack: Vec::new(),
@@ -116,6 +124,7 @@ impl Runtime {
         rt.scene = snap.scene;
         rt.music = snap.music;
         rt.journal = snap.journal;
+        rt.plugin_kv = snap.plugin_kv;
         rt
     }
 
@@ -126,6 +135,7 @@ impl Runtime {
             scene: self.scene.clone(),
             music: self.music.clone(),
             journal: self.journal.clone(),
+            plugin_kv: self.plugin_kv.clone(),
         }
     }
 
@@ -239,6 +249,7 @@ impl Runtime {
         self.scene = snap.scene;
         self.history.truncate(snap.history_len);
         self.music = snap.music;
+        self.plugin_kv = snap.plugin_kv;
         self.replaying = true;
         let event = self.step();
         self.replaying = false;
@@ -254,6 +265,7 @@ impl Runtime {
             scene: self.scene.clone(),
             history_len: self.history.len(),
             music: self.music.clone(),
+            plugin_kv: self.plugin_kv.clone(),
         });
         if self.rollback_stack.len() > MAX_ROLLBACK {
             self.rollback_stack.remove(0);

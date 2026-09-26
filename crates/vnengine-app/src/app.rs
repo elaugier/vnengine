@@ -116,6 +116,8 @@ pub struct App {
     /// BGM track last applied to the audio engine — compared against
     /// `runtime.music` to keep playback in sync (incl. after load).
     last_bgm: Option<String>,
+    /// Sandboxed WASM plugins (None if the project ships none).
+    pub plugins: Option<vnengine_plugins::PluginHost>,
     /// Play time accumulator.
     play_time: f32,
     /// Last frame time.
@@ -257,6 +259,12 @@ impl App {
         let gallery_path = save_root.join(&config.save_dir).join("gallery.json");
         runtime.gallery = GalleryState::load(&gallery_path);
 
+        // Sandboxed WASM plugins declared under `plugins/`.
+        let mut plugins = vnengine_plugins::PluginHost::new()?;
+        vnengine_plugins::load_source(&mut plugins, &*assets, "plugins");
+        plugins.init_all(&mut runtime.plugin_kv);
+        let plugins = (!plugins.is_empty()).then_some(plugins);
+
         let app = App {
             config,
             assets,
@@ -271,6 +279,7 @@ impl App {
             blocking: None,
             transition: None,
             last_bgm: None,
+            plugins,
             play_time: 0.0,
             last_frame: Instant::now(),
             auto_timer: 0.0,
@@ -473,6 +482,9 @@ impl App {
     fn select_choice(&mut self, index: usize) {
         if self.runtime.is_on_menu() {
             self.runtime.resume_menu(index);
+            if let Some(host) = &mut self.plugins {
+                host.notify_choice(&mut self.runtime.plugin_kv, index);
+            }
             self.blocking = None;
             self.screen = Screen::Dialogue;
             self.step_vm();
@@ -486,6 +498,13 @@ impl App {
         // Advance the runtime's logical clock (expires `pause` commands).
         if let Some(event) = self.runtime.update(dt) {
             self.dispatch(event);
+        }
+
+        // Plugin tick: each WASM module runs within its fuel/memory
+        // budget; KV state is swapped through `runtime.plugin_kv` so it
+        // persists with saves and rollback.
+        if let Some(host) = &mut self.plugins {
+            host.tick_all(&mut self.runtime.plugin_kv, dt);
         }
 
         // Keep BGM playback in sync with the runtime's tracked music
@@ -1751,6 +1770,7 @@ impl App {
             blocking: self.blocking.as_ref().map(|b| b.command.clone()),
             music: snap.music,
             journal: snap.journal,
+            plugin_kv: snap.plugin_kv,
             thumbnail,
             saved_at: chrono::Utc::now().timestamp(),
         };
@@ -1788,6 +1808,7 @@ impl App {
                 scene: state.scene,
                 music: state.music,
                 journal: state.journal,
+                plugin_kv: state.plugin_kv,
             },
         );
         self.blocking = None;

@@ -172,6 +172,36 @@ fn asset_paths_reject_traversal() {
 }
 
 #[test]
+fn build_includes_plugins() {
+    let project = fixture("plugins");
+    fs::create_dir_all(project.join("plugins")).unwrap();
+    fs::write(project.join("plugins/codex.wasm"), b"\0asm fake").unwrap();
+    fs::write(
+        project.join("plugins/codex.toml"),
+        "version = \"1\"\npermissions = [\"log\", \"kv\"]\n",
+    )
+    .unwrap();
+    // Non-wasm/toml files are skipped.
+    fs::write(project.join("plugins/readme.md"), b"docs").unwrap();
+    let out = pkg_path("plugins");
+    build(&project, &out).unwrap();
+
+    let pkg = Package::open(&out).unwrap();
+    assert!(pkg
+        .manifest()
+        .plugins
+        .contains(&"assets/plugins/codex.wasm".into()));
+    assert!(pkg.exists("plugins/codex.wasm"));
+    assert!(pkg.exists("plugins/codex.toml"));
+    assert!(!pkg.exists("plugins/readme.md"));
+    // Listing works through the AssetSource view.
+    let listed = pkg.list("plugins");
+    assert!(listed.contains(&"plugins/codex.wasm".to_string()));
+    let _ = fs::remove_dir_all(&project);
+    let _ = fs::remove_file(&out);
+}
+
+#[test]
 fn validate_passes_on_fixture() {
     let project = fixture("validate");
     validate(&project).unwrap();

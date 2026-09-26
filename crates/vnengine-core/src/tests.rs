@@ -368,6 +368,9 @@ fn save_state_write_read_roundtrip() {
         blocking: Some(Command::Narrate { text: "hi".into() }),
         music: Some("bgm.ogg".into()),
         journal: vec![crate::save::JournalEntry::Menu(1)],
+        plugin_kv: [("plug.k".to_string(), "v".to_string())]
+            .into_iter()
+            .collect(),
         thumbnail: None,
         saved_at: 1700000000,
     };
@@ -384,6 +387,7 @@ fn save_state_write_read_roundtrip() {
     ));
     assert_eq!(loaded.music.as_deref(), Some("bgm.ogg"));
     assert_eq!(loaded.journal.len(), 1);
+    assert_eq!(loaded.plugin_kv.get("plug.k"), Some(&"v".to_string()));
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -401,6 +405,7 @@ fn save_state_list_multiple_slots() {
             blocking: None,
             music: None,
             journal: vec![],
+            plugin_kv: Default::default(),
             thumbnail: None,
             saved_at: 0,
         }
@@ -428,6 +433,7 @@ fn save_state_delete() {
         blocking: None,
         music: None,
         journal: vec![],
+        plugin_kv: Default::default(),
         thumbnail: None,
         saved_at: 0,
     }
