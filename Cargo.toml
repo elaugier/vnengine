@@ -57,6 +57,7 @@ vnengine-runtime = { path = "crates/vnengine-runtime" }
 vnengine-render = { path = "crates/vnengine-render" }
 vnengine-audio = { path = "crates/vnengine-audio" }
 vnengine-app = { path = "crates/vnengine-app" }
+vnengine-pack = { path = "crates/vnengine-pack" }
 
 [profile.release]
 opt-level = 3

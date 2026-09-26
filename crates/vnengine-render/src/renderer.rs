@@ -13,7 +13,7 @@
 use crate::text::{text_area, TextState};
 use crate::texture::TextureCache;
 use bytemuck::{Pod, Zeroable};
-use std::path::Path;
+use vnengine_core::assets::AssetSource;
 use vnengine_core::model::{anchor_x, Scene};
 use wgpu::util::DeviceExt;
 use wgpu::{
@@ -155,8 +155,14 @@ impl Renderer {
         self.text.resize(&self.queue, size.0, size.1);
     }
 
-    /// Render a frame.
-    pub fn render(&mut self, scene: &Scene, image_root: &Path, ui: &UiDraw) -> anyhow::Result<()> {
+    /// Render a frame. Images are fetched from `src` under `image_dir`.
+    pub fn render(
+        &mut self,
+        scene: &Scene,
+        src: &dyn AssetSource,
+        image_dir: &str,
+        ui: &UiDraw,
+    ) -> anyhow::Result<()> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Timeout
@@ -187,16 +193,16 @@ impl Renderer {
         {
             // Pre-load all needed textures (mutable phase).
             if let Some(bg) = &scene.background {
-                self.textures.ensure_loaded(image_root, bg);
+                self.textures.ensure_loaded(src, image_dir, bg);
             }
             if let Some(bg) = &scene.prev_background {
-                self.textures.ensure_loaded(image_root, bg);
+                self.textures.ensure_loaded(src, image_dir, bg);
             }
             for s in &scene.sprites {
-                self.textures.ensure_loaded(image_root, &s.image);
+                self.textures.ensure_loaded(src, image_dir, &s.image);
             }
             for img in &ui.images {
-                self.textures.ensure_loaded(image_root, &img.path);
+                self.textures.ensure_loaded(src, image_dir, &img.path);
             }
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

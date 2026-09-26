@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 vnengine-core = { workspace = true }
 vnengine-app = { workspace = true }
+vnengine-pack = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 log = { workspace = true }

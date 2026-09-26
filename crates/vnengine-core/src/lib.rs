@@ -4,6 +4,7 @@
 //! the audio backend and the application loop. It deliberately has no heavy
 //! dependencies so it can be reused everywhere.
 
+pub mod assets;
 pub mod command;
 pub mod config;
 pub mod model;

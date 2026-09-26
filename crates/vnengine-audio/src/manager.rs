@@ -6,8 +6,8 @@
 
 use kira::sound::static_sound::{StaticSoundData, StaticSoundSettings};
 use kira::{AudioManager as KiraManager, AudioManagerSettings, Decibels, DefaultBackend, Tween};
-use std::path::Path;
 use std::time::Duration;
+use vnengine_core::assets::{AssetSource, AUDIO_EXTS};
 use vnengine_core::settings::UserSettings;
 
 pub struct AudioEngine {
@@ -47,31 +47,33 @@ impl AudioEngine {
     }
 
     /// Play a looping BGM track. Stops any currently playing BGM.
-    pub fn play_music(&mut self, audio_dir: &Path, track: &str, fade: f32) {
-        let path = audio_dir.join(track);
+    /// `track` is relative to `dir` (the audio dir of the project).
+    pub fn play_music(&mut self, src: &dyn AssetSource, dir: &str, track: &str, fade: f32) {
         let vol = db_from_linear(self.settings.music_volume);
         let settings = StaticSoundSettings::new().loop_region(0.0..).volume(vol);
-        match StaticSoundData::from_file(&path).map(|d| d.with_settings(settings)) {
-            Ok(data) => {
-                if let Some(mut h) = self.current_bgm.take() {
-                    let tween = if fade > 0.0 {
-                        Tween {
-                            duration: Duration::from_secs_f32(fade),
-                            ..Default::default()
-                        }
-                    } else {
-                        Tween::default()
-                    };
-                    h.stop(tween);
-                }
-                match self.manager.play(data) {
-                    Ok(handle) => {
-                        self.current_bgm = Some(handle);
-                    }
-                    Err(e) => log::warn!("failed to play music `{}`: {e}", path.display()),
-                }
+        let data = match load_sound(src, dir, track, settings) {
+            Ok(data) => data,
+            Err(e) => {
+                log::warn!("failed to load music `{dir}/{track}`: {e}");
+                return;
             }
-            Err(e) => log::warn!("failed to load music `{}`: {e}", path.display()),
+        };
+        if let Some(mut h) = self.current_bgm.take() {
+            let tween = if fade > 0.0 {
+                Tween {
+                    duration: Duration::from_secs_f32(fade),
+                    ..Default::default()
+                }
+            } else {
+                Tween::default()
+            };
+            h.stop(tween);
+        }
+        match self.manager.play(data) {
+            Ok(handle) => {
+                self.current_bgm = Some(handle);
+            }
+            Err(e) => log::warn!("failed to play music `{track}`: {e}"),
         }
     }
 
@@ -91,26 +93,24 @@ impl AudioEngine {
     }
 
     /// Play a one-shot sound effect.
-    pub fn play_sfx(&mut self, audio_dir: &Path, track: &str, volume: f32) {
-        let path = audio_dir.join(track);
+    pub fn play_sfx(&mut self, src: &dyn AssetSource, dir: &str, track: &str, volume: f32) {
         let vol = db_from_linear(self.settings.sfx_volume * volume as f64);
         let settings = StaticSoundSettings::new().volume(vol);
-        match StaticSoundData::from_file(&path).map(|d| d.with_settings(settings)) {
+        match load_sound(src, dir, track, settings) {
             Ok(data) => {
                 if let Err(e) = self.manager.play(data) {
-                    log::warn!("failed to play sfx `{}`: {e}", path.display());
+                    log::warn!("failed to play sfx `{track}`: {e}");
                 }
             }
-            Err(e) => log::warn!("failed to load sfx `{}`: {e}", path.display()),
+            Err(e) => log::warn!("failed to load sfx `{dir}/{track}`: {e}"),
         }
     }
 
     /// Play a voice line. Stops any currently playing voice.
-    pub fn play_voice(&mut self, voice_dir: &Path, track: &str) {
-        let path = voice_dir.join(track);
+    pub fn play_voice(&mut self, src: &dyn AssetSource, dir: &str, track: &str) {
         let vol = db_from_linear(self.settings.voice_volume);
         let settings = StaticSoundSettings::new().volume(vol);
-        match StaticSoundData::from_file(&path).map(|d| d.with_settings(settings)) {
+        match load_sound(src, dir, track, settings) {
             Ok(data) => {
                 if let Some(mut h) = self.current_voice.take() {
                     h.stop(Tween::default());
@@ -119,10 +119,10 @@ impl AudioEngine {
                     Ok(handle) => {
                         self.current_voice = Some(handle);
                     }
-                    Err(e) => log::warn!("failed to play voice `{}`: {e}", path.display()),
+                    Err(e) => log::warn!("failed to play voice `{track}`: {e}"),
                 }
             }
-            Err(e) => log::warn!("failed to load voice `{}`: {e}", path.display()),
+            Err(e) => log::warn!("failed to load voice `{dir}/{track}`: {e}"),
         }
     }
 
@@ -132,6 +132,18 @@ impl AudioEngine {
             h.stop(Tween::default());
         }
     }
+}
+
+/// Read `dir/track` (probing common audio extensions) and decode it into
+/// a `StaticSoundData`.
+fn load_sound(
+    src: &dyn AssetSource,
+    dir: &str,
+    track: &str,
+    settings: StaticSoundSettings,
+) -> anyhow::Result<StaticSoundData> {
+    let (_, bytes) = src.read_any(&format!("{dir}/{track}"), AUDIO_EXTS)?;
+    Ok(StaticSoundData::from_cursor(std::io::Cursor::new(bytes))?.with_settings(settings))
 }
 
 /// Convert a linear volume (0..1) to decibels.

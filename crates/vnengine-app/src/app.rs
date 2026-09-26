@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use vnengine_audio::AudioEngine;
+use vnengine_core::assets::{AssetSource, DirAssets, IMAGE_EXTS};
 use vnengine_core::command::Command;
 use vnengine_core::save::{GalleryState, SaveState};
 use vnengine_core::settings::UserSettings;
@@ -15,6 +16,7 @@ use vnengine_core::EngineConfig;
 use vnengine_render::renderer::{UiBox, UiDraw, UiText};
 use vnengine_render::Renderer;
 use vnengine_runtime::{Runtime, RuntimeEvent, RuntimeSnapshot};
+use vnengine_script::ast::Script;
 use vnengine_script::parser::Parser;
 
 /// The current UI screen being displayed.
@@ -95,7 +97,13 @@ struct ActiveTransition {
 
 pub struct App {
     pub config: EngineConfig,
-    pub project_root: PathBuf,
+    /// Asset source: project directory or `.vnpkg` package.
+    pub assets: Box<dyn AssetSource>,
+    /// Directory under which `config.save_dir` resolves (saves, settings,
+    /// gallery). For packages this is the directory containing the file.
+    pub save_root: PathBuf,
+    /// The parsed entry script, kept for save/load restores.
+    pub script: Script,
     pub settings: UserSettings,
     /// Headless game state: VM, scene, history, rollback, gallery.
     pub runtime: Runtime,
@@ -166,8 +174,24 @@ fn quick_menu_buttons(w: f32, h: f32) -> [(f32, f32, f32, f32); 8] {
 }
 
 impl App {
-    /// Create and run the application. This blocks until the window closes.
+    /// Create and run the application on a loose project directory.
+    /// This blocks until the window closes.
     pub fn run(config: EngineConfig, project_root: PathBuf) -> anyhow::Result<()> {
+        let script_path = project_root.join(&config.entry_script);
+        let script_src = std::fs::read_to_string(&script_path)?;
+        let script = Parser::parse(&script_src)?;
+        let save_root = project_root.clone();
+        Self::run_source(config, Box::new(DirAssets(project_root)), save_root, script)
+    }
+
+    /// Create and run the application with an arbitrary asset source
+    /// (directory or package) and an already-loaded script.
+    pub fn run_source(
+        config: EngineConfig,
+        assets: Box<dyn AssetSource>,
+        save_root: PathBuf,
+        script: Script,
+    ) -> anyhow::Result<()> {
         let event_loop = winit::event_loop::EventLoop::new()?;
         let title = config.title.clone();
         let (w, h) = (config.width, config.height);
@@ -221,25 +245,23 @@ impl App {
         )?;
 
         // Load settings.
-        let settings_path = project_root.join(&config.save_dir).join("settings.json");
+        let settings_path = save_root.join(&config.save_dir).join("settings.json");
         let settings = UserSettings::load(&settings_path).unwrap_or_default();
 
-        // Load script.
-        let script_path = project_root.join(&config.entry_script);
-        let script_src = std::fs::read_to_string(&script_path)?;
-        let script = Parser::parse(&script_src)?;
-        let mut runtime = Runtime::new(script);
+        let mut runtime = Runtime::new(script.clone());
 
         // Audio.
         let audio = AudioEngine::new(settings.clone())?;
 
         // Gallery.
-        let gallery_path = project_root.join(&config.save_dir).join("gallery.json");
+        let gallery_path = save_root.join(&config.save_dir).join("gallery.json");
         runtime.gallery = GalleryState::load(&gallery_path);
 
         let app = App {
             config,
-            project_root,
+            assets,
+            save_root,
+            script,
             settings,
             runtime,
             audio,
@@ -331,12 +353,12 @@ impl App {
             // PlayMusic/StopMusic are handled by `resync_music`, which
             // follows `runtime.music` and also covers load/rollback.
             Command::PlaySfx { track, volume } => {
-                let audio_dir = self.project_root.join(&self.config.audio_dir);
-                self.audio.play_sfx(&audio_dir, &track, volume);
+                self.audio
+                    .play_sfx(&*self.assets, &self.config.audio_dir, &track, volume);
             }
             Command::PlayVoice { track } => {
-                let voice_dir = self.project_root.join(&self.config.voice_dir);
-                self.audio.play_voice(&voice_dir, &track);
+                self.audio
+                    .play_voice(&*self.assets, &self.config.voice_dir, &track);
             }
             Command::StopVoice => self.audio.stop_voice(),
             Command::PlayTransition(transition) => {
@@ -355,7 +377,7 @@ impl App {
             }
             Command::RegisterCg { .. } => {
                 let gallery_path = self
-                    .project_root
+                    .save_root
                     .join(&self.config.save_dir)
                     .join("gallery.json");
                 let _ = self.runtime.gallery.save(&gallery_path);
@@ -383,8 +405,8 @@ impl App {
             voice: Some(track), ..
         } = &cmd
         {
-            let voice_dir = self.project_root.join(&self.config.voice_dir);
-            self.audio.play_voice(&voice_dir, track);
+            self.audio
+                .play_voice(&*self.assets, &self.config.voice_dir, track);
         }
         let typewriter_done =
             complete || !matches!(cmd, Command::Say { .. } | Command::Narrate { .. });
@@ -435,11 +457,13 @@ impl App {
         if self.runtime.music == self.last_bgm {
             return;
         }
-        let audio_dir = self.project_root.join(&self.config.audio_dir);
         match &self.runtime.music {
-            Some(track) => self
-                .audio
-                .play_music(&audio_dir, track, self.runtime.music_fade),
+            Some(track) => self.audio.play_music(
+                &*self.assets,
+                &self.config.audio_dir,
+                track,
+                self.runtime.music_fade,
+            ),
             None => self.audio.stop_music(self.runtime.music_fade),
         }
         self.last_bgm = self.runtime.music.clone();
@@ -1021,7 +1045,7 @@ impl App {
             }
             1 => {
                 // Continue — load most recent save
-                let save_dir = self.project_root.join(&self.config.save_dir);
+                let save_dir = self.save_root.join(&self.config.save_dir);
                 let saves = vnengine_core::save::SaveState::list(&save_dir);
                 if let Some(latest) = saves.iter().max_by_key(|s| s.saved_at) {
                     let _ = self.load(latest.slot);
@@ -1077,7 +1101,7 @@ impl App {
     /// Save settings to disk.
     fn save_settings(&self) {
         let settings_path = self
-            .project_root
+            .save_root
             .join(&self.config.save_dir)
             .join("settings.json");
         let _ = self.settings.save(&settings_path);
@@ -1348,7 +1372,7 @@ impl App {
                 });
 
                 // Save slots grid (3x3).
-                let save_dir = self.project_root.join(&self.config.save_dir);
+                let save_dir = self.save_root.join(&self.config.save_dir);
                 let saves = vnengine_core::save::SaveState::list(&save_dir);
                 let cols = 3;
                 let slot_w = w * 0.28;
@@ -1707,7 +1731,7 @@ impl App {
 
     /// Save the game to a slot.
     pub fn save(&self, slot: u32) -> anyhow::Result<()> {
-        let save_dir = self.project_root.join(&self.config.save_dir);
+        let save_dir = self.save_root.join(&self.config.save_dir);
         let snap = self.runtime.capture();
         let label = self
             .blocking
@@ -1737,8 +1761,11 @@ impl App {
     /// Generate a small PNG thumbnail from the current background image.
     fn generate_thumbnail(&self) -> Option<Vec<u8>> {
         let bg = self.runtime.scene.background.as_ref()?;
-        let image_path = self.project_root.join(&self.config.image_dir).join(bg);
-        let img = image::open(&image_path).ok()?;
+        let (_, bytes) = self
+            .assets
+            .read_any(&format!("{}/{bg}", self.config.image_dir), IMAGE_EXTS)
+            .ok()?;
+        let img = image::load_from_memory(&bytes).ok()?;
         let thumb = img.resize_to_fill(160, 90, image::imageops::FilterType::Lanczos3);
         let mut buf = Vec::new();
         let mut cursor = std::io::Cursor::new(&mut buf);
@@ -1751,15 +1778,11 @@ impl App {
 
     /// Load the game from a slot.
     pub fn load(&mut self, slot: u32) -> anyhow::Result<()> {
-        let save_dir = self.project_root.join(&self.config.save_dir);
+        let save_dir = self.save_root.join(&self.config.save_dir);
         let state = SaveState::read(&save_dir, slot)?;
         let vm_state: vnengine_script::vm::VmState = serde_json::from_slice(&state.vm_state)?;
-        // Re-parse the script and restore VM + scene state.
-        let script_path = self.project_root.join(&self.config.entry_script);
-        let script_src = std::fs::read_to_string(&script_path)?;
-        let script = Parser::parse(&script_src)?;
         self.runtime = Runtime::restore(
-            script,
+            self.script.clone(),
             RuntimeSnapshot {
                 vm_state,
                 scene: state.scene,
@@ -1853,7 +1876,6 @@ impl winit::application::ApplicationHandler for AppHandler {
                 app.handle_input();
                 app.update(dt);
                 let ui = app.build_ui();
-                let image_root = app.project_root.join(&app.config.image_dir);
                 let mut scene = app.runtime.scene.clone();
                 // Apply screen shake offset.
                 if let Some((remaining, intensity)) = app.shake {
@@ -1869,7 +1891,13 @@ impl winit::application::ApplicationHandler for AppHandler {
                         sprite.offset[1] += oy;
                     }
                 }
-                if let Err(e) = app.renderer.render(&scene, &image_root, &ui) {
+                let App {
+                    renderer,
+                    assets,
+                    config,
+                    ..
+                } = &mut *app;
+                if let Err(e) = renderer.render(&scene, &**assets, &config.image_dir, &ui) {
                     log::error!("render error: {e}");
                 }
                 // Clear per-frame input state after processing.

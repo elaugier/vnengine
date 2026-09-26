@@ -7,8 +7,12 @@ use vnengine_core::EngineConfig;
 #[command(name = "vnengine", version, about)]
 struct Cli {
     /// Path to the project directory (containing project.toml).
-    #[arg(short, long, default_value = ".")]
+    #[arg(short, long, default_value = ".", conflicts_with = "package")]
     project: PathBuf,
+
+    /// Run a packaged `.vnpkg` file instead of a project directory.
+    #[arg(long)]
+    package: Option<PathBuf>,
 
     /// Run in fullscreen mode.
     #[arg(short = 'f', long)]
@@ -30,6 +34,24 @@ fn main() -> anyhow::Result<()> {
         env_logger::Builder::from_default_env()
             .filter_level(log::LevelFilter::Warn)
             .init();
+    }
+
+    if let Some(pkg_path) = &cli.package {
+        let pkg = vnengine_pack::Package::open(pkg_path)?;
+        let mut config = pkg.config().clone();
+        if cli.fullscreen {
+            config.fullscreen = true;
+        }
+        log::info!("Running package {}", pkg_path.display());
+        // Saves go to `<package dir>/<save_dir>` — the package itself is
+        // read-only.
+        let save_root = pkg_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let script = pkg.script().clone();
+        vnengine_app::App::run_source(config, Box::new(pkg), save_root, script)?;
+        return Ok(());
     }
 
     // Load project config.

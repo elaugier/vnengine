@@ -6,6 +6,9 @@
 - Check: `cargo check`
 - Run tests: `cargo test`
 - Run demo: `cargo run -- --project demo`
+- Run a package: `cargo run -p vnengine-cli -- --package build/demo.vnpkg`
+- Package a project: `cargo run -p vnengine-pack -- --project demo --output build/demo.vnpkg`
+- Validate a project: `cargo run -p vnengine-pack -- --project demo --check-only`
 
 ## Architecture
 - `vnengine-core`: Shared types, config, save/load, scene model
@@ -14,7 +17,8 @@
 - `vnengine-render`: wgpu renderer (sprites, backgrounds, text, UI)
 - `vnengine-audio`: kira audio engine (BGM/SFX/voice)
 - `vnengine-app`: Main loop, input, scene management, UI
-- `vnengine-cli`: Command-line runner
+- `vnengine-cli`: Command-line runner (`--project` dir or `--package` .vnpkg)
+- `vnengine-pack`: `.vnpkg` builder/reader (manifest, asset index with sha256, licenses)
 
 ## Key Dependencies
 - wgpu 30, winit 0.30, glyphon 0.12 (text), kira 0.12 (audio), gilrs 0.11 (gamepad)
@@ -26,6 +30,7 @@
 - `pause <seconds>` is driven by the runtime's logical clock (`Runtime::update`), not wall time.
 - `Runtime.journal` records menu choices; `Runtime::replay(script, journal)` re-runs deterministically.
 - `Runtime.music` tracks the current BGM across commands/saves/rollback — hosts resync audio against it.
+- Assets are read through `AssetSource` (`DirAssets` in dev, `Package` in .vnpkg) — never hardcode `project_root.join(...)` for assets; saves/settings still live under `save_root` on disk.
 
 ## Notes
 - Windows builds may hit transient file lock errors (os error 32) on proc-macro crates. Retry the build if this happens.

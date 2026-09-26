@@ -5,7 +5,7 @@
 //! requests are cheap.
 
 use ahash::AHashMap;
-use std::path::Path;
+use vnengine_core::assets::{AssetSource, IMAGE_EXTS};
 use wgpu::TextureFormat;
 
 /// A cached GPU texture and its dimensions.
@@ -34,31 +34,21 @@ impl TextureCache {
     }
 
     /// Ensure a texture is loaded into the cache. Call before `get`.
-    pub fn ensure_loaded(&mut self, root: &Path, rel: &str) {
+    /// `rel` is an image reference relative to `dir` (the image dir);
+    /// common extensions are probed when `rel` has none.
+    pub fn ensure_loaded(&mut self, src: &dyn AssetSource, dir: &str, rel: &str) {
         if self.cache.contains_key(rel) {
             return;
         }
-        // Try the path as-is first, then with common image extensions.
-        let path = root.join(rel);
-        let path = if path.exists() {
-            path
-        } else {
-            // Try appending common extensions.
-            let candidates = [".png", ".jpg", ".jpeg", ".webp", ".bmp"];
-            let mut found = None;
-            for ext in &candidates {
-                let p = root.join(format!("{rel}{ext}"));
-                if p.exists() {
-                    found = Some(p);
-                    break;
-                }
-            }
-            match found {
-                Some(p) => p,
-                None => path, // original path (will fail with a warning)
+        let full = format!("{dir}/{rel}");
+        let bytes = match src.read_any(&full, IMAGE_EXTS) {
+            Ok((_, bytes)) => bytes,
+            Err(e) => {
+                log::warn!("failed to load image `{full}`: {e}");
+                return;
             }
         };
-        match image::open(&path) {
+        match image::load_from_memory(&bytes) {
             Ok(img) => {
                 let rgba = img.to_rgba8();
                 let (w, h) = rgba.dimensions();
@@ -106,7 +96,7 @@ impl TextureCache {
                 );
             }
             Err(e) => {
-                log::warn!("failed to load image `{}`: {e}", path.display());
+                log::warn!("failed to decode image `{full}`: {e}");
             }
         }
     }
