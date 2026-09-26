@@ -24,20 +24,6 @@ pub struct RichSegment {
     pub size: Option<f32>,
 }
 
-impl RichSegment {
-    fn empty() -> Self {
-        Self {
-            text: String::new(),
-            bold: false,
-            italic: false,
-            underline: false,
-            strikethrough: false,
-            color: None,
-            size: None,
-        }
-    }
-}
-
 /// Active formatting state during parsing.
 #[derive(Debug, Clone, Default)]
 struct FormatState {
@@ -166,7 +152,12 @@ fn parse_color(s: &str) -> Option<[f32; 4]> {
                 let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
                 let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
                 let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
-                Some([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a as f32 / 255.0])
+                Some([
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    a as f32 / 255.0,
+                ])
             }
             _ => None,
         }

@@ -3335,6 +3335,7 @@ dependencies = [
  "vnengine-audio",
  "vnengine-core",
  "vnengine-render",
+ "vnengine-runtime",
  "vnengine-script",
  "wgpu",
  "winit",
@@ -3406,6 +3407,18 @@ dependencies = [
  "pollster",
  "vnengine-core",
  "wgpu",
+]
+
+[[package]]
+name = "vnengine-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "serde",
+ "serde_json",
+ "vnengine-core",
+ "vnengine-script",
 ]
 
 [[package]]

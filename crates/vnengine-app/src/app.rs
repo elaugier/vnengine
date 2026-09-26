@@ -3,24 +3,23 @@
 
 use crate::input::{Action, Input};
 use parking_lot::Mutex;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use vnengine_audio::AudioEngine;
-use vnengine_core::command::{Anchor, Command};
-use vnengine_core::model::Scene;
+use vnengine_core::command::Command;
 use vnengine_core::save::{GalleryState, SaveState};
 use vnengine_core::settings::UserSettings;
 use vnengine_core::transition::{SlideDirection, Transition};
-use vnengine_core::{EngineConfig, Value};
+use vnengine_core::EngineConfig;
 use vnengine_render::renderer::{UiBox, UiDraw, UiText};
 use vnengine_render::Renderer;
+use vnengine_runtime::{Runtime, RuntimeEvent, RuntimeSnapshot};
 use vnengine_script::parser::Parser;
-use vnengine_script::vm::{MenuResponse, StepResult, Vm};
 
 /// The current UI screen being displayed.
 #[derive(Debug, Clone, PartialEq)]
-enum Screen {
+pub enum Screen {
     /// Normal gameplay (dialogue/narration).
     Dialogue,
     /// A menu of choices is displayed.
@@ -55,20 +54,18 @@ enum Screen {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum SaveLoadMode {
+pub enum SaveLoadMode {
     Save,
     Load,
 }
 
 /// What action to take when a confirm dialog is accepted.
 #[derive(Debug, Clone, PartialEq)]
-enum ConfirmAction {
+pub enum ConfirmAction {
     /// Return to the title screen.
     ToTitle,
     /// Quit the game.
     Quit,
-    /// Overwrite a save slot.
-    OverwriteSave(u32),
 }
 
 /// A blocking command currently being displayed (and waiting for input).
@@ -100,18 +97,17 @@ pub struct App {
     pub config: EngineConfig,
     pub project_root: PathBuf,
     pub settings: UserSettings,
-    pub vm: Vm,
-    pub scene: Scene,
+    /// Headless game state: VM, scene, history, rollback, gallery.
+    pub runtime: Runtime,
     pub audio: AudioEngine,
     pub renderer: Renderer,
     pub input: Input,
     pub screen: Screen,
     blocking: Option<BlockingState>,
     transition: Option<ActiveTransition>,
-    /// Pending menu choices from the VM (stored so we can resume).
-    pending_menu: Option<Vec<String>>,
-    /// Gallery state (unlocked CGs).
-    gallery: GalleryState,
+    /// BGM track last applied to the audio engine — compared against
+    /// `runtime.music` to keep playback in sync (incl. after load).
+    last_bgm: Option<String>,
     /// Play time accumulator.
     play_time: f32,
     /// Last frame time.
@@ -122,35 +118,12 @@ pub struct App {
     auto_advance: bool,
     /// Whether skip is on.
     skip: bool,
-    /// Dialogue history for the backlog.
-    history: Vec<HistoryEntry>,
-    /// Rollback stack: snapshots of state before each blocking command.
-    rollback_stack: Vec<RollbackSnapshot>,
-    /// Rollforward stack: snapshots popped during rollback, for re-advancing.
-    rollforward_stack: Vec<RollbackSnapshot>,
     /// Auto-save timer (seconds since last auto-save).
     auto_save_timer: f32,
     /// Screen shake state: (remaining_time, intensity).
     shake: Option<(f32, f32)>,
     /// Logical window size.
     window_size: (u32, u32),
-}
-
-/// A snapshot of game state for rollback.
-#[derive(Debug, Clone)]
-struct RollbackSnapshot {
-    vm_state: vnengine_script::vm::VmState,
-    scene: Scene,
-    blocking_text: Option<String>,
-    blocking_speaker: Option<String>,
-    screen_is_dialogue: bool,
-}
-
-/// A single entry in the dialogue history (backlog).
-#[derive(Debug, Clone)]
-struct HistoryEntry {
-    speaker: Option<String>,
-    text: String,
 }
 
 /// Quick menu button actions.
@@ -186,8 +159,8 @@ fn quick_menu_buttons(w: f32, h: f32) -> [(f32, f32, f32, f32); 8] {
     let start_x = w - total_w - 10.0;
     let y = h - btn_h - 10.0;
     let mut buttons = [(0.0, 0.0, 0.0, 0.0); 8];
-    for i in 0..8 {
-        buttons[i] = (start_x + i as f32 * (btn_w + gap), y, btn_w, btn_h);
+    for (i, button) in buttons.iter_mut().enumerate() {
+        *button = (start_x + i as f32 * (btn_w + gap), y, btn_w, btn_h);
     }
     buttons
 }
@@ -208,18 +181,20 @@ impl App {
                 None
             });
 
+        // TODO: migrate to `ActiveEventLoop::create_window` inside
+        // `resumed()` when the event loop is refactored to
+        // `ApplicationHandler`.
+        #[allow(deprecated)]
         let window = Arc::new(event_loop.create_window(window_attrs)?);
 
         // Initialize wgpu.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(event_loop.owned_display_handle()),
         ));
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions::default(),
-        ))?;
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor::default(),
-        ))?;
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
         let surface = instance.create_surface(window.clone())?;
         // Query the surface's preferred format instead of hardcoding.
         let capabilities = surface.get_capabilities(&adapter);
@@ -228,7 +203,13 @@ impl App {
             .iter()
             .find(|f| matches!(f, wgpu::TextureFormat::Bgra8UnormSrgb))
             .copied()
-            .unwrap_or(capabilities.formats.first().copied().unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb));
+            .unwrap_or(
+                capabilities
+                    .formats
+                    .first()
+                    .copied()
+                    .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb),
+            );
 
         let window_size = window.inner_size();
         let renderer = Renderer::new(
@@ -247,37 +228,32 @@ impl App {
         let script_path = project_root.join(&config.entry_script);
         let script_src = std::fs::read_to_string(&script_path)?;
         let script = Parser::parse(&script_src)?;
-        let vm = Vm::new(script);
+        let mut runtime = Runtime::new(script);
 
         // Audio.
         let audio = AudioEngine::new(settings.clone())?;
 
         // Gallery.
         let gallery_path = project_root.join(&config.save_dir).join("gallery.json");
-        let gallery = GalleryState::load(&gallery_path);
+        runtime.gallery = GalleryState::load(&gallery_path);
 
         let app = App {
             config,
             project_root,
             settings,
-            vm,
-            scene: Scene::default(),
+            runtime,
             audio,
             renderer,
             input: Input::new(),
             screen: Screen::Title { selected: 0 },
             blocking: None,
             transition: None,
-            pending_menu: None,
-            gallery,
+            last_bgm: None,
             play_time: 0.0,
             last_frame: Instant::now(),
             auto_timer: 0.0,
             auto_advance: false,
             skip: false,
-            history: Vec::new(),
-            rollback_stack: Vec::new(),
-            rollforward_stack: Vec::new(),
             auto_save_timer: 0.0,
             shake: None,
             window_size: (window_size.width, window_size.height),
@@ -294,157 +270,75 @@ impl App {
         Ok(())
     }
 
-    /// Step the VM forward, processing commands until we hit a blocking one.
+    /// Step the runtime forward until it blocks on user-visible content.
     fn step_vm(&mut self) {
+        let event = self.runtime.step();
+        self.pump(event);
+    }
+
+    /// Dispatch runtime events until one blocks on the player.
+    fn pump(&mut self, mut event: RuntimeEvent) {
         loop {
-            match self.vm.step() {
-                StepResult::Command(cmd) => {
-                    if self.handle_command(cmd.clone()) {
-                        // Blocking command: stop stepping.
-                        return;
-                    }
-                    // Non-blocking: continue stepping.
-                }
-                StepResult::Menu { prompt, choices } => {
-                    let texts: Vec<String> = choices.iter().map(|c| c.text.clone()).collect();
-                    self.screen = Screen::Menu {
-                        prompt,
-                        choices: texts.clone(),
-                        hovered: 0,
-                    };
-                    self.pending_menu = Some(texts);
-                    return;
-                }
-                StepResult::Finished => {
-                    self.screen = Screen::End;
-                    return;
-                }
+            if self.dispatch(event) {
+                return;
+            }
+            event = self.runtime.step();
+        }
+    }
+
+    /// Handle a runtime event. Returns `true` once the runtime is blocked
+    /// on user-visible content (dialogue, menu, end screen).
+    fn dispatch(&mut self, event: RuntimeEvent) -> bool {
+        match event {
+            RuntimeEvent::Effect(cmd) => {
+                self.apply_effect(cmd);
+                false
+            }
+            RuntimeEvent::Blocking(cmd) => {
+                self.set_blocking(cmd, false);
+                true
+            }
+            RuntimeEvent::Menu { prompt, choices } => {
+                self.screen = Screen::Menu {
+                    prompt,
+                    choices,
+                    hovered: 0,
+                };
+                true
+            }
+            RuntimeEvent::Finished => {
+                self.screen = Screen::End;
+                true
             }
         }
     }
 
-    /// Handle a command. Returns `true` if the command is blocking (requires
-    /// user input before the VM can continue).
-    fn handle_command(&mut self, cmd: Command) -> bool {
+    /// Apply a host-side side effect: audio, transition timers, screen
+    /// shake, gallery persistence. Scene state itself is already updated
+    /// by the runtime.
+    fn apply_effect(&mut self, cmd: Command) {
         match cmd {
-            Command::Scene { image, transition } => {
-                // Start a transition if specified.
+            Command::Scene { transition, .. } => {
                 let duration = transition.default_duration();
-                if duration > 0.0 && self.scene.background.is_some() {
-                    self.scene.prev_background = self.scene.background.take();
-                    self.scene.prev_bg_opacity = 1.0;
-                    self.scene.bg_opacity = 0.0;
+                if duration > 0.0 && self.runtime.scene.prev_background.is_some() {
                     self.transition = Some(ActiveTransition {
                         transition,
                         elapsed: 0.0,
                         duration,
                     });
-                } else {
-                    self.scene.bg_opacity = 1.0;
                 }
-                self.scene.background = image;
-                false
             }
-            Command::Show(spec) => {
-                self.scene.set_sprite(&spec);
-                false
-            }
-            Command::Hide { character, transition } => {
-                let duration = transition.default_duration();
-                if duration > 0.0 {
-                    // For now, just hide immediately. A full implementation
-                    // would fade the sprite out over `duration`.
-                    self.scene.hide_sprite(&character);
-                } else {
-                    self.scene.hide_sprite(&character);
-                }
-                false
-            }
-            Command::Say { speaker, text, voice, side_image } => {
-                if let Some(track) = &voice {
-                    let voice_dir = self.project_root.join(&self.config.voice_dir);
-                    self.audio.play_voice(&voice_dir, track);
-                }
-                self.history.push(HistoryEntry {
-                    speaker: speaker.clone(),
-                    text: text.clone(),
-                });
-                self.push_rollback_snapshot();
-                self.blocking = Some(BlockingState {
-                    command: Command::Say {
-                        speaker: speaker.clone(),
-                        text: text.clone(),
-                        voice: voice.clone(),
-                        side_image: side_image.clone(),
-                    },
-                    chars_shown: 0,
-                    typewriter_done: false,
-                    shown_at: Instant::now(),
-                    text,
-                    speaker,
-                    side_image,
-                });
-                self.screen = Screen::Dialogue;
-                true
-            }
-            Command::Narrate { ref text } => {
-                let text = text.clone();
-                self.history.push(HistoryEntry {
-                    speaker: None,
-                    text: text.clone(),
-                });
-                self.push_rollback_snapshot();
-                self.blocking = Some(BlockingState {
-                    command: Command::Narrate { text: text.clone() },
-                    chars_shown: 0,
-                    typewriter_done: false,
-                    shown_at: Instant::now(),
-                    text,
-                    speaker: None,
-                    side_image: None,
-                });
-                self.screen = Screen::Dialogue;
-                true
-            }
-            Command::Menu { .. } => {
-                // Handled by StepResult::Menu in step_vm.
-                false
-            }
-            Command::PlayMusic { track, fade } => {
-                let audio_dir = self.project_root.join(&self.config.audio_dir);
-                self.audio.play_music(&audio_dir, &track, fade);
-                false
-            }
-            Command::StopMusic { fade } => {
-                self.audio.stop_music(fade);
-                false
-            }
+            // PlayMusic/StopMusic are handled by `resync_music`, which
+            // follows `runtime.music` and also covers load/rollback.
             Command::PlaySfx { track, volume } => {
                 let audio_dir = self.project_root.join(&self.config.audio_dir);
                 self.audio.play_sfx(&audio_dir, &track, volume);
-                false
             }
             Command::PlayVoice { track } => {
                 let voice_dir = self.project_root.join(&self.config.voice_dir);
                 self.audio.play_voice(&voice_dir, &track);
-                false
             }
-            Command::StopVoice => {
-                self.audio.stop_voice();
-                false
-            }
-            Command::Pause { seconds } => {
-                self.blocking = Some(BlockingState {
-                    command: Command::Pause { seconds },
-                    chars_shown: 0,
-                    typewriter_done: true,
-                    shown_at: Instant::now(),
-                    text: String::new(),
-                    speaker: None,
-                    side_image: None,
-                });
-                true
-            }
+            Command::StopVoice => self.audio.stop_voice(),
             Command::PlayTransition(transition) => {
                 let duration = transition.default_duration();
                 self.transition = Some(ActiveTransition {
@@ -452,49 +346,63 @@ impl App {
                     elapsed: 0.0,
                     duration,
                 });
-                false
             }
-            Command::Shake { duration, intensity } => {
+            Command::Shake {
+                duration,
+                intensity,
+            } => {
                 self.shake = Some((duration, intensity));
-                false
             }
-            Command::Transform { character, rotation, scale, offset, opacity, layer } => {
-                if let Some(sprite) = self.scene.sprite_mut(&character) {
-                    if let Some(r) = rotation {
-                        sprite.rotation = r;
-                    }
-                    if let Some(s) = scale {
-                        sprite.scale = s;
-                    }
-                    if let Some((ox, oy)) = offset {
-                        sprite.offset[0] = ox;
-                        sprite.offset[1] = oy;
-                    }
-                    if let Some(o) = opacity {
-                        sprite.opacity = o;
-                    }
-                    if let Some(l) = layer {
-                        sprite.layer = l;
-                        self.scene.sprites.sort_by_key(|s| (s.layer, s.z));
-                    }
-                }
-                false
+            Command::RegisterCg { .. } => {
+                let gallery_path = self
+                    .project_root
+                    .join(&self.config.save_dir)
+                    .join("gallery.json");
+                let _ = self.runtime.gallery.save(&gallery_path);
             }
-            Command::RegisterCg { image } => {
-                self.gallery.unlock(&image);
-                let gallery_path = self.project_root.join(&self.config.save_dir).join("gallery.json");
-                let _ = self.gallery.save(&gallery_path);
-                false
-            }
-            Command::SetVariable { name, value } => {
-                self.vm.state.variables.insert(name, value);
-                false
-            }
-            Command::End => {
-                self.screen = Screen::End;
-                true
-            }
+            _ => {}
         }
+    }
+
+    /// Display a blocking command (dialogue line or pause). When
+    /// `complete` is true the text is shown fully revealed, skipping the
+    /// typewriter (used when restoring a save).
+    fn set_blocking(&mut self, cmd: Command, complete: bool) {
+        let (text, speaker, side_image) = match &cmd {
+            Command::Say {
+                speaker,
+                text,
+                side_image,
+                ..
+            } => (text.clone(), speaker.clone(), side_image.clone()),
+            Command::Narrate { text } => (text.clone(), None, None),
+            _ => (String::new(), None, None),
+        };
+        // Voice playback for Say.
+        if let Command::Say {
+            voice: Some(track), ..
+        } = &cmd
+        {
+            let voice_dir = self.project_root.join(&self.config.voice_dir);
+            self.audio.play_voice(&voice_dir, track);
+        }
+        let typewriter_done =
+            complete || !matches!(cmd, Command::Say { .. } | Command::Narrate { .. });
+        let chars_shown = if typewriter_done {
+            vnengine_render::richtext::visible_char_count(&text)
+        } else {
+            0
+        };
+        self.blocking = Some(BlockingState {
+            command: cmd,
+            chars_shown,
+            typewriter_done,
+            shown_at: Instant::now(),
+            text,
+            speaker,
+            side_image,
+        });
+        self.screen = Screen::Dialogue;
     }
 
     /// Advance past the current blocking command.
@@ -512,22 +420,36 @@ impl App {
             }
             return;
         }
-        // Check if it's a Pause command.
-        if let Command::Pause { seconds } = &self.blocking.as_ref().unwrap().command {
-            let elapsed = b.shown_at.elapsed().as_secs_f32();
-            if elapsed < *seconds {
-                return; // Not enough time has passed.
-            }
+        // A pause command is not skippable: the runtime's logical clock
+        // expires it via `Runtime::update`.
+        if matches!(b.command, Command::Pause { .. }) {
+            return;
         }
         self.blocking = None;
         self.step_vm();
     }
 
+    /// Apply `runtime.music` to the audio engine whenever it drifts —
+    /// covers live playback, save/load and rollback/rollforward.
+    fn resync_music(&mut self) {
+        if self.runtime.music == self.last_bgm {
+            return;
+        }
+        let audio_dir = self.project_root.join(&self.config.audio_dir);
+        match &self.runtime.music {
+            Some(track) => self
+                .audio
+                .play_music(&audio_dir, track, self.runtime.music_fade),
+            None => self.audio.stop_music(self.runtime.music_fade),
+        }
+        self.last_bgm = self.runtime.music.clone();
+    }
+
     /// Select a menu choice.
     fn select_choice(&mut self, index: usize) {
-        if self.pending_menu.is_some() {
-            self.vm.resume(Some(MenuResponse::Selected(index)));
-            self.pending_menu = None;
+        if self.runtime.is_on_menu() {
+            self.runtime.resume_menu(index);
+            self.blocking = None;
             self.screen = Screen::Dialogue;
             self.step_vm();
         }
@@ -537,6 +459,15 @@ impl App {
     fn update(&mut self, dt: f32) {
         self.play_time += dt;
 
+        // Advance the runtime's logical clock (expires `pause` commands).
+        if let Some(event) = self.runtime.update(dt) {
+            self.dispatch(event);
+        }
+
+        // Keep BGM playback in sync with the runtime's tracked music
+        // state — this is also what restores music after load/rollback.
+        self.resync_music();
+
         // Auto-save every 60 seconds.
         self.auto_save_timer += dt;
         if self.auto_save_timer >= 60.0 {
@@ -545,7 +476,7 @@ impl App {
         }
 
         // Decay screen shake.
-        if let Some((remaining, intensity)) = &mut self.shake {
+        if let Some((remaining, _)) = &mut self.shake {
             *remaining -= dt;
             if *remaining <= 0.0 {
                 self.shake = None;
@@ -558,20 +489,20 @@ impl App {
             let progress = (t.elapsed / t.duration).min(1.0);
             match &t.transition {
                 Transition::Fade { .. } => {
-                    self.scene.bg_opacity = progress;
-                    self.scene.prev_bg_opacity = 1.0 - progress;
+                    self.runtime.scene.bg_opacity = progress;
+                    self.runtime.scene.prev_bg_opacity = 1.0 - progress;
                 }
                 Transition::Dissolve { .. } => {
-                    self.scene.bg_opacity = progress;
-                    self.scene.prev_bg_opacity = 1.0 - progress;
+                    self.runtime.scene.bg_opacity = progress;
+                    self.runtime.scene.prev_bg_opacity = 1.0 - progress;
                 }
                 Transition::Cut => {
-                    self.scene.bg_opacity = 1.0;
-                    self.scene.prev_bg_opacity = 0.0;
+                    self.runtime.scene.bg_opacity = 1.0;
+                    self.runtime.scene.prev_bg_opacity = 0.0;
                 }
                 Transition::Slide { direction, .. } => {
-                    self.scene.bg_opacity = 1.0;
-                    self.scene.prev_bg_opacity = 1.0 - progress;
+                    self.runtime.scene.bg_opacity = 1.0;
+                    self.runtime.scene.prev_bg_opacity = 1.0 - progress;
                     let offset = match direction {
                         SlideDirection::Left => [progress, 0.0],
                         SlideDirection::Right => [-progress, 0.0],
@@ -579,20 +510,20 @@ impl App {
                         SlideDirection::Down => [0.0, -progress],
                     };
                     // Apply offset to sprites (simplified).
-                    for s in &mut self.scene.sprites {
+                    for s in &mut self.runtime.scene.sprites {
                         s.offset = offset;
                     }
                 }
                 Transition::Zoom { .. } => {
-                    self.scene.bg_opacity = progress;
-                    self.scene.prev_bg_opacity = 1.0 - progress;
+                    self.runtime.scene.bg_opacity = progress;
+                    self.runtime.scene.prev_bg_opacity = 1.0 - progress;
                 }
             }
             if t.elapsed >= t.duration {
-                self.scene.prev_background = None;
-                self.scene.prev_bg_opacity = 0.0;
-                self.scene.bg_opacity = 1.0;
-                for s in &mut self.scene.sprites {
+                self.runtime.scene.prev_background = None;
+                self.runtime.scene.prev_bg_opacity = 0.0;
+                self.runtime.scene.bg_opacity = 1.0;
+                for s in &mut self.runtime.scene.sprites {
                     s.offset = [0.0, 0.0];
                 }
                 self.transition = None;
@@ -633,10 +564,8 @@ impl App {
         }
 
         // Skip mode.
-        if self.skip {
-            if self.blocking.is_some() {
-                self.advance();
-            }
+        if self.skip && self.blocking.is_some() {
+            self.advance();
         }
     }
 
@@ -648,7 +577,12 @@ impl App {
         }
 
         // Handle confirm dialog first — it intercepts most input.
-        if let Screen::Confirm { message, selected, action } = &self.screen.clone() {
+        if let Screen::Confirm {
+            message,
+            selected,
+            action,
+        } = &self.screen.clone()
+        {
             let message = message.clone();
             let mut selected = *selected;
             let action = action.clone();
@@ -692,7 +626,11 @@ impl App {
                     }
                 }
             }
-            self.screen = Screen::Confirm { message, selected, action };
+            self.screen = Screen::Confirm {
+                message,
+                selected,
+                action,
+            };
             return;
         }
 
@@ -700,7 +638,9 @@ impl App {
         match &self.screen.clone() {
             Screen::Title { selected } => {
                 let mut sel = *selected;
-                let buttons = ["New Game", "Continue", "Load", "Settings", "Gallery", "Quit"];
+                let buttons = [
+                    "New Game", "Continue", "Load", "Settings", "Gallery", "Quit",
+                ];
                 let n = buttons.len();
                 if self.input.pressed(Action::Down) {
                     sel = (sel + 1) % n;
@@ -717,7 +657,6 @@ impl App {
                     for i in 0..n {
                         let y = start_y + i as f32 * btn_h;
                         if my >= y && my < y + btn_h && mx > w * 0.3 && mx < w * 0.7 {
-                            sel = i;
                             self.activate_title_button(i);
                             return;
                         }
@@ -732,11 +671,17 @@ impl App {
             Screen::Dialogue => {
                 // Quick menu hotkeys.
                 if self.input.pressed(Action::Save) {
-                    self.screen = Screen::SaveLoad { mode: SaveLoadMode::Save, selected: 0 };
+                    self.screen = Screen::SaveLoad {
+                        mode: SaveLoadMode::Save,
+                        selected: 0,
+                    };
                     return;
                 }
                 if self.input.pressed(Action::Load) {
-                    self.screen = Screen::SaveLoad { mode: SaveLoadMode::Load, selected: 0 };
+                    self.screen = Screen::SaveLoad {
+                        mode: SaveLoadMode::Load,
+                        selected: 0,
+                    };
                     return;
                 }
                 if self.input.pressed(Action::Settings) {
@@ -789,11 +734,17 @@ impl App {
                         QuickMenuAction::Auto => self.auto_advance = !self.auto_advance,
                         QuickMenuAction::Skip => self.skip = !self.skip,
                         QuickMenuAction::Save => {
-                            self.screen = Screen::SaveLoad { mode: SaveLoadMode::Save, selected: 0 };
+                            self.screen = Screen::SaveLoad {
+                                mode: SaveLoadMode::Save,
+                                selected: 0,
+                            };
                             return;
                         }
                         QuickMenuAction::Load => {
-                            self.screen = Screen::SaveLoad { mode: SaveLoadMode::Load, selected: 0 };
+                            self.screen = Screen::SaveLoad {
+                                mode: SaveLoadMode::Load,
+                                selected: 0,
+                            };
                             return;
                         }
                         QuickMenuAction::Settings => {
@@ -884,7 +835,7 @@ impl App {
                     sel = (sel + n_slots - 1) % n_slots;
                 }
                 if self.input.pressed(Action::Cancel) {
-                    self.screen = if self.vm.state.finished {
+                    self.screen = if self.runtime.vm.state.finished {
                         Screen::Title { selected: 0 }
                     } else {
                         Screen::Dialogue
@@ -895,7 +846,7 @@ impl App {
                     let slot = sel as u32;
                     match mode {
                         SaveLoadMode::Save => {
-                            if self.vm.state.finished {
+                            if self.runtime.vm.state.finished {
                                 return; // Can't save after game over.
                             }
                             let _ = self.save(slot);
@@ -929,7 +880,7 @@ impl App {
                             let slot = i as u32;
                             match mode {
                                 SaveLoadMode::Save => {
-                                    if !self.vm.state.finished {
+                                    if !self.runtime.vm.state.finished {
                                         let _ = self.save(slot);
                                         self.screen = Screen::Dialogue;
                                         return;
@@ -943,7 +894,10 @@ impl App {
                         }
                     }
                 }
-                self.screen = Screen::SaveLoad { mode, selected: sel };
+                self.screen = Screen::SaveLoad {
+                    mode,
+                    selected: sel,
+                };
             }
             Screen::Settings { selected } => {
                 let mut sel = *selected;
@@ -956,7 +910,7 @@ impl App {
                 }
                 if self.input.pressed(Action::Cancel) {
                     self.save_settings();
-                    self.screen = if self.vm.state.finished {
+                    self.screen = if self.runtime.vm.state.finished {
                         Screen::Title { selected: 0 }
                     } else {
                         Screen::Dialogue
@@ -965,14 +919,37 @@ impl App {
                 }
                 // Adjust settings with left/right.
                 if self.input.pressed(Action::Left) || self.input.pressed(Action::Right) {
-                    let dir: f64 = if self.input.pressed(Action::Right) { 1.0 } else { -1.0 };
+                    let dir: f64 = if self.input.pressed(Action::Right) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
                     match sel {
-                        0 => self.settings.master_volume = (self.settings.master_volume + dir * 0.1).clamp(0.0, 1.0),
-                        1 => self.settings.music_volume = (self.settings.music_volume + dir * 0.1).clamp(0.0, 1.0),
-                        2 => self.settings.sfx_volume = (self.settings.sfx_volume + dir * 0.1).clamp(0.0, 1.0),
-                        3 => self.settings.voice_volume = (self.settings.voice_volume + dir * 0.1).clamp(0.0, 1.0),
-                        4 => self.settings.text_speed = (self.settings.text_speed + dir as f32 * 10.0).clamp(0.0, 200.0),
-                        5 => self.settings.auto_advance_delay = (self.settings.auto_advance_delay + dir as f32 * 0.5).clamp(0.0, 10.0),
+                        0 => {
+                            self.settings.master_volume =
+                                (self.settings.master_volume + dir * 0.1).clamp(0.0, 1.0)
+                        }
+                        1 => {
+                            self.settings.music_volume =
+                                (self.settings.music_volume + dir * 0.1).clamp(0.0, 1.0)
+                        }
+                        2 => {
+                            self.settings.sfx_volume =
+                                (self.settings.sfx_volume + dir * 0.1).clamp(0.0, 1.0)
+                        }
+                        3 => {
+                            self.settings.voice_volume =
+                                (self.settings.voice_volume + dir * 0.1).clamp(0.0, 1.0)
+                        }
+                        4 => {
+                            self.settings.text_speed =
+                                (self.settings.text_speed + dir as f32 * 10.0).clamp(0.0, 200.0)
+                        }
+                        5 => {
+                            self.settings.auto_advance_delay = (self.settings.auto_advance_delay
+                                + dir as f32 * 0.5)
+                                .clamp(0.0, 10.0)
+                        }
                         6 => self.settings.fullscreen = !self.settings.fullscreen,
                         7 => self.settings.auto_advance = !self.settings.auto_advance,
                         8 => self.settings.skip_unread = !self.settings.skip_unread,
@@ -985,10 +962,10 @@ impl App {
             }
             Screen::Gallery { selected } => {
                 let mut sel = *selected;
-                let n = self.gallery.unlocked.len();
+                let n = self.runtime.gallery.unlocked.len();
                 if n == 0 {
                     if self.input.pressed(Action::Cancel) || self.input.pressed(Action::Advance) {
-                        self.screen = if self.vm.state.finished {
+                        self.screen = if self.runtime.vm.state.finished {
                             Screen::Title { selected: 0 }
                         } else {
                             Screen::Dialogue
@@ -1003,7 +980,7 @@ impl App {
                     sel = (sel + n - 1) % n;
                 }
                 if self.input.pressed(Action::Cancel) {
-                    self.screen = if self.vm.state.finished {
+                    self.screen = if self.runtime.vm.state.finished {
                         Screen::Title { selected: 0 }
                     } else {
                         Screen::Dialogue
@@ -1014,7 +991,7 @@ impl App {
             }
             Screen::Backlog { scroll } => {
                 let mut sc = *scroll;
-                let max_scroll = self.history.len().saturating_sub(1);
+                let max_scroll = self.runtime.history.len().saturating_sub(1);
                 if self.input.pressed(Action::Up) {
                     sc = sc.saturating_sub(1);
                 }
@@ -1027,10 +1004,8 @@ impl App {
                 }
                 self.screen = Screen::Backlog { scroll: sc };
             }
-            Screen::End => {
-                if self.input.advance_requested() || self.input.pressed(Action::Cancel) {
-                    self.screen = Screen::Title { selected: 0 };
-                }
+            Screen::End if self.input.advance_requested() || self.input.pressed(Action::Cancel) => {
+                self.screen = Screen::Title { selected: 0 };
             }
             _ => {}
         }
@@ -1058,7 +1033,10 @@ impl App {
             }
             2 => {
                 // Load
-                self.screen = Screen::SaveLoad { mode: SaveLoadMode::Load, selected: 0 };
+                self.screen = Screen::SaveLoad {
+                    mode: SaveLoadMode::Load,
+                    selected: 0,
+                };
             }
             3 => {
                 // Settings
@@ -1090,87 +1068,40 @@ impl App {
                 // We can't directly close the window from here, but
                 // setting finished will cause the app to exit on next
                 // event. A real implementation would signal the event loop.
-                self.vm.state.finished = true;
+                self.runtime.vm.state.finished = true;
                 self.screen = Screen::End;
-            }
-            ConfirmAction::OverwriteSave(slot) => {
-                let _ = self.save(*slot);
-                self.screen = Screen::Dialogue;
             }
         }
     }
 
     /// Save settings to disk.
     fn save_settings(&self) {
-        let settings_path = self.project_root.join(&self.config.save_dir).join("settings.json");
+        let settings_path = self
+            .project_root
+            .join(&self.config.save_dir)
+            .join("settings.json");
         let _ = self.settings.save(&settings_path);
     }
 
-    /// Push a rollback snapshot of the current state.
-    fn push_rollback_snapshot(&mut self) {
-        let snapshot = RollbackSnapshot {
-            vm_state: self.vm.save_state(),
-            scene: self.scene.clone(),
-            blocking_text: self.blocking.as_ref().map(|b| b.text.clone()),
-            blocking_speaker: self.blocking.as_ref().and_then(|b| b.speaker.clone()),
-            screen_is_dialogue: matches!(self.screen, Screen::Dialogue),
-        };
-        self.rollback_stack.push(snapshot);
-        // Limit stack size to prevent unbounded memory growth.
-        if self.rollback_stack.len() > 50 {
-            self.rollback_stack.remove(0);
-        }
-        // Clear rollforward stack — a new action invalidates it.
-        self.rollforward_stack.clear();
-    }
-
-    /// Rollback to the previous state.
+    /// Rollback to the previous blocking point (Ren'Py-style).
     fn rollback(&mut self) {
-        if let Some(snapshot) = self.rollback_stack.pop() {
-            // Push current state to rollforward stack.
-            let current = RollbackSnapshot {
-                vm_state: self.vm.save_state(),
-                scene: self.scene.clone(),
-                blocking_text: self.blocking.as_ref().map(|b| b.text.clone()),
-                blocking_speaker: self.blocking.as_ref().and_then(|b| b.speaker.clone()),
-                screen_is_dialogue: matches!(self.screen, Screen::Dialogue),
-            };
-            self.rollforward_stack.push(current);
-
-            // Restore the snapshot.
-            self.vm.state = snapshot.vm_state;
-            self.scene = snapshot.scene;
-            self.blocking = None;
-            self.screen = Screen::Dialogue;
-            // Re-step to get the blocking command again.
-            self.step_vm();
+        self.blocking = None;
+        if let Some(event) = self.runtime.rollback() {
+            self.pump(event);
         }
     }
 
     /// Rollforward (undo a rollback).
     fn rollforward(&mut self) {
-        if let Some(snapshot) = self.rollforward_stack.pop() {
-            // Push current state back to rollback stack.
-            self.rollback_stack.push(RollbackSnapshot {
-                vm_state: self.vm.save_state(),
-                scene: self.scene.clone(),
-                blocking_text: self.blocking.as_ref().map(|b| b.text.clone()),
-                blocking_speaker: self.blocking.as_ref().and_then(|b| b.speaker.clone()),
-                screen_is_dialogue: matches!(self.screen, Screen::Dialogue),
-            });
-
-            // Restore the snapshot.
-            self.vm.state = snapshot.vm_state;
-            self.scene = snapshot.scene;
-            self.blocking = None;
-            self.screen = Screen::Dialogue;
-            self.step_vm();
+        self.blocking = None;
+        if let Some(event) = self.runtime.rollforward() {
+            self.pump(event);
         }
     }
 
     /// Auto-save to slot 0.
     fn auto_save(&mut self) {
-        if !self.vm.state.finished {
+        if !self.runtime.vm.state.finished {
             let _ = self.save(0);
         }
     }
@@ -1280,7 +1211,11 @@ impl App {
                     });
                 }
             }
-            Screen::Menu { prompt, choices, hovered } => {
+            Screen::Menu {
+                prompt,
+                choices,
+                hovered,
+            } => {
                 // Dim background.
                 ui.boxes.push(UiBox {
                     x: 0.0,
@@ -1353,7 +1288,9 @@ impl App {
                 });
 
                 // Buttons.
-                let buttons = ["New Game", "Continue", "Load", "Settings", "Gallery", "Quit"];
+                let buttons = [
+                    "New Game", "Continue", "Load", "Settings", "Gallery", "Quit",
+                ];
                 let btn_h = 50.0;
                 let start_y = h * 0.3;
                 for (i, label) in buttons.iter().enumerate() {
@@ -1491,7 +1428,10 @@ impl App {
                     format!("SFX Volume: {:.0}%", self.settings.sfx_volume * 100.0),
                     format!("Voice Volume: {:.0}%", self.settings.voice_volume * 100.0),
                     format!("Text Speed: {:.0} cps", self.settings.text_speed),
-                    format!("Auto-Advance Delay: {:.1}s", self.settings.auto_advance_delay),
+                    format!(
+                        "Auto-Advance Delay: {:.1}s",
+                        self.settings.auto_advance_delay
+                    ),
                     format!("Fullscreen: {}", self.settings.fullscreen),
                     format!("Auto-Advance: {}", self.settings.auto_advance),
                     format!("Skip Unread: {}", self.settings.skip_unread),
@@ -1552,7 +1492,7 @@ impl App {
                     rich: false,
                 });
 
-                if self.gallery.unlocked.is_empty() {
+                if self.runtime.gallery.unlocked.is_empty() {
                     ui.text.push(UiText {
                         text: "No CGs unlocked yet.".to_string(),
                         left: w * 0.35,
@@ -1570,7 +1510,7 @@ impl App {
                     let gap_y = h * 0.03;
                     let start_x = w * 0.05;
                     let start_y = h * 0.15;
-                    for (i, cg) in self.gallery.unlocked.iter().enumerate() {
+                    for (i, cg) in self.runtime.gallery.unlocked.iter().enumerate() {
                         let col = i % cols;
                         let row = i / cols;
                         let x = start_x + col as f32 * (cg_w + gap_x);
@@ -1631,12 +1571,12 @@ impl App {
 
                 // Show last N entries.
                 let max_display = 15;
-                let total = self.history.len();
+                let total = self.runtime.history.len();
                 let start_idx = total.saturating_sub(max_display + *scroll);
                 let end_idx = total.saturating_sub(*scroll);
                 let start_y = h * 0.08;
                 let line_h = 35.0;
-                for (i, entry) in self.history[start_idx..end_idx].iter().enumerate() {
+                for (i, entry) in self.runtime.history[start_idx..end_idx].iter().enumerate() {
                     let y = start_y + i as f32 * line_h;
                     if let Some(speaker) = &entry.speaker {
                         ui.text.push(UiText {
@@ -1661,7 +1601,9 @@ impl App {
                     }
                 }
             }
-            Screen::Confirm { message, selected, .. } => {
+            Screen::Confirm {
+                message, selected, ..
+            } => {
                 // Dim background.
                 ui.boxes.push(UiBox {
                     x: 0.0,
@@ -1766,7 +1708,7 @@ impl App {
     /// Save the game to a slot.
     pub fn save(&self, slot: u32) -> anyhow::Result<()> {
         let save_dir = self.project_root.join(&self.config.save_dir);
-        let vm_state = self.vm.save_state();
+        let snap = self.runtime.capture();
         let label = self
             .blocking
             .as_ref()
@@ -1780,8 +1722,11 @@ impl App {
             slot,
             label,
             play_time: self.play_time,
-            vm_state: serde_json::to_vec(&vm_state)?,
-            variables: self.vm.state.variables.clone(),
+            vm_state: serde_json::to_vec(&snap.vm_state)?,
+            scene: snap.scene,
+            blocking: self.blocking.as_ref().map(|b| b.command.clone()),
+            music: snap.music,
+            journal: snap.journal,
             thumbnail,
             saved_at: chrono::Utc::now().timestamp(),
         };
@@ -1791,13 +1736,16 @@ impl App {
 
     /// Generate a small PNG thumbnail from the current background image.
     fn generate_thumbnail(&self) -> Option<Vec<u8>> {
-        let bg = self.scene.background.as_ref()?;
+        let bg = self.runtime.scene.background.as_ref()?;
         let image_path = self.project_root.join(&self.config.image_dir).join(bg);
         let img = image::open(&image_path).ok()?;
         let thumb = img.resize_to_fill(160, 90, image::imageops::FilterType::Lanczos3);
         let mut buf = Vec::new();
         let mut cursor = std::io::Cursor::new(&mut buf);
-        thumb.to_rgba8().write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+        thumb
+            .to_rgba8()
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .ok()?;
         Some(buf)
     }
 
@@ -1805,17 +1753,34 @@ impl App {
     pub fn load(&mut self, slot: u32) -> anyhow::Result<()> {
         let save_dir = self.project_root.join(&self.config.save_dir);
         let state = SaveState::read(&save_dir, slot)?;
-        let vm_state: vnengine_script::vm::VmState =
-            serde_json::from_slice(&state.vm_state)?;
-        // Re-parse the script and restore VM state.
+        let vm_state: vnengine_script::vm::VmState = serde_json::from_slice(&state.vm_state)?;
+        // Re-parse the script and restore VM + scene state.
         let script_path = self.project_root.join(&self.config.entry_script);
         let script_src = std::fs::read_to_string(&script_path)?;
         let script = Parser::parse(&script_src)?;
-        self.vm = Vm::restore(script, vm_state);
-        self.vm.state.variables = state.variables;
+        self.runtime = Runtime::restore(
+            script,
+            RuntimeSnapshot {
+                vm_state,
+                scene: state.scene,
+                music: state.music,
+                journal: state.journal,
+            },
+        );
         self.blocking = None;
-        self.screen = Screen::Dialogue;
-        self.step_vm();
+        self.transition = None;
+        if self.runtime.is_on_menu() {
+            // The save was taken on a menu: re-display it.
+            let event = self.runtime.resume_display();
+            self.dispatch(event);
+        } else if let Some(cmd) = state.blocking {
+            // Re-display the line that was shown when saving (fully
+            // revealed, no typewriter replay).
+            self.set_blocking(cmd, true);
+        } else {
+            self.screen = Screen::Dialogue;
+            self.step_vm();
+        }
         Ok(())
     }
 }
@@ -1832,9 +1797,9 @@ impl winit::application::ApplicationHandler for AppHandler {
         // or "Continue" is selected.
         let mut app = self.app.lock();
         if !matches!(app.screen, Screen::Title { .. })
-            && !app.vm.state.finished
+            && !app.runtime.vm.state.finished
             && app.blocking.is_none()
-            && app.pending_menu.is_none()
+            && !app.runtime.is_on_menu()
         {
             app.step_vm();
         }
@@ -1869,8 +1834,7 @@ impl winit::application::ApplicationHandler for AppHandler {
                 }
             }
             winit::event::WindowEvent::CursorMoved { position, .. } => {
-                app.input
-                    .mouse_move(position.x as f32, position.y as f32);
+                app.input.mouse_move(position.x as f32, position.y as f32);
             }
             winit::event::WindowEvent::MouseInput { state, button, .. } => {
                 use winit::event::{ElementState, MouseButton};
@@ -1884,16 +1848,13 @@ impl winit::application::ApplicationHandler for AppHandler {
             }
             winit::event::WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = now
-                    .duration_since(app.last_frame)
-                    .as_secs_f32()
-                    .min(0.1);
+                let dt = now.duration_since(app.last_frame).as_secs_f32().min(0.1);
                 app.last_frame = now;
                 app.handle_input();
                 app.update(dt);
                 let ui = app.build_ui();
                 let image_root = app.project_root.join(&app.config.image_dir);
-                let mut scene = app.scene.clone();
+                let mut scene = app.runtime.scene.clone();
                 // Apply screen shake offset.
                 if let Some((remaining, intensity)) = app.shake {
                     use std::collections::hash_map::DefaultHasher;

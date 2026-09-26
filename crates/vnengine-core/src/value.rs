@@ -52,7 +52,11 @@ impl Value {
             Value::None => Some("None".to_string()),
             Value::List(items) => Some(format!(
                 "[{}]",
-                items.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+                items
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
         }
     }

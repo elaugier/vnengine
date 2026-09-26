@@ -127,8 +127,7 @@ impl Renderer {
             ],
         });
 
-        let textured_pipeline =
-            create_textured_pipeline(&device, format, &bind_group_layout);
+        let textured_pipeline = create_textured_pipeline(&device, format, &bind_group_layout);
         let color_pipeline = create_color_pipeline(&device, format);
 
         Ok(Self {
@@ -157,12 +156,7 @@ impl Renderer {
     }
 
     /// Render a frame.
-    pub fn render(
-        &mut self,
-        scene: &Scene,
-        image_root: &Path,
-        ui: &UiDraw,
-    ) -> anyhow::Result<()> {
+    pub fn render(&mut self, scene: &Scene, image_root: &Path, ui: &UiDraw) -> anyhow::Result<()> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Timeout
@@ -304,10 +298,7 @@ impl Renderer {
         // --- UI Image pass ---
         for img in &ui.images {
             if let Some(texture) = self.textures.get(&img.path) {
-                let (iw, ih) = (
-                    texture.width as f32,
-                    texture.height as f32,
-                );
+                let (iw, ih) = (texture.width as f32, texture.height as f32);
                 let (w, h) = img.size.unwrap_or((iw, ih));
                 let scale = (w / iw).min(h / ih);
                 let draw_w = iw * scale;

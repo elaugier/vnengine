@@ -21,7 +21,7 @@ pub enum Anchor {
 }
 
 /// A sprite to display on screen.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpriteSpec {
     /// Character identifier (used to replace/hide existing sprites).
     pub character: String,
@@ -38,7 +38,7 @@ pub struct SpriteSpec {
 }
 
 /// A single choice in a menu.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MenuChoice {
     pub text: String,
     /// Condition expression that must evaluate truthy for the choice to be
@@ -47,7 +47,7 @@ pub struct MenuChoice {
 }
 
 /// Commands produced by the script VM.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     /// Show a background image, replacing the current one.
     Scene {

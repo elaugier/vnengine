@@ -41,7 +41,9 @@ impl Parser {
     }
 
     pub fn parse(src: &str) -> Result<Script, ParseError> {
-        let tokens = Lexer::new(src).tokenize().map_err(|e| err(0, e.to_string()))?;
+        let tokens = Lexer::new(src)
+            .tokenize()
+            .map_err(|e| err(0, e.to_string()))?;
         let mut p = Parser::new(tokens);
         p.parse_script()
     }
@@ -233,7 +235,7 @@ impl Parser {
                             i += 1;
                             color = Some([r, g, b]);
                         } else if let Token::StringLit(ref s) = toks[i].token {
-                            color = parse_hex_color(&s, line_no)?;
+                            color = parse_hex_color(s, line_no)?;
                             i += 1;
                         } else {
                             return Err(err(line_no, "expected color value"));
@@ -247,7 +249,11 @@ impl Parser {
                 i += 1;
             }
         }
-        Ok(Definition::Character { id: id.to_string(), name, color })
+        Ok(Definition::Character {
+            id: id.to_string(),
+            name,
+            color,
+        })
     }
 
     /// Parse a label starting at `lines[0]`. Returns the label and the number
@@ -305,7 +311,6 @@ impl Parser {
             Token::For => self.parse_for_stmt(lines, indent, line_no),
             Token::Transform => self.parse_transform_stmt(lines, indent, line_no),
             Token::Shake => self.parse_shake_stmt(toks, line_no),
-            Token::Return => Ok((Stmt::ReturnStmt, 1)),
             Token::Pause => {
                 let expr = self.parse_expr_tokens(&toks[1..], line_no)?;
                 Ok((Stmt::Pause { seconds: expr }, 1))
@@ -359,14 +364,17 @@ impl Parser {
             }
             Token::StringLit(text) => {
                 // Narration: "text"
-                Ok((Stmt::Say {
-                    speaker: None,
-                    text: text.clone(),
-                    voice: None,
-                    side_image: None,
-                }, 1))
+                Ok((
+                    Stmt::Say {
+                        speaker: None,
+                        text: text.clone(),
+                        voice: None,
+                        side_image: None,
+                    },
+                    1,
+                ))
             }
-            Token::Ident(s) => {
+            Token::Ident(_) => {
                 // Speaker line: <id> "text" [voice "track"]
                 self.parse_say_stmt(toks, line_no)
             }
@@ -374,7 +382,11 @@ impl Parser {
         }
     }
 
-    fn parse_scene_stmt(&self, toks: &[Spanned], line_no: usize) -> Result<(Stmt, usize), ParseError> {
+    fn parse_scene_stmt(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+    ) -> Result<(Stmt, usize), ParseError> {
         // scene <image...> [with <transition>]
         // or `scene` alone (clear)
         let mut image_parts = Vec::new();
@@ -413,7 +425,11 @@ impl Parser {
         Ok((Stmt::Scene { image, transition }, 1))
     }
 
-    fn parse_show_stmt(&self, toks: &[Spanned], line_no: usize) -> Result<(Stmt, usize), ParseError> {
+    fn parse_show_stmt(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+    ) -> Result<(Stmt, usize), ParseError> {
         // show <character> <image> [at <anchor>] [with <transition>]
         // image may be a single ident or "char expr" (we join idents with space).
         let character = expect_ident(&toks[1], line_no, "character id")?;
@@ -514,7 +530,11 @@ impl Parser {
         ))
     }
 
-    fn parse_hide_stmt(&self, toks: &[Spanned], line_no: usize) -> Result<(Stmt, usize), ParseError> {
+    fn parse_hide_stmt(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+    ) -> Result<(Stmt, usize), ParseError> {
         let character = expect_ident(&toks[1], line_no, "character id")?;
         let mut transition = None;
         if let Some(t) = toks.get(2) {
@@ -526,10 +546,20 @@ impl Parser {
                 });
             }
         }
-        Ok((Stmt::Hide { character, transition }, 1))
+        Ok((
+            Stmt::Hide {
+                character,
+                transition,
+            },
+            1,
+        ))
     }
 
-    fn parse_transition(&self, toks: &[Spanned], line_no: usize) -> Result<(String, Option<f32>), ParseError> {
+    fn parse_transition(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+    ) -> Result<(String, Option<f32>), ParseError> {
         if toks.is_empty() {
             return Err(err(line_no, "expected transition name after `with`"));
         }
@@ -636,7 +666,7 @@ impl Parser {
         &self,
         lines: &[Line],
         indent: usize,
-        line_no: usize,
+        _line_no: usize,
     ) -> Result<(Stmt, usize), ParseError> {
         // if <cond>:
         //     body
@@ -704,17 +734,20 @@ impl Parser {
                 _ => break,
             }
         }
-        Ok((Stmt::If {
-            branches,
-            else_branch,
-        }, consumed))
+        Ok((
+            Stmt::If {
+                branches,
+                else_branch,
+            },
+            consumed,
+        ))
     }
 
     fn parse_while_stmt(
         &self,
         lines: &[Line],
         indent: usize,
-        line_no: usize,
+        _line_no: usize,
     ) -> Result<(Stmt, usize), ParseError> {
         // while <cond>:
         //     body
@@ -763,13 +796,17 @@ impl Parser {
         let base_indent = indent;
         let mut consumed = 1;
         let body = self.parse_block(lines, base_indent, &mut consumed)?;
-        Ok((Stmt::For { var, iterable, body }, consumed))
+        Ok((
+            Stmt::For {
+                var,
+                iterable,
+                body,
+            },
+            consumed,
+        ))
     }
 
-    fn parse_def_stmt(
-        &self,
-        lines: &[Line],
-    ) -> Result<(FunctionDef, usize), ParseError> {
+    fn parse_def_stmt(&self, lines: &[Line]) -> Result<(FunctionDef, usize), ParseError> {
         // def <name>(<params>):
         //     body
         let first = &lines[0];
@@ -843,7 +880,13 @@ impl Parser {
         }
         let intensity = intensity.ok_or_else(|| err(line_no, "shake requires intensity="))?;
         let duration = duration.ok_or_else(|| err(line_no, "shake requires duration="))?;
-        Ok((Stmt::Shake { intensity, duration }, 1))
+        Ok((
+            Stmt::Shake {
+                intensity,
+                duration,
+            },
+            1,
+        ))
     }
 
     fn parse_transform_stmt(
@@ -900,33 +943,43 @@ impl Parser {
                         layer = Some(name.clone());
                     }
                 }
-                "offset" => {
-                    // offset = (x, y) or offset = x, y
-                    if value_toks.len() >= 2 {
-                        // Try parsing as (x, y) or x, y
-                        let mut toks = value_toks.clone();
-                        // Remove parens if present
-                        if matches!(toks.first().map(|t| &t.token), Some(Token::LParen)) {
-                            toks.remove(0);
-                        }
-                        if matches!(toks.last().map(|t| &t.token), Some(Token::RParen)) {
-                            toks.pop();
-                        }
-                        // Split on comma
-                        if let Some(comma_pos) = toks.iter().position(|t| matches!(t.token, Token::Comma)) {
-                            let x_toks = &toks[..comma_pos];
-                            let y_toks = &toks[comma_pos + 1..];
-                            let x = self.parse_expr_tokens(x_toks, line_no)?;
-                            let y = self.parse_expr_tokens(y_toks, line_no)?;
-                            offset = Some((x, y));
-                        }
+                // offset = (x, y) or offset = x, y
+                "offset" if value_toks.len() >= 2 => {
+                    // Try parsing as (x, y) or x, y
+                    let mut toks = value_toks.clone();
+                    // Remove parens if present
+                    if matches!(toks.first().map(|t| &t.token), Some(Token::LParen)) {
+                        toks.remove(0);
+                    }
+                    if matches!(toks.last().map(|t| &t.token), Some(Token::RParen)) {
+                        toks.pop();
+                    }
+                    // Split on comma
+                    if let Some(comma_pos) =
+                        toks.iter().position(|t| matches!(t.token, Token::Comma))
+                    {
+                        let x_toks = &toks[..comma_pos];
+                        let y_toks = &toks[comma_pos + 1..];
+                        let x = self.parse_expr_tokens(x_toks, line_no)?;
+                        let y = self.parse_expr_tokens(y_toks, line_no)?;
+                        offset = Some((x, y));
                     }
                 }
                 _ => {} // Unknown property, ignore
             }
         }
 
-        Ok((Stmt::Transform { character, rotation, scale, offset, opacity, layer }, 1))
+        Ok((
+            Stmt::Transform {
+                character,
+                rotation,
+                scale,
+                offset,
+                opacity,
+                layer,
+            },
+            1,
+        ))
     }
 
     /// Parse a block of statements indented more than `parent_indent`.
@@ -954,7 +1007,11 @@ impl Parser {
         Ok(body)
     }
 
-    fn parse_play_stmt(&self, toks: &[Spanned], line_no: usize) -> Result<(Stmt, usize), ParseError> {
+    fn parse_play_stmt(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+    ) -> Result<(Stmt, usize), ParseError> {
         // play music "track" [fade <s>]
         // play sfx "track" [volume <v>]
         let kind = expect_ident(&toks[1], line_no, "play kind (music/sfx)")?;
@@ -990,7 +1047,11 @@ impl Parser {
         }
     }
 
-    fn parse_stop_stmt(&self, toks: &[Spanned], line_no: usize) -> Result<(Stmt, usize), ParseError> {
+    fn parse_stop_stmt(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+    ) -> Result<(Stmt, usize), ParseError> {
         // stop music [fade <s>]
         // stop voice
         let kind = match &toks[1].token {
@@ -1023,7 +1084,11 @@ impl Parser {
         }
     }
 
-    fn parse_say_stmt(&self, toks: &[Spanned], line_no: usize) -> Result<(Stmt, usize), ParseError> {
+    fn parse_say_stmt(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+    ) -> Result<(Stmt, usize), ParseError> {
         // <speaker> "text" [voice "track"] [side "image"]
         let speaker = expect_ident(&toks[0], line_no, "speaker id")?;
         let text = expect_string(&toks[1], line_no, "dialogue text")?;
@@ -1067,23 +1132,12 @@ impl Parser {
         };
         let e = p.parse_expr()?;
         if p.pos != toks.len() {
-            return Err(err(line_no, format!("trailing tokens in expression at position {}", p.pos)));
+            return Err(err(
+                line_no,
+                format!("trailing tokens in expression at position {}", p.pos),
+            ));
         }
         Ok(e)
-    }
-
-    /// Parse an expression that ends at the first token in `terminators`.
-    fn parse_expr_until(
-        &self,
-        toks: &[Spanned],
-        terminators: &[Token],
-        line_no: usize,
-    ) -> Result<Expr, ParseError> {
-        let end = toks
-            .iter()
-            .position(|t| terminators.contains(&t.token))
-            .unwrap_or(toks.len());
-        self.parse_expr_tokens(&toks[..end], line_no)
     }
 }
 
@@ -1267,12 +1321,34 @@ impl<'a> ExprParser<'a> {
             Token::True => Expr::Bool(true),
             Token::False => Expr::Bool(false),
             Token::None => Expr::None,
-            Token::Ident(s) => Expr::Var(s.clone()),
+            Token::Ident(s) => {
+                // `name(args...)` is a builtin call, otherwise a variable.
+                let name = s.clone();
+                if matches!(self.peek().map(|t| &t.token), Some(Token::LParen)) {
+                    self.next(); // consume `(`
+                    let mut args = Vec::new();
+                    if !matches!(self.peek().map(|t| &t.token), Some(Token::RParen)) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            match self.next().map(|t| &t.token) {
+                                Some(Token::Comma) => continue,
+                                Some(Token::RParen) => break,
+                                _ => {
+                                    return Err(err(line_no, "expected `,` or `)`"));
+                                }
+                            }
+                        }
+                    } else {
+                        self.next(); // consume `)`
+                    }
+                    Expr::Call { name, args }
+                } else {
+                    Expr::Var(name)
+                }
+            }
             Token::LParen => {
                 let e = self.parse_expr()?;
-                let close = self
-                    .next()
-                    .ok_or_else(|| err(line_no, "expected `)`"))?;
+                let close = self.next().ok_or_else(|| err(line_no, "expected `)`"))?;
                 expect_token(close, Token::RParen, line_no, ")")?;
                 e
             }
@@ -1294,14 +1370,15 @@ impl<'a> ExprParser<'a> {
                         }
                     }
                 }
-                let close = self
-                    .next()
-                    .ok_or_else(|| err(line_no, "expected `]`"))?;
+                let close = self.next().ok_or_else(|| err(line_no, "expected `]`"))?;
                 expect_token(close, Token::RBracket, line_no, "]")?;
                 Expr::List(items)
             }
             other => {
-                return Err(err(line_no, format!("unexpected token in expression: {other:?}")));
+                return Err(err(
+                    line_no,
+                    format!("unexpected token in expression: {other:?}"),
+                ));
             }
         };
         Ok(expr)
@@ -1311,16 +1388,17 @@ impl<'a> ExprParser<'a> {
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary()?;
         loop {
-            let is_lbracket = self.peek().map(|t| t.token == Token::LBracket).unwrap_or(false);
+            let is_lbracket = self
+                .peek()
+                .map(|t| t.token == Token::LBracket)
+                .unwrap_or(false);
             if !is_lbracket {
                 break;
             }
             self.next(); // consume [
             let index = self.parse_expr()?;
             let line_no = self.line_no;
-            let close = self
-                .next()
-                .ok_or_else(|| err(line_no, "expected `]`"))?;
+            let close = self.next().ok_or_else(|| err(line_no, "expected `]`"))?;
             expect_token(close, Token::RBracket, line_no, "]")?;
             expr = Expr::Index {
                 collection: Box::new(expr),
@@ -1367,7 +1445,12 @@ fn expect_string(t: &Spanned, line_no: usize, what: &str) -> Result<String, Pars
     }
 }
 
-fn expect_token(t: &Spanned, expected: Token, line_no: usize, what: &str) -> Result<(), ParseError> {
+fn expect_token(
+    t: &Spanned,
+    expected: Token,
+    line_no: usize,
+    what: &str,
+) -> Result<(), ParseError> {
     if t.token == expected {
         Ok(())
     } else {
@@ -1391,7 +1474,10 @@ fn parse_color_component(t: &Spanned, line_no: usize) -> Result<f32, ParseError>
     match &t.token {
         Token::IntLit(n) => Ok(*n as f32 / 255.0),
         Token::FloatLit(f) => Ok(*f as f32),
-        other => Err(err(line_no, format!("expected color component, got {other:?}"))),
+        other => Err(err(
+            line_no,
+            format!("expected color component, got {other:?}"),
+        )),
     }
 }
 

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/vnengine-core",
     "crates/vnengine-script",
+    "crates/vnengine-runtime",
     "crates/vnengine-render",
     "crates/vnengine-audio",
     "crates/vnengine-app",
@@ -52,6 +53,7 @@ walkdir = "2"
 # Internal crates
 vnengine-core = { path = "crates/vnengine-core" }
 vnengine-script = { path = "crates/vnengine-script" }
+vnengine-runtime = { path = "crates/vnengine-runtime" }
 vnengine-render = { path = "crates/vnengine-render" }
 vnengine-audio = { path = "crates/vnengine-audio" }
 vnengine-app = { path = "crates/vnengine-app" }

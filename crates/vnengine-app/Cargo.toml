@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 vnengine-core = { workspace = true }
 vnengine-script = { workspace = true }
+vnengine-runtime = { workspace = true }
 vnengine-render = { workspace = true }
 vnengine-audio = { workspace = true }
 glyphon = { workspace = true }

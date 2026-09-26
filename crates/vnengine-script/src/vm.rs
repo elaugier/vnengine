@@ -13,11 +13,86 @@ use vnengine_core::command::{Anchor, Command, MenuChoice, SpriteSpec};
 use vnengine_core::transition::Transition;
 use vnengine_core::Value;
 
-/// A position within the script: which label and which statement index.
+/// What a frame executes: a named label in the script, or an inline
+/// statement block pushed by control flow (menu choice, `if` branch, loop
+/// body, function call). Inline bodies are serialized with the frame so a
+/// saved game can be restored mid-block without mutating the script.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FrameBody {
+    /// Statements of `script.labels` matching this name.
+    Label(String),
+    /// A statement block owned by the frame itself.
+    Inline(Vec<Stmt>),
+}
+
+/// Iteration state owned by a `for` loop body frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForLoop {
+    /// Loop variable name.
+    pub var: String,
+    /// Evaluated items to iterate over.
+    pub items: Vec<Value>,
+    /// Index of the item currently bound to `var`.
+    pub index: usize,
+}
+
+/// A position within the script: what to execute and where.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
-    pub label: String,
+    /// The statement source for this frame.
+    pub body: FrameBody,
+    /// Index of the next statement to execute within `body`.
     pub stmt: usize,
+    /// True when this frame was pushed by `call` (label or function).
+    /// `return` unwinds through non-call frames until it has popped one
+    /// call frame.
+    pub is_call: bool,
+    /// When set, reaching the end of the body advances the iteration
+    /// instead of popping the frame.
+    pub for_loop: Option<ForLoop>,
+    /// When set, reaching the end of the body re-evaluates this condition
+    /// and restarts the body while it stays true.
+    pub while_loop: Option<Expr>,
+}
+
+impl Frame {
+    fn label(name: impl Into<String>) -> Self {
+        Self {
+            body: FrameBody::Label(name.into()),
+            stmt: 0,
+            is_call: false,
+            for_loop: None,
+            while_loop: None,
+        }
+    }
+
+    fn call(name: impl Into<String>) -> Self {
+        Self {
+            is_call: true,
+            ..Self::label(name)
+        }
+    }
+
+    fn block(body: Vec<Stmt>) -> Self {
+        Self {
+            body: FrameBody::Inline(body),
+            stmt: 0,
+            is_call: false,
+            for_loop: None,
+            while_loop: None,
+        }
+    }
+
+    /// Borrow the statement list this frame executes, resolving labels
+    /// against the script. `None` if the label does not exist.
+    fn body_stmts<'a>(&'a self, script: &'a Script) -> Option<&'a [Stmt]> {
+        match &self.body {
+            FrameBody::Inline(stmts) => Some(stmts),
+            FrameBody::Label(name) => script
+                .find_label_index(name)
+                .map(|i| script.labels[i].body.as_slice()),
+        }
+    }
 }
 
 /// Serializable VM state for save/load.
@@ -27,11 +102,27 @@ pub struct VmState {
     pub stack: Vec<Frame>,
     /// Global variables.
     pub variables: HashMap<String, Value>,
-    /// Pending menu choices awaiting a selection (index into the menu's
-    /// choice list). `None` unless we're blocked on a menu.
-    pub pending_menu: Option<Vec<MenuChoiceAst>>,
+    /// Pending menu awaiting a selection. `None` unless we're blocked on
+    /// a menu.
+    pub pending_menu: Option<PendingMenu>,
+    /// PRNG state for `random()`/`randint()`/`srand()`. Serialized so
+    /// save/load and replay reproduce the same sequence.
+    #[serde(default = "default_rng_seed")]
+    pub rng_seed: u64,
     /// Whether the VM has finished (reached `End` or fell off the script).
     pub finished: bool,
+}
+
+fn default_rng_seed() -> u64 {
+    0x9E37_79B9_7F4A_7C15
+}
+
+/// A menu presented to the player, kept in serializable form so the same
+/// menu can be rebuilt after a save/restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingMenu {
+    pub prompt: Option<String>,
+    pub choices: Vec<MenuChoiceAst>,
 }
 
 /// A menu choice kept in AST form so it can be serialized and resumed.
@@ -45,12 +136,10 @@ pub struct MenuChoiceAst {
 impl VmState {
     pub fn new() -> Self {
         Self {
-            stack: vec![Frame {
-                label: "start".to_string(),
-                stmt: 0,
-            }],
+            stack: vec![Frame::label("start")],
             variables: HashMap::new(),
             pending_menu: None,
+            rng_seed: default_rng_seed(),
             finished: false,
         }
     }
@@ -78,6 +167,11 @@ pub enum StepResult {
     Finished,
 }
 
+/// Maximum number of internal steps `Vm::step` may take before giving up.
+/// Prevents pathological scripts (e.g. an empty `while True:`) from
+/// hanging the game loop.
+const MAX_STEPS_PER_CALL: usize = 100_000;
+
 pub struct Vm {
     pub script: Script,
     pub state: VmState,
@@ -89,8 +183,6 @@ pub struct Vm {
     pub constants: HashMap<String, Value>,
     /// User-defined functions, keyed by name.
     pub functions: HashMap<String, FunctionDef>,
-    /// Counter for unique synthetic label names.
-    synth_counter: u64,
 }
 
 impl Vm {
@@ -107,7 +199,6 @@ impl Vm {
             character_colors: HashMap::new(),
             constants: HashMap::new(),
             functions,
-            synth_counter: 0,
         };
         vm.process_definitions();
         vm
@@ -140,7 +231,9 @@ impl Vm {
         // doesn't already exist (important for save/load restoration).
         for d in &self.script.defaults.clone() {
             if !self.state.variables.contains_key(&d.name) {
-                if let Ok(v) = eval_expr(&d.value, &self.state.variables) {
+                if let Ok(v) =
+                    eval_expr_rng(&d.value, &self.state.variables, &mut self.state.rng_seed)
+                {
                     self.state.variables.insert(d.name.clone(), v);
                 }
             }
@@ -167,43 +260,76 @@ impl Vm {
             return StepResult::Command(Command::Pause { seconds: 0.0 });
         }
 
+        let mut budget = MAX_STEPS_PER_CALL;
         loop {
-            let frame = match self.state.stack.last_mut() {
-                Some(f) => f,
-                None => {
-                    self.state.finished = true;
-                    return StepResult::Finished;
-                }
-            };
-
-            // Find the current label's body.
-            let label_idx = match self.script.find_label_index(&frame.label) {
-                Some(i) => i,
-                None => {
-                    log::error!("label `{}` not found", frame.label);
-                    self.state.finished = true;
-                    return StepResult::Finished;
-                }
-            };
-
-            if frame.stmt >= self.script.labels[label_idx].body.len() {
-                // End of label: pop the frame (return) or finish.
-                self.state.stack.pop();
-                if let Some(parent) = self.state.stack.last_mut() {
-                    parent.stmt += 1;
-                    continue;
-                } else {
-                    self.state.finished = true;
-                    return StepResult::Finished;
-                }
+            budget -= 1;
+            if budget == 0 {
+                log::error!("script error: step budget exceeded (possible infinite loop)");
+                self.state.finished = true;
+                return StepResult::Finished;
             }
 
+            // Resolve the current frame's statement list.
+            let body_len = {
+                let Some(frame) = self.state.stack.last() else {
+                    self.state.finished = true;
+                    return StepResult::Finished;
+                };
+                match frame.body_stmts(&self.script) {
+                    Some(stmts) => stmts.len(),
+                    None => {
+                        if let FrameBody::Label(name) = &frame.body {
+                            log::error!("label `{name}` not found");
+                        }
+                        self.state.finished = true;
+                        return StepResult::Finished;
+                    }
+                }
+            };
+
+            let frame = self.state.stack.last_mut().unwrap();
+            if frame.stmt >= body_len {
+                // End of this frame's body. Loop frames re-enter instead of
+                // popping.
+                if let Some(for_loop) = &mut frame.for_loop {
+                    for_loop.index += 1;
+                    if for_loop.index < for_loop.items.len() {
+                        let value = for_loop.items[for_loop.index].clone();
+                        self.state.variables.insert(for_loop.var.clone(), value);
+                        frame.stmt = 0;
+                        continue;
+                    }
+                } else if let Some(cond) = &frame.while_loop {
+                    if eval_expr_rng(cond, &self.state.variables, &mut self.state.rng_seed)
+                        .map(|v| v.is_truthy())
+                        .unwrap_or(false)
+                    {
+                        frame.stmt = 0;
+                        continue;
+                    }
+                }
+                // Pop the frame and advance the caller past the statement
+                // that pushed it.
+                self.state.stack.pop();
+                match self.state.stack.last_mut() {
+                    Some(parent) => {
+                        parent.stmt += 1;
+                        continue;
+                    }
+                    None => {
+                        self.state.finished = true;
+                        return StepResult::Finished;
+                    }
+                }
+            }
             // We need to borrow the statement immutably while potentially
             // mutating the stack. Clone the statement to avoid borrow issues.
-            let stmt = self.script.labels[label_idx].body[frame.stmt].clone();
-            let stmt_idx = frame.stmt;
+            let stmt = {
+                let frame = self.state.stack.last().unwrap();
+                frame.body_stmts(&self.script).unwrap()[frame.stmt].clone()
+            };
 
-            match self.exec_stmt(stmt, stmt_idx) {
+            match self.exec_stmt(stmt) {
                 Ok(ExecOutcome::Command(cmd)) => {
                     // Advance past this statement, then return the command.
                     if let Some(f) = self.state.stack.last_mut() {
@@ -212,33 +338,57 @@ impl Vm {
                     return StepResult::Command(cmd);
                 }
                 Ok(ExecOutcome::Menu { prompt, choices }) => {
-                    // pending_menu was already set by exec_stmt.
+                    // pending_menu was already set by exec_stmt. The frame
+                    // still points at the menu statement; it advances when
+                    // the choice body completes.
                     return StepResult::Menu { prompt, choices };
                 }
                 Ok(ExecOutcome::Jump(label)) => {
-                    // Replace current frame with the jump target.
+                    // `jump` abandons the enclosing block context: unwind
+                    // inline (non-call) frames, then redirect the nearest
+                    // call frame — or the bottom label frame — to the jump
+                    // target. Statements after the enclosing block are not
+                    // executed, matching Ren'Py semantics.
+                    while self.state.stack.len() > 1
+                        && !self.state.stack.last().map(|f| f.is_call).unwrap_or(false)
+                    {
+                        self.state.stack.pop();
+                    }
                     if let Some(f) = self.state.stack.last_mut() {
-                        f.label = label;
+                        f.body = FrameBody::Label(label);
                         f.stmt = 0;
+                        f.for_loop = None;
+                        f.while_loop = None;
                     }
                     continue;
                 }
                 Ok(ExecOutcome::Call(label)) => {
                     // Push a new frame for the called label.
-                    self.state.stack.push(Frame {
-                        label,
-                        stmt: 0,
-                    });
+                    self.state.stack.push(Frame::call(label));
+                    continue;
+                }
+                Ok(ExecOutcome::Push(frame)) => {
+                    self.state.stack.push(frame);
                     continue;
                 }
                 Ok(ExecOutcome::Return) => {
-                    self.state.stack.pop();
-                    if let Some(parent) = self.state.stack.last_mut() {
-                        parent.stmt += 1;
-                        continue;
-                    } else {
-                        self.state.finished = true;
-                        return StepResult::Finished;
+                    // Unwind through control-flow frames until a call frame
+                    // has been popped. `return` outside any `call` ends the
+                    // script.
+                    while let Some(f) = self.state.stack.pop() {
+                        if f.is_call {
+                            break;
+                        }
+                    }
+                    match self.state.stack.last_mut() {
+                        Some(parent) => {
+                            parent.stmt += 1;
+                            continue;
+                        }
+                        None => {
+                            self.state.finished = true;
+                            return StepResult::Finished;
+                        }
                     }
                 }
                 Ok(ExecOutcome::Continue) => {
@@ -263,23 +413,11 @@ impl Vm {
     pub fn resume(&mut self, response: Option<MenuResponse>) {
         if let Some(menu) = self.state.pending_menu.take() {
             if let Some(MenuResponse::Selected(idx)) = response {
-                if let Some(choice) = menu.get(idx) {
-                    // Execute the choice body by pushing it as a temporary
-                    // frame. We store the body in a synthetic label.
-                    let label_name = format!("__menu_{}", self.state.stack.len());
-                    let body = choice.body.clone();
-                    self.script.labels.push(Label {
-                        name: label_name.clone(),
-                        body,
-                    });
-                    // Advance past the menu statement in the current frame.
-                    if let Some(f) = self.state.stack.last_mut() {
-                        f.stmt += 1;
-                    }
-                    self.state.stack.push(Frame {
-                        label: label_name,
-                        stmt: 0,
-                    });
+                if let Some(choice) = menu.choices.get(idx) {
+                    // Push the choice body as an inline frame. The parent
+                    // frame still points at the menu statement and advances
+                    // when the body completes.
+                    self.state.stack.push(Frame::block(choice.body.clone()));
                 }
             }
         }
@@ -299,12 +437,15 @@ enum ExecOutcome {
     },
     Jump(String),
     Call(String),
+    /// Push a frame (control-flow block or function body) without advancing
+    /// the parent frame's statement index.
+    Push(Frame),
     Return,
     Continue,
 }
 
 impl Vm {
-    fn exec_stmt(&mut self, stmt: Stmt, _stmt_idx: usize) -> Result<ExecOutcome, String> {
+    fn exec_stmt(&mut self, stmt: Stmt) -> Result<ExecOutcome, String> {
         match stmt {
             Stmt::Scene { image, transition } => {
                 let trans = transition
@@ -326,15 +467,22 @@ impl Vm {
             } => {
                 let anchor = anchor_to_anchor(&anchor);
                 let pos = position.and_then(|(x, y)| {
-                    let xv = eval_expr(&x, &self.state.variables).ok()?;
-                    let yv = eval_expr(&y, &self.state.variables).ok()?;
+                    let xv =
+                        eval_expr_rng(&x, &self.state.variables, &mut self.state.rng_seed).ok()?;
+                    let yv =
+                        eval_expr_rng(&y, &self.state.variables, &mut self.state.rng_seed).ok()?;
                     Some((xv.as_float()?, yv.as_float()?))
                 });
                 let scale = scale
-                    .and_then(|e| eval_expr(&e, &self.state.variables).ok())
+                    .and_then(|e| {
+                        eval_expr_rng(&e, &self.state.variables, &mut self.state.rng_seed).ok()
+                    })
                     .and_then(|v| v.as_float())
                     .map(|f| f as f32);
-                let z = z.and_then(|e| eval_expr(&e, &self.state.variables).ok())
+                let z = z
+                    .and_then(|e| {
+                        eval_expr_rng(&e, &self.state.variables, &mut self.state.rng_seed).ok()
+                    })
                     .and_then(|v| v.as_int())
                     .map(|i| i as i32);
                 Ok(ExecOutcome::Command(Command::Show(SpriteSpec {
@@ -383,9 +531,11 @@ impl Vm {
                 let mut ast_choices = Vec::new();
                 for c in choices {
                     let selectable = match &c.condition {
-                        Some(expr) => eval_expr(expr, &self.state.variables)
-                            .map(|v| v.is_truthy())
-                            .unwrap_or(true),
+                        Some(expr) => {
+                            eval_expr_rng(expr, &self.state.variables, &mut self.state.rng_seed)
+                                .map(|v| v.is_truthy())
+                                .unwrap_or(true)
+                        }
                         None => true,
                     };
                     if selectable {
@@ -405,7 +555,10 @@ impl Vm {
                     return Ok(ExecOutcome::Continue);
                 }
                 // Stash the AST choices for resume.
-                self.state.pending_menu = Some(ast_choices);
+                self.state.pending_menu = Some(PendingMenu {
+                    prompt: prompt.clone(),
+                    choices: ast_choices,
+                });
                 Ok(ExecOutcome::Menu {
                     prompt,
                     choices: filtered,
@@ -415,23 +568,19 @@ impl Vm {
             Stmt::Call { label } => {
                 // Check if this is a user-defined function.
                 if let Some(func) = self.functions.get(&label).cloned() {
-                    let id = self.synth_counter;
-                    self.synth_counter += 1;
-                    let func_label = format!("__func_{}", id);
-                    self.script.labels.push(Label {
-                        name: func_label.clone(),
-                        body: func.body,
-                    });
-                    // Don't advance parent stmt — Return will do that.
-                    return Ok(ExecOutcome::Call(func_label));
+                    let mut frame = Frame::block(func.body);
+                    frame.is_call = true;
+                    return Ok(ExecOutcome::Push(frame));
                 }
                 Ok(ExecOutcome::Call(label))
             }
-            Stmt::ReturnStmt => Ok(ExecOutcome::Return),
-            Stmt::Shake { intensity, duration } => {
-                let i = eval_expr(&intensity, &self.state.variables)
+            Stmt::Shake {
+                intensity,
+                duration,
+            } => {
+                let i = eval_expr_rng(&intensity, &self.state.variables, &mut self.state.rng_seed)
                     .map_err(|e| format!("shake error: {e}"))?;
-                let d = eval_expr(&duration, &self.state.variables)
+                let d = eval_expr_rng(&duration, &self.state.variables, &mut self.state.rng_seed)
                     .map_err(|e| format!("shake error: {e}"))?;
                 let intensity = i.as_float().unwrap_or(0.5) as f32;
                 let duration = d.as_float().unwrap_or(0.5) as f32;
@@ -450,41 +599,28 @@ impl Vm {
                 else_branch,
             } => {
                 for (cond, body) in &branches {
-                    if eval_expr(cond, &self.state.variables)
+                    if eval_expr_rng(cond, &self.state.variables, &mut self.state.rng_seed)
                         .map(|v| v.is_truthy())
                         .unwrap_or(false)
                     {
-                        // Execute the branch body by pushing it as a
-                        // synthetic label (like a call).
-                        let label_name = format!("__if_{}", self.state.stack.len());
-                        self.script.labels.push(Label {
-                            name: label_name.clone(),
-                            body: body.clone(),
-                        });
-                        return Ok(ExecOutcome::Call(label_name));
+                        return Ok(ExecOutcome::Push(Frame::block(body.clone())));
                     }
                 }
                 if let Some(body) = else_branch {
-                    let label_name = format!("__else_{}", self.state.stack.len());
-                    self.script.labels.push(Label {
-                        name: label_name.clone(),
-                        body,
-                    });
-                    return Ok(ExecOutcome::Call(label_name));
+                    return Ok(ExecOutcome::Push(Frame::block(body)));
                 }
                 Ok(ExecOutcome::Continue)
             }
             Stmt::Pause { seconds } => {
-                let s = eval_expr(&seconds, &self.state.variables)
+                let s = eval_expr_rng(&seconds, &self.state.variables, &mut self.state.rng_seed)
                     .ok()
                     .and_then(|v| v.as_float())
                     .unwrap_or(1.0) as f32;
                 Ok(ExecOutcome::Command(Command::Pause { seconds: s }))
             }
-            Stmt::PlayMusic { track, fade } => Ok(ExecOutcome::Command(Command::PlayMusic {
-                track,
-                fade,
-            })),
+            Stmt::PlayMusic { track, fade } => {
+                Ok(ExecOutcome::Command(Command::PlayMusic { track, fade }))
+            }
             Stmt::StopMusic { fade } => Ok(ExecOutcome::Command(Command::StopMusic { fade })),
             Stmt::PlaySfx { track, volume } => {
                 Ok(ExecOutcome::Command(Command::PlaySfx { track, volume }))
@@ -492,19 +628,16 @@ impl Vm {
             Stmt::PlayVoice { track } => Ok(ExecOutcome::Command(Command::PlayVoice { track })),
             Stmt::StopVoice => Ok(ExecOutcome::Command(Command::StopVoice)),
             Stmt::Assign { name, value } => {
-                let v = eval_expr(&value, &self.state.variables)
+                let v = eval_expr_rng(&value, &self.state.variables, &mut self.state.rng_seed)
                     .map_err(|e| format!("assignment error: {e}"))?;
                 self.state.variables.insert(name, v);
                 Ok(ExecOutcome::Continue)
             }
             Stmt::AssignOp { name, op, value } => {
-                let current = self
-                    .state
-                    .variables
-                    .get(&name)
-                    .cloned()
-                    .ok_or_else(|| format!("undefined variable `{name}` for compound assignment"))?;
-                let rhs = eval_expr(&value, &self.state.variables)
+                let current = self.state.variables.get(&name).cloned().ok_or_else(|| {
+                    format!("undefined variable `{name}` for compound assignment")
+                })?;
+                let rhs = eval_expr_rng(&value, &self.state.variables, &mut self.state.rng_seed)
                     .map_err(|e| format!("assignment error: {e}"))?;
                 let result = eval_binop(op, current, rhs)?;
                 self.state.variables.insert(name, result);
@@ -513,13 +646,20 @@ impl Vm {
             Stmt::Default { name, value } => {
                 // Only assign if the variable doesn't already exist.
                 if !self.state.variables.contains_key(&name) {
-                    let v = eval_expr(&value, &self.state.variables)
+                    let v = eval_expr_rng(&value, &self.state.variables, &mut self.state.rng_seed)
                         .map_err(|e| format!("default error: {e}"))?;
                     self.state.variables.insert(name, v);
                 }
                 Ok(ExecOutcome::Continue)
             }
-            Stmt::Transform { character, rotation, scale, offset, opacity, layer } => {
+            Stmt::Transform {
+                character,
+                rotation,
+                scale,
+                offset,
+                opacity,
+                layer,
+            } => {
                 let mut cmd = Command::Transform {
                     character: character.clone(),
                     rotation: None,
@@ -529,79 +669,99 @@ impl Vm {
                     layer: None,
                 };
                 if let Some(r) = rotation {
-                    let v = eval_expr(&r, &self.state.variables)
+                    let v = eval_expr_rng(&r, &self.state.variables, &mut self.state.rng_seed)
                         .map_err(|e| format!("transform error: {e}"))?;
                     if let Some(f) = v.as_float() {
                         cmd = match cmd {
-                            Command::Transform { character, scale, offset, opacity, layer, .. } => {
-                                Command::Transform {
-                                    character,
-                                    rotation: Some(f as f32),
-                                    scale,
-                                    offset,
-                                    opacity,
-                                    layer,
-                                }
-                            }
+                            Command::Transform {
+                                character,
+                                scale,
+                                offset,
+                                opacity,
+                                layer,
+                                ..
+                            } => Command::Transform {
+                                character,
+                                rotation: Some(f as f32),
+                                scale,
+                                offset,
+                                opacity,
+                                layer,
+                            },
                             _ => unreachable!(),
                         };
                     }
                 }
                 if let Some(s) = scale {
-                    let v = eval_expr(&s, &self.state.variables)
+                    let v = eval_expr_rng(&s, &self.state.variables, &mut self.state.rng_seed)
                         .map_err(|e| format!("transform error: {e}"))?;
                     if let Some(f) = v.as_float() {
                         cmd = match cmd {
-                            Command::Transform { character, rotation, offset, opacity, layer, .. } => {
-                                Command::Transform {
-                                    character,
-                                    rotation,
-                                    scale: Some(f as f32),
-                                    offset,
-                                    opacity,
-                                    layer,
-                                }
-                            }
+                            Command::Transform {
+                                character,
+                                rotation,
+                                offset,
+                                opacity,
+                                layer,
+                                ..
+                            } => Command::Transform {
+                                character,
+                                rotation,
+                                scale: Some(f as f32),
+                                offset,
+                                opacity,
+                                layer,
+                            },
                             _ => unreachable!(),
                         };
                     }
                 }
                 if let Some(o) = opacity {
-                    let v = eval_expr(&o, &self.state.variables)
+                    let v = eval_expr_rng(&o, &self.state.variables, &mut self.state.rng_seed)
                         .map_err(|e| format!("transform error: {e}"))?;
                     if let Some(f) = v.as_float() {
                         cmd = match cmd {
-                            Command::Transform { character, rotation, scale, offset, layer, .. } => {
-                                Command::Transform {
-                                    character,
-                                    rotation,
-                                    scale,
-                                    offset,
-                                    opacity: Some(f as f32),
-                                    layer,
-                                }
-                            }
+                            Command::Transform {
+                                character,
+                                rotation,
+                                scale,
+                                offset,
+                                layer,
+                                ..
+                            } => Command::Transform {
+                                character,
+                                rotation,
+                                scale,
+                                offset,
+                                opacity: Some(f as f32),
+                                layer,
+                            },
                             _ => unreachable!(),
                         };
                     }
                 }
                 if let Some((x, y)) = offset {
-                    let xv = eval_expr(&x, &self.state.variables)
+                    let xv = eval_expr_rng(&x, &self.state.variables, &mut self.state.rng_seed)
                         .map_err(|e| format!("transform error: {e}"))?;
-                    let yv = eval_expr(&y, &self.state.variables)
+                    let yv = eval_expr_rng(&y, &self.state.variables, &mut self.state.rng_seed)
                         .map_err(|e| format!("transform error: {e}"))?;
                     if let (Some(xf), Some(yf)) = (xv.as_float(), yv.as_float()) {
                         cmd = match cmd {
-                            Command::Transform { character, rotation, scale, opacity, layer, .. } => {
-                                Command::Transform {
-                                    character,
-                                    rotation,
-                                    scale,
-                                    offset: Some((xf as f32, yf as f32)),
-                                    opacity,
-                                    layer,
-                                }
-                            }
+                            Command::Transform {
+                                character,
+                                rotation,
+                                scale,
+                                opacity,
+                                layer,
+                                ..
+                            } => Command::Transform {
+                                character,
+                                rotation,
+                                scale,
+                                offset: Some((xf as f32, yf as f32)),
+                                opacity,
+                                layer,
+                            },
                             _ => unreachable!(),
                         };
                     }
@@ -615,123 +775,45 @@ impl Vm {
                         _ => vnengine_core::Layer::Foreground,
                     };
                     cmd = match cmd {
-                        Command::Transform { character, rotation, scale, offset, opacity, .. } => {
-                            Command::Transform {
-                                character,
-                                rotation,
-                                scale,
-                                offset,
-                                opacity,
-                                layer: Some(layer_val),
-                            }
-                        }
+                        Command::Transform {
+                            character,
+                            rotation,
+                            scale,
+                            offset,
+                            opacity,
+                            ..
+                        } => Command::Transform {
+                            character,
+                            rotation,
+                            scale,
+                            offset,
+                            opacity,
+                            layer: Some(layer_val),
+                        },
                         _ => unreachable!(),
                     };
                 }
                 Ok(ExecOutcome::Command(cmd))
             }
             Stmt::While { cond, body } => {
-                // Check condition. If true, push body as a synthetic label
-                // and execute it. When the body finishes, it jumps back to
-                // a check label that re-evaluates the While.
                 if eval_expr(&cond, &self.state.variables)
                     .map(|v| v.is_truthy())
                     .unwrap_or(false)
                 {
-                    let id = self.synth_counter;
-                    self.synth_counter += 1;
-                    let label_name = format!("__while_{}", id);
-                    let check_label = format!("__while_check_{}", id);
-                    // Check label re-evaluates the while.
-                    self.script.labels.push(Label {
-                        name: check_label.clone(),
-                        body: vec![Stmt::While {
-                            cond: cond.clone(),
-                            body: body.clone(),
-                        }],
-                    });
-                    // Body label: body + jump back to check.
-                    let mut full_body = body.clone();
-                    full_body.push(Stmt::Jump {
-                        label: check_label,
-                    });
-                    self.script.labels.push(Label {
-                        name: label_name.clone(),
-                        body: full_body,
-                    });
-                    // Use Call outcome so the body frame is pushed without
-                    // the step loop incrementing the body's stmt counter.
-                    return Ok(ExecOutcome::Call(label_name));
+                    let mut frame = Frame::block(body);
+                    frame.while_loop = Some(cond);
+                    return Ok(ExecOutcome::Push(frame));
                 }
                 Ok(ExecOutcome::Continue)
             }
-            Stmt::For { var, iterable, body } => {
-                // Check if this is a continuation (re-entry from check label).
-                // We scan for a continuation marker that was set during first entry.
-                let mut cont_id: Option<u64> = None;
-                for (key, val) in &self.state.variables {
-                    if let Some(rest) = key.strip_prefix("__for_continue_") {
-                        if val.is_truthy() {
-                            if let Ok(id) = rest.parse::<u64>() {
-                                cont_id = Some(id);
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if let Some(id) = cont_id {
-                    // Continuation: advance the index.
-                    let items_key = format!("__for_{}_items", id);
-                    let idx_key = format!("__for_{}_idx", id);
-                    let cont_key = format!("__for_continue_{}", id);
-                    let items = match self.state.variables.get(&items_key) {
-                        Some(Value::List(items)) => items.clone(),
-                        _ => return Ok(ExecOutcome::Continue),
-                    };
-                    let idx = match self.state.variables.get(&idx_key) {
-                        Some(Value::Int(i)) => *i,
-                        _ => 0,
-                    };
-                    let next_idx = idx + 1;
-                    if next_idx >= items.len() as i64 {
-                        // Loop done — clean up and continue.
-                        self.state.variables.remove(&items_key);
-                        self.state.variables.remove(&idx_key);
-                        self.state.variables.remove(&cont_key);
-                        return Ok(ExecOutcome::Continue);
-                    }
-                    // Update index and loop variable.
-                    self.state
-                        .variables
-                        .insert(idx_key, Value::Int(next_idx));
-                    self.state
-                        .variables
-                        .insert(var.clone(), items[next_idx as usize].clone());
-                    // Push body frame again using Call.
-                    let body_id = self.synth_counter;
-                    self.synth_counter += 1;
-                    let label_name = format!("__for_body_{}", body_id);
-                    let current_label = self
-                        .state
-                        .stack
-                        .last()
-                        .map(|f| f.label.clone())
-                        .unwrap_or_default();
-                    let mut full_body = body.clone();
-                    full_body.push(Stmt::Jump {
-                        label: current_label,
-                    });
-                    self.script.labels.push(Label {
-                        name: label_name.clone(),
-                        body: full_body,
-                    });
-                    return Ok(ExecOutcome::Call(label_name));
-                }
-
-                // First entry: evaluate the iterable.
-                let iter_val = eval_expr(&iterable, &self.state.variables)
-                    .map_err(|e| format!("for loop error: {e}"))?;
+            Stmt::For {
+                var,
+                iterable,
+                body,
+            } => {
+                let iter_val =
+                    eval_expr_rng(&iterable, &self.state.variables, &mut self.state.rng_seed)
+                        .map_err(|e| format!("for loop error: {e}"))?;
                 let items: Vec<Value> = match &iter_val {
                     Value::List(items) => items.clone(),
                     _ => return Err("for loop iterable must be a list".into()),
@@ -739,47 +821,17 @@ impl Vm {
                 if items.is_empty() {
                     return Ok(ExecOutcome::Continue);
                 }
-
-                let id = self.synth_counter;
-                self.synth_counter += 1;
-                // Set the loop variable to the first item.
+                // Bind the loop variable to the first item; the frame owns
+                // the iteration state and re-enters the body until the
+                // items are exhausted.
                 self.state.variables.insert(var.clone(), items[0].clone());
-                // Store items and index.
-                self.state
-                    .variables
-                    .insert(format!("__for_{}_items", id), Value::List(items));
-                self.state
-                    .variables
-                    .insert(format!("__for_{}_idx", id), Value::Int(0));
-
-                // Create check label.
-                let check_label = format!("__for_check_{}", id);
-                self.script.labels.push(Label {
-                    name: check_label.clone(),
-                    body: vec![Stmt::For {
-                        var: var.clone(),
-                        iterable: iterable.clone(),
-                        body: body.clone(),
-                    }],
+                let mut frame = Frame::block(body);
+                frame.for_loop = Some(ForLoop {
+                    var,
+                    items,
+                    index: 0,
                 });
-                // Mark continuation for the check label.
-                self.state
-                    .variables
-                    .insert(format!("__for_continue_{}", id), Value::Bool(true));
-
-                // Body label: body + jump back to check.
-                let body_id = self.synth_counter;
-                self.synth_counter += 1;
-                let label_name = format!("__for_body_{}", body_id);
-                let mut full_body = body.clone();
-                full_body.push(Stmt::Jump {
-                    label: check_label,
-                });
-                self.script.labels.push(Label {
-                    name: label_name.clone(),
-                    body: full_body,
-                });
-                return Ok(ExecOutcome::Call(label_name));
+                Ok(ExecOutcome::Push(frame))
             }
             Stmt::End => {
                 self.state.finished = true;
@@ -803,8 +855,20 @@ fn anchor_to_anchor(anchor: &Option<AnchorExpr>) -> Anchor {
     }
 }
 
-/// Evaluate an expression to a [`Value`].
+/// Evaluate an expression to a [`Value`], without a mutable RNG state.
+/// Calls to `random()`/`randint()` consume a throwaway stream seeded from
+/// `default_rng_seed()`, keeping the evaluation deterministic.
 pub fn eval_expr(expr: &Expr, vars: &HashMap<String, Value>) -> Result<Value, String> {
+    let mut rng = default_rng_seed();
+    eval_expr_rng(expr, vars, &mut rng)
+}
+
+/// Evaluate an expression to a [`Value`], drawing randomness from `rng`.
+pub fn eval_expr_rng(
+    expr: &Expr,
+    vars: &HashMap<String, Value>,
+    rng: &mut u64,
+) -> Result<Value, String> {
     Ok(match expr {
         Expr::Var(name) => vars
             .get(name)
@@ -818,13 +882,13 @@ pub fn eval_expr(expr: &Expr, vars: &HashMap<String, Value>) -> Result<Value, St
         Expr::List(items) => {
             let mut vals = Vec::new();
             for item in items {
-                vals.push(eval_expr(item, vars)?);
+                vals.push(eval_expr_rng(item, vars, rng)?);
             }
             Value::List(vals)
         }
         Expr::Index { collection, index } => {
-            let coll = eval_expr(collection, vars)?;
-            let idx = eval_expr(index, vars)?;
+            let coll = eval_expr_rng(collection, vars, rng)?;
+            let idx = eval_expr_rng(index, vars, rng)?;
             match (&coll, &idx) {
                 (Value::List(items), Value::Int(i)) => {
                     if *i < 0 || *i as usize >= items.len() {
@@ -841,8 +905,9 @@ pub fn eval_expr(expr: &Expr, vars: &HashMap<String, Value>) -> Result<Value, St
                 _ => return Err("cannot index non-collection".into()),
             }
         }
+        Expr::Call { name, args } => eval_builtin(name, args, vars, rng)?,
         Expr::UnaryOp { op, operand } => {
-            let v = eval_expr(operand, vars)?;
+            let v = eval_expr_rng(operand, vars, rng)?;
             match op {
                 UnaryOp::Neg => match v {
                     Value::Int(i) => Value::Int(-i),
@@ -853,11 +918,71 @@ pub fn eval_expr(expr: &Expr, vars: &HashMap<String, Value>) -> Result<Value, St
             }
         }
         Expr::BinaryOp { op, lhs, rhs } => {
-            let l = eval_expr(lhs, vars)?;
-            let r = eval_expr(rhs, vars)?;
+            let l = eval_expr_rng(lhs, vars, rng)?;
+            let r = eval_expr_rng(rhs, vars, rng)?;
             eval_binop(*op, l, r)?
         }
     })
+}
+
+/// Builtin expression functions. `random()` returns a float in [0, 1),
+/// `randint(lo, hi)` returns an integer in [lo, hi], and `srand(seed)`
+/// reseeds the PRNG and returns the seed.
+fn eval_builtin(
+    name: &str,
+    args: &[Expr],
+    vars: &HashMap<String, Value>,
+    rng: &mut u64,
+) -> Result<Value, String> {
+    match name {
+        "random" => {
+            if !args.is_empty() {
+                return Err("random() takes no arguments".into());
+            }
+            Ok(Value::Float(next_f64(rng)))
+        }
+        "randint" => {
+            if args.len() != 2 {
+                return Err("randint() takes two arguments".into());
+            }
+            let lo = eval_expr_rng(&args[0], vars, rng)?
+                .as_int()
+                .ok_or("randint() bounds must be integers")?;
+            let hi = eval_expr_rng(&args[1], vars, rng)?
+                .as_int()
+                .ok_or("randint() bounds must be integers")?;
+            if lo > hi {
+                return Err(format!("randint() invalid range {lo}..{hi}"));
+            }
+            let span = (hi - lo + 1) as u64;
+            Ok(Value::Int(lo + (next_u64(rng) % span) as i64))
+        }
+        "srand" => {
+            if args.len() != 1 {
+                return Err("srand() takes one argument".into());
+            }
+            let seed = eval_expr_rng(&args[0], vars, rng)?
+                .as_int()
+                .ok_or("srand() seed must be an integer")?;
+            *rng = (seed as u64) | 1;
+            Ok(Value::Int(seed))
+        }
+        _ => Err(format!("unknown function `{name}()`")),
+    }
+}
+
+/// xorshift64* PRNG — fast, deterministic, and stable across platforms.
+fn next_u64(rng: &mut u64) -> u64 {
+    let mut x = *rng;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *rng = x;
+    x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+fn next_f64(rng: &mut u64) -> f64 {
+    (next_u64(rng) >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
 }
 
 fn eval_binop(op: BinaryOp, l: Value, r: Value) -> Result<Value, String> {
@@ -924,9 +1049,15 @@ fn values_eq(l: &Value, r: &Value) -> bool {
 fn cmp(l: &Value, r: &Value) -> Result<std::cmp::Ordering, String> {
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => Ok(a.cmp(b)),
-        (Value::Float(a), Value::Float(b)) => Ok(a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
-        (Value::Int(a), Value::Float(b)) => Ok((*a as f64).partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
-        (Value::Float(a), Value::Int(b)) => Ok(a.partial_cmp(&(*b as f64)).unwrap_or(std::cmp::Ordering::Equal)),
+        (Value::Float(a), Value::Float(b)) => {
+            Ok(a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        }
+        (Value::Int(a), Value::Float(b)) => Ok((*a as f64)
+            .partial_cmp(b)
+            .unwrap_or(std::cmp::Ordering::Equal)),
+        (Value::Float(a), Value::Int(b)) => Ok(a
+            .partial_cmp(&(*b as f64))
+            .unwrap_or(std::cmp::Ordering::Equal)),
         (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
         _ => Err("cannot compare these values".into()),
     }

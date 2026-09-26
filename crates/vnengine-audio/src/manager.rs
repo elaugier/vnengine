@@ -50,9 +50,7 @@ impl AudioEngine {
     pub fn play_music(&mut self, audio_dir: &Path, track: &str, fade: f32) {
         let path = audio_dir.join(track);
         let vol = db_from_linear(self.settings.music_volume);
-        let settings = StaticSoundSettings::new()
-            .loop_region(0.0..)
-            .volume(vol);
+        let settings = StaticSoundSettings::new().loop_region(0.0..).volume(vol);
         match StaticSoundData::from_file(&path).map(|d| d.with_settings(settings)) {
             Ok(data) => {
                 if let Some(mut h) = self.current_bgm.take() {
@@ -64,7 +62,7 @@ impl AudioEngine {
                     } else {
                         Tween::default()
                     };
-                    let _ = h.stop(tween);
+                    h.stop(tween);
                 }
                 match self.manager.play(data) {
                     Ok(handle) => {
@@ -88,7 +86,7 @@ impl AudioEngine {
             } else {
                 Tween::default()
             };
-            let _ = h.stop(tween);
+            h.stop(tween);
         }
     }
 
@@ -115,7 +113,7 @@ impl AudioEngine {
         match StaticSoundData::from_file(&path).map(|d| d.with_settings(settings)) {
             Ok(data) => {
                 if let Some(mut h) = self.current_voice.take() {
-                    let _ = h.stop(Tween::default());
+                    h.stop(Tween::default());
                 }
                 match self.manager.play(data) {
                     Ok(handle) => {
@@ -131,7 +129,7 @@ impl AudioEngine {
     /// Stop any playing voice line.
     pub fn stop_voice(&mut self) {
         if let Some(mut h) = self.current_voice.take() {
-            let _ = h.stop(Tween::default());
+            h.stop(Tween::default());
         }
     }
 }

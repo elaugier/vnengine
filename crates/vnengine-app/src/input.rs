@@ -69,6 +69,12 @@ pub struct Input {
     mouse_pos: (f32, f32),
 }
 
+impl Default for Input {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Input {
     pub fn new() -> Self {
         Self {

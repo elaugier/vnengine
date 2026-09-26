@@ -1,0 +1,41 @@
+# License policy for vnengine.
+#
+# The engine and its official distribution must remain fully open source.
+# `cargo deny check licenses` fails on any crate whose license expression
+# cannot be satisfied by the allow list below.
+
+[licenses]
+confidence-threshold = 0.93
+# Licenses are only allowed if explicitly listed here. New entries require
+# human review: check that the license is OSI-approved/FSF-free and that its
+# obligations (notice, source offer, MPL file-level copyleft, ...) are met
+# by our release pipeline before adding it.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# Any license not in the allow list is denied. Copyleft found outside the
+# allow list is denied as well; weak copyleft that we deliberately accept
+# (MPL-2.0) is listed above.
+copyleft = "deny"
+unused-allowed-license = "warn"
+# Workspace crates are not published; still require them to carry the
+# workspace license (MIT OR Apache-2.0) so the check stays meaningful.
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"

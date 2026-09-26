@@ -1,14 +1,28 @@
 //! Save / load system.
 //!
 //! A [`SaveState`] captures everything needed to resume the game: the script
-//! VM's execution position, all variables and the visible scene. It is
-//! serialized with bincode for compact, fast saves.
+//! VM's execution position (including variables), the visible scene and the
+//! line or menu currently displayed. It is serialized as JSON.
 
-use crate::value::Value;
+use crate::command::Command;
+use crate::model::Scene;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+fn default_scene() -> Scene {
+    Scene {
+        bg_opacity: 1.0,
+        ..Default::default()
+    }
+}
+
+/// One recorded player input, used to replay a session deterministically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum JournalEntry {
+    /// The player selected menu choice N.
+    Menu(usize),
+}
 
 /// A single save slot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,8 +35,21 @@ pub struct SaveState {
     pub play_time: f32,
     /// Script VM state, serialized as opaque bytes.
     pub vm_state: Vec<u8>,
-    /// Global variables.
-    pub variables: HashMap<String, Value>,
+    /// The visible scene at save time. Older saves lack this field; the
+    /// default shows a fully-opaque empty scene.
+    #[serde(default = "default_scene")]
+    pub scene: Scene,
+    /// The blocking command displayed when the save was taken (dialogue
+    /// line or pause), so load can re-display it instead of skipping past.
+    /// `None` if the save was taken on a menu or between commands.
+    #[serde(default)]
+    pub blocking: Option<Command>,
+    /// BGM track playing at save time, if any. Restored on load.
+    #[serde(default)]
+    pub music: Option<String>,
+    /// Player inputs recorded so far, for deterministic replay.
+    #[serde(default)]
+    pub journal: Vec<JournalEntry>,
     /// Thumbnail image path (PNG bytes) of the scene.
     pub thumbnail: Option<Vec<u8>>,
     /// Real-world save time (Unix timestamp).

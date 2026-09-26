@@ -12,7 +12,10 @@ pub enum Transition {
     /// Cross-fade (dissolve) between old and new frame.
     Dissolve { duration: f32 },
     /// Slide the new frame in from a direction.
-    Slide { direction: SlideDirection, duration: f32 },
+    Slide {
+        direction: SlideDirection,
+        duration: f32,
+    },
     /// Zoom/scale the new frame in.
     Zoom { duration: f32 },
 }

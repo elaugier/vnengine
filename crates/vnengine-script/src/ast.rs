@@ -121,13 +121,21 @@ pub enum Stmt {
     /// `$ <name> = <expr>` or `set <name> = <expr>`
     Assign { name: String, value: Expr },
     /// `$ <name> += <expr>` etc.
-    AssignOp { name: String, op: BinaryOp, value: Expr },
+    AssignOp {
+        name: String,
+        op: BinaryOp,
+        value: Expr,
+    },
     /// `default <name> = <expr>` — only assigns if the variable doesn't exist.
     Default { name: String, value: Expr },
     /// `while <cond>: <body>`
     While { cond: Expr, body: Vec<Stmt> },
     /// `for <var> in <iterable>: <body>`
-    For { var: String, iterable: Expr, body: Vec<Stmt> },
+    For {
+        var: String,
+        iterable: Expr,
+        body: Vec<Stmt>,
+    },
     /// `transform <character> <props>`
     Transform {
         character: String,
@@ -143,13 +151,8 @@ pub enum Stmt {
         params: Vec<String>,
         body: Vec<Stmt>,
     },
-    /// `return` — return from a function call.
-    ReturnStmt,
     /// `shake intensity=<expr> duration=<expr>`
-    Shake {
-        intensity: Expr,
-        duration: Expr,
-    },
+    Shake { intensity: Expr, duration: Expr },
     /// `end`
     End,
 }
@@ -194,8 +197,19 @@ pub enum Expr {
     /// List literal: `[expr, expr, ...]`
     List(Vec<Expr>),
     /// Index access: `expr[expr]`
-    Index { collection: Box<Expr>, index: Box<Expr> },
-    UnaryOp { op: UnaryOp, operand: Box<Expr> },
+    Index {
+        collection: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// Builtin function call: `random()`, `randint(a, b)`, `srand(seed)`.
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+    UnaryOp {
+        op: UnaryOp,
+        operand: Box<Expr>,
+    },
     BinaryOp {
         op: BinaryOp,
         lhs: Box<Expr>,

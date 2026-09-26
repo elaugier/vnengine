@@ -22,7 +22,8 @@ impl TextState {
         let swash_cache = SwashCache::new();
         let cache = Cache::new(device);
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
-        let renderer = TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
+        let renderer =
+            TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
         let viewport = Viewport::new(device, &cache);
         let _ = &mut font_system;
         Self {
@@ -42,7 +43,10 @@ impl TextState {
     /// Create a new text buffer with the given font size (in pixels) and
     /// wrapping width (in pixels).
     pub fn new_buffer(&mut self, font_size: f32, width: u32) -> Buffer {
-        let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, font_size * 1.2));
+        let mut buffer = Buffer::new(
+            &mut self.font_system,
+            Metrics::new(font_size, font_size * 1.2),
+        );
         buffer.set_size(Some(width as f32), Some(font_size * 1.2 * 8.0));
         buffer
     }
@@ -103,10 +107,7 @@ impl TextState {
             .collect();
 
         // Build references for set_rich_text.
-        let refs: Vec<(&str, Attrs)> = pairs
-            .iter()
-            .map(|(s, a)| (s.as_str(), a.clone()))
-            .collect();
+        let refs: Vec<(&str, Attrs)> = pairs.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
         buffer.set_rich_text(refs, &default_attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut self.font_system, false);
     }

@@ -6,7 +6,7 @@
 
 use ahash::AHashMap;
 use std::path::Path;
-use wgpu::{Device, Queue, TextureFormat};
+use wgpu::TextureFormat;
 
 /// A cached GPU texture and its dimensions.
 pub struct GpuImage {

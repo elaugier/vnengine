@@ -46,14 +46,14 @@ pub enum Token {
     Play,
     Stop,
     Voice,
-    Set,     // `set` keyword (unused alias for `$`)
-    Default, // `default` keyword
-    While,   // `while` keyword
-    For,     // `for` keyword
-    In,      // `in` keyword (for loops)
-    Def,     // `def` keyword (user functions)
+    Set,       // `set` keyword (unused alias for `$`)
+    Default,   // `default` keyword
+    While,     // `while` keyword
+    For,       // `for` keyword
+    In,        // `in` keyword (for loops)
+    Def,       // `def` keyword (user functions)
     Transform, // `transform` keyword
-    Shake,    // `shake` keyword
+    Shake,     // `shake` keyword
     End,
     // Literals
     Ident(String),
@@ -61,14 +61,14 @@ pub enum Token {
     IntLit(i64),
     FloatLit(f64),
     // Operators / punctuation
-    Assign,    // =
-    PlusAssign,  // +=
-    MinusAssign, // -=
-    StarAssign,  // *=
-    SlashAssign, // /=
+    Assign,        // =
+    PlusAssign,    // +=
+    MinusAssign,   // -=
+    StarAssign,    // *=
+    SlashAssign,   // /=
     PercentAssign, // %=
-    Eq,        // ==
-    Neq,       // !=
+    Eq,            // ==
+    Neq,           // !=
     Lt,
     Gt,
     Le,
@@ -107,8 +107,7 @@ pub struct Spanned {
     pub col: usize,
 }
 
-pub struct Lexer<'a> {
-    src: &'a str,
+pub struct Lexer {
     chars: Vec<char>,
     pos: usize,
     line: usize,
@@ -128,10 +127,9 @@ fn lex_error(line: usize, msg: impl Into<String>) -> LexError {
     }
 }
 
-impl<'a> Lexer<'a> {
-    pub fn new(src: &'a str) -> Self {
+impl Lexer {
+    pub fn new(src: &str) -> Self {
         Self {
-            src,
             chars: src.chars().collect(),
             pos: 0,
             line: 1,
@@ -275,13 +273,15 @@ impl<'a> Lexer<'a> {
                 }
                 let text: String = self.chars[start..self.pos].iter().collect();
                 let tok = if is_float {
-                    Token::FloatLit(text.parse().map_err(|_| {
-                        lex_error(self.line, format!("bad float `{text}`"))
-                    })?)
+                    Token::FloatLit(
+                        text.parse()
+                            .map_err(|_| lex_error(self.line, format!("bad float `{text}`")))?,
+                    )
                 } else {
-                    Token::IntLit(text.parse().map_err(|_| {
-                        lex_error(self.line, format!("bad int `{text}`"))
-                    })?)
+                    Token::IntLit(
+                        text.parse()
+                            .map_err(|_| lex_error(self.line, format!("bad int `{text}`")))?,
+                    )
                 };
                 out.push(Spanned {
                     token: tok,
@@ -332,9 +332,9 @@ impl<'a> Lexer<'a> {
                     "and" => Token::And,
                     "or" => Token::Or,
                     "not" => Token::Not,
-                    "true" => Token::True,
-                    "false" => Token::False,
-                    "none" => Token::None,
+                    "true" | "True" => Token::True,
+                    "false" | "False" => Token::False,
+                    "none" | "None" => Token::None,
                     other => Token::Ident(other.to_string()),
                 };
                 out.push(Spanned {
@@ -392,10 +392,7 @@ impl<'a> Lexer<'a> {
                 '.' => Token::Dot,
                 ':' => Token::Colon,
                 _ => {
-                    return Err(lex_error(
-                        self.line,
-                        format!("unexpected character `{c}`"),
-                    ));
+                    return Err(lex_error(self.line, format!("unexpected character `{c}`")));
                 }
             };
             self.advance();
