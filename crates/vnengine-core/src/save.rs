@@ -24,6 +24,14 @@ pub enum JournalEntry {
     Menu(usize),
 }
 
+/// One adaptive-music stem layer (a synced loop faded in/out
+/// independently of the base track).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MusicLayerState {
+    pub track: String,
+    pub volume: f32,
+}
+
 /// A single save slot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveState {
@@ -54,6 +62,9 @@ pub struct SaveState {
     /// restores with the save and rollback.
     #[serde(default)]
     pub plugin_kv: std::collections::BTreeMap<String, String>,
+    /// Adaptive-music stem layers active at save time.
+    #[serde(default)]
+    pub music_layers: std::collections::BTreeMap<String, MusicLayerState>,
     /// Thumbnail image path (PNG bytes) of the scene.
     pub thumbnail: Option<Vec<u8>>,
     /// Real-world save time (Unix timestamp).

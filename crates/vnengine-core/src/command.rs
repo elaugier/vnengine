@@ -35,6 +35,9 @@ pub struct SpriteSpec {
     pub scale: Option<f32>,
     /// Optional z-order (higher = drawn on top).
     pub z: Option<i32>,
+    /// Entry transition (`show ... with dissolve`). `None`/`Cut` is instant.
+    #[serde(default)]
+    pub transition: Option<Transition>,
 }
 
 /// A single choice in a menu.
@@ -81,6 +84,17 @@ pub enum Command {
     PlayMusic { track: String, fade: f32 },
     /// Stop the currently playing music.
     StopMusic { fade: f32 },
+    /// Upsert or adjust an adaptive-music stem layer. `track` starts or
+    /// replaces the stem; `volume` tweens its level. At least one must
+    /// be set.
+    MusicLayer {
+        name: String,
+        track: Option<String>,
+        volume: Option<f32>,
+        fade: f32,
+    },
+    /// Remove an adaptive-music stem layer.
+    MusicLayerOff { name: String, fade: f32 },
     /// Play a one-shot sound effect.
     PlaySfx { track: String, volume: f32 },
     /// Play a voice line.
@@ -106,6 +120,23 @@ pub enum Command {
     RegisterCg { image: String },
     /// Set a global variable.
     SetVariable { name: String, value: Value },
+    /// Send a command to a WASM plugin. `payload` is a JSON array of the
+    /// evaluated argument values, e.g. `["unlock","chapel"]`.
+    PluginCall { plugin: String, payload: String },
+    /// Insert or replace a named point light in the scene.
+    LightSet(crate::model::PointLight),
+    /// Remove a point light by name.
+    LightRemove { name: String },
+    /// Set ambient light level per channel (1.0 = fully lit).
+    Ambient { color: [f32; 3] },
+    /// Move the scene camera (parallax + zoom). Unset axes keep their
+    /// current values. `duration` > 0 animates smoothly.
+    Camera {
+        x: Option<f32>,
+        y: Option<f32>,
+        zoom: Option<f32>,
+        duration: f32,
+    },
     /// The script reached the end of the game.
     End,
 }

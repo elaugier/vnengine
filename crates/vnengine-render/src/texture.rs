@@ -33,6 +33,12 @@ impl TextureCache {
         }
     }
 
+    /// Drop every cached texture so the next frame reloads them from
+    /// the asset source (hot reload of edited images).
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+
     /// Ensure a texture is loaded into the cache. Call before `get`.
     /// `rel` is an image reference relative to `dir` (the image dir);
     /// common extensions are probed when `rel` has none.

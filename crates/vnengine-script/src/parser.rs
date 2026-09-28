@@ -16,11 +16,68 @@ pub enum ParseError {
     },
 }
 
+/// Split a token slice on top-level commas (commas inside parens,
+/// brackets or braces don't split). An empty input yields no chunks.
+fn split_commas(toks: &[Spanned]) -> Vec<&[Spanned]> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, t) in toks.iter().enumerate() {
+        match t.token {
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => depth -= 1,
+            Token::Comma if depth == 0 => {
+                if start < i {
+                    out.push(&toks[start..i]);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < toks.len() {
+        out.push(&toks[start..]);
+    }
+    out
+}
+
 fn err(line: usize, msg: impl Into<String>) -> ParseError {
     ParseError::Generic {
         line,
         message: msg.into(),
     }
+}
+
+/// Collect `key=<tokens>` pairs starting at `start`. A value runs until
+/// the next `ident =` pair or end of line.
+fn kv_pairs(
+    toks: &[Spanned],
+    start: usize,
+    line_no: usize,
+) -> Result<Vec<(String, Vec<Spanned>)>, ParseError> {
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < toks.len() {
+        let key = expect_ident(&toks[i], line_no, "property name")?;
+        i += 1;
+        if i >= toks.len() || !matches!(toks[i].token, Token::Assign) {
+            return Err(err(line_no, "expected `=` after property name"));
+        }
+        i += 1;
+        let mut value = Vec::new();
+        while i < toks.len() {
+            if matches!(toks[i].token, Token::Ident(_))
+                && i + 1 < toks.len()
+                && matches!(toks[i + 1].token, Token::Assign)
+            {
+                break;
+            }
+            value.push(toks[i].clone());
+            i += 1;
+        }
+        out.push((key, value));
+    }
+    Ok(out)
 }
 
 pub struct Parser {
@@ -352,6 +409,145 @@ impl Parser {
                 expect_token(&toks[2], Token::Assign, line_no, "=")?;
                 let value = self.parse_expr_tokens(&toks[3..], line_no)?;
                 Ok((Stmt::Assign { name, value }, 1))
+            }
+            Token::Ident(s) if s == "plugin" => {
+                // `plugin <name> [<expr>, <expr>, ...]`
+                let name = expect_ident(&toks[1], line_no, "plugin name")?;
+                let mut args = Vec::new();
+                for chunk in split_commas(&toks[2..]) {
+                    args.push(self.parse_expr_tokens(chunk, line_no)?);
+                }
+                Ok((Stmt::Plugin { name, args }, 1))
+            }
+            Token::Ident(s) if s == "light" => {
+                // `light <name> x=<e> y=<e> radius=<e> intensity=<e> [color=#hex]`
+                let name = match &toks.get(1).map(|t| &t.token) {
+                    Some(Token::Ident(n)) | Some(Token::StringLit(n)) => n.clone(),
+                    _ => return Err(err(line_no, "expected light name")),
+                };
+                let mut x = None;
+                let mut y = None;
+                let mut radius = None;
+                let mut intensity = None;
+                let mut color = None;
+                for (k, vt) in kv_pairs(toks, 2, line_no)? {
+                    match k.as_str() {
+                        "x" => x = Some(self.parse_expr_tokens(&vt, line_no)?),
+                        "y" => y = Some(self.parse_expr_tokens(&vt, line_no)?),
+                        "radius" => radius = Some(self.parse_expr_tokens(&vt, line_no)?),
+                        "intensity" => intensity = Some(self.parse_expr_tokens(&vt, line_no)?),
+                        "color" => {
+                            if let Some(Token::StringLit(h)) = vt.first().map(|t| &t.token) {
+                                color = parse_hex_color(h, line_no)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let (x, y, radius, intensity) = match (x, y, radius, intensity) {
+                    (Some(x), Some(y), Some(r), Some(i)) => (x, y, r, i),
+                    _ => {
+                        return Err(err(
+                            line_no,
+                            "light requires x=, y=, radius= and intensity=",
+                        ))
+                    }
+                };
+                Ok((
+                    Stmt::Light {
+                        name,
+                        x,
+                        y,
+                        radius,
+                        intensity,
+                        color,
+                    },
+                    1,
+                ))
+            }
+            Token::Ident(s) if s == "music" => {
+                // `music layer "<n>" ["<track>"] [volume=<e>] [fade=<e>]`
+                // `music layer "<n>" off [fade=<e>]`
+                let sub = expect_ident(&toks[1], line_no, "`layer`")?;
+                if sub != "layer" {
+                    return Err(err(line_no, "expected `music layer`"));
+                }
+                let name = match toks.get(2).map(|t| &t.token) {
+                    Some(Token::Ident(n)) | Some(Token::StringLit(n)) => n.clone(),
+                    _ => return Err(err(line_no, "expected layer name")),
+                };
+                let mut i = 3;
+                let mut track = None;
+                let mut off = false;
+                // Optional positional track (string) or `off` keyword.
+                match toks.get(i).map(|t| &t.token) {
+                    Some(Token::StringLit(t)) => {
+                        track = Some(t.clone());
+                        i += 1;
+                    }
+                    Some(Token::Ident(t)) if t == "off" => {
+                        off = true;
+                        i += 1;
+                    }
+                    _ => {}
+                }
+                let mut volume = None;
+                let mut fade = None;
+                for (k, vt) in kv_pairs(toks, i, line_no)? {
+                    match k.as_str() {
+                        "volume" => volume = Some(self.parse_expr_tokens(&vt, line_no)?),
+                        "fade" => fade = Some(self.parse_expr_tokens(&vt, line_no)?),
+                        _ => {}
+                    }
+                }
+                Ok((
+                    Stmt::MusicLayer {
+                        name,
+                        track,
+                        volume,
+                        fade,
+                        off,
+                    },
+                    1,
+                ))
+            }
+            Token::Ident(s) if s == "unlight" => {
+                let name = match &toks.get(1).map(|t| &t.token) {
+                    Some(Token::Ident(n)) | Some(Token::StringLit(n)) => n.clone(),
+                    _ => return Err(err(line_no, "expected light name")),
+                };
+                Ok((Stmt::Unlight { name }, 1))
+            }
+            Token::Ident(s) if s == "ambient" => {
+                // `ambient <r> <g> <b>` (three positional expressions)
+                if toks.len() < 4 {
+                    return Err(err(line_no, "ambient requires r g b"));
+                }
+                Ok((
+                    Stmt::Ambient {
+                        r: self.parse_expr_tokens(&toks[1..2], line_no)?,
+                        g: self.parse_expr_tokens(&toks[2..3], line_no)?,
+                        b: self.parse_expr_tokens(&toks[3..4], line_no)?,
+                    },
+                    1,
+                ))
+            }
+            Token::Ident(s) if s == "camera" => {
+                // `camera [x=<e>] [y=<e>] [zoom=<e>] [over=<e>]`
+                let mut x = None;
+                let mut y = None;
+                let mut zoom = None;
+                let mut over = None;
+                for (k, vt) in kv_pairs(toks, 1, line_no)? {
+                    match k.as_str() {
+                        "x" => x = Some(self.parse_expr_tokens(&vt, line_no)?),
+                        "y" => y = Some(self.parse_expr_tokens(&vt, line_no)?),
+                        "zoom" => zoom = Some(self.parse_expr_tokens(&vt, line_no)?),
+                        "over" => over = Some(self.parse_expr_tokens(&vt, line_no)?),
+                        _ => {}
+                    }
+                }
+                Ok((Stmt::Camera { x, y, zoom, over }, 1))
             }
             Token::Ident(s) if s == "stop" && toks.len() >= 2 => {
                 // `stop voice` (lowercase ident fallback)

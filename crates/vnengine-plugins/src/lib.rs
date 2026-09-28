@@ -20,6 +20,10 @@
 //! - `vn_init()` — called once after load
 //! - `vn_tick(dt: f32)` — called each engine tick
 //! - `vn_on_choice(index: i32)` — called when the player picks a menu item
+//! - `vn_alloc(len: i32) -> ptr` — allocate `len` bytes; required for
+//!   `vn_on_command` (the host writes the JSON payload at `ptr`)
+//! - `vn_on_command(ptr, len)` — called for each `plugin <name> ...`
+//!   statement in a script; `ptr..ptr+len` is a JSON array of args
 //!
 //! Plugin state lives in the runtime's key/value store (namespaced as
 //! `<plugin>.<key>`), which is part of saves and rollback snapshots —
@@ -136,6 +140,31 @@ impl Plugin {
             }
         }
     }
+
+    /// Copy `payload` into plugin memory via `vn_alloc` and invoke
+    /// `vn_on_command`. Returns false when the plugin doesn't export
+    /// the command hook.
+    fn deliver(&mut self, payload: &[u8]) -> Result<bool> {
+        if self
+            .instance
+            .get_func(&mut self.store, "vn_on_command")
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let len = i32::try_from(payload.len()).context("payload too large")?;
+        let Some(ptr) = self.call::<(i32,), i32>("vn_alloc", (len,))? else {
+            bail!("plugin `{}` exports no `vn_alloc`", self.manifest.name);
+        };
+        let mem = self
+            .instance
+            .get_memory(&mut self.store, "memory")
+            .context("plugin exports no `memory`")?;
+        mem.write(&mut self.store, ptr as usize, payload)
+            .context("payload write out of bounds")?;
+        self.call::<(i32, i32), ()>("vn_on_command", (ptr, len))?;
+        Ok(true)
+    }
 }
 
 /// The plugin host: engine plus all loaded plugins.
@@ -237,6 +266,30 @@ impl PluginHost {
     /// Notify plugins of a menu choice selection.
     pub fn notify_choice(&mut self, kv: &mut PluginKv, index: usize) {
         self.call_all("vn_on_choice", (index as i32,), kv);
+    }
+
+    /// Deliver a `plugin <name> ...` command. The JSON payload is copied
+    /// into the plugin's memory via its `vn_alloc` export, then
+    /// `vn_on_command(ptr, len)` runs within the fuel budget. Returns
+    /// false if no such plugin is loaded or it doesn't handle commands.
+    pub fn send_command(&mut self, kv: &mut PluginKv, name: &str, payload: &str) -> bool {
+        let Some(plugin) = self.plugins.iter_mut().find(|p| p.name() == name) else {
+            log::warn!("plugin command for unknown plugin `{name}`");
+            return false;
+        };
+        std::mem::swap(&mut plugin.store.data_mut().kv, kv);
+        let result = plugin.deliver(payload.as_bytes());
+        for line in plugin.store.data_mut().logs.drain(..) {
+            log::info!("plugin `{name}`: {line}");
+        }
+        std::mem::swap(&mut plugin.store.data_mut().kv, kv);
+        match result {
+            Ok(handled) => handled,
+            Err(e) => {
+                log::warn!("plugin `{name}` command error: {e:#}");
+                false
+            }
+        }
     }
 
     /// All hooks return `()`, so `O` is fixed.
@@ -364,13 +417,16 @@ pub fn load_source(
     prefix: &str,
 ) {
     for path in source.list(prefix) {
-        if !path.ends_with(".wasm") {
+        // `.wasm` binaries and `.wat` text modules (dev-friendly) both
+        // load — wasmtime's `wat` feature detects text format.
+        let ext = path.rsplit('.').next().unwrap_or("");
+        if ext != "wasm" && ext != "wat" {
             continue;
         }
         let stem = path
             .rsplit('/')
             .next()
-            .and_then(|f| f.strip_suffix(".wasm"))
+            .and_then(|f| f.rsplit_once('.').map(|(s, _)| s))
             .unwrap_or_default()
             .to_string();
         if let Err(e) = load_entry(host, source, &path, &stem) {
@@ -386,9 +442,13 @@ fn load_entry(
     stem: &str,
 ) -> Result<()> {
     let wasm = source.read(wasm_path)?;
+    let base = wasm_path
+        .rsplit_once('.')
+        .map(|(b, _)| b)
+        .unwrap_or(wasm_path);
     let manifest_src = String::from_utf8(
         source
-            .read(&format!("{}.toml", wasm_path.trim_end_matches(".wasm")))
+            .read(&format!("{base}.toml"))
             .context("missing `<name>.toml` manifest")?,
     )?;
     let manifest = PluginManifest::for_file(&manifest_src, stem)?;

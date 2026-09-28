@@ -19,6 +19,7 @@ def thought:
 label start:
     scene bg school with dissolve 1.5
     play music "bgm_school.ogg" fade 2.0
+    plugin journal "chapter", "gate"
     n "The sun was setting over Sakura High, painting everything in gold."
     n "A gentle breeze carried the scent of {b}cherry blossoms{/b} through the air."
     play sfx "sfx_wind.ogg" volume 0.6
@@ -107,15 +108,15 @@ label library:
 
     menu:
         "All the time. It's my favorite spot.":
-            show eileen happy at left
+            show eileen happy at left with dissolve
             e "Really? Maybe we should come here together more often."
             $ eileen_affection = 2
         "Not really. I prefer being outside.":
-            show eileen thinking at left
+            show eileen thinking at left with dissolve
             e "I see. Well, maybe I can change your mind."
             $ eileen_affection = 0
         "Only when I need to study for exams.":
-            show eileen surprised at left
+            show eileen surprised at left with dissolve
             e "So practical! You're so different from me."
             $ eileen_affection = 1
 
@@ -140,11 +141,16 @@ label library:
 
 label sunset:
     stop music fade 1.5
-    scene bg rooftop with dissolve 1.0
+    scene bg rooftop with zoom 1.0
     play music "bgm_rooftop.ogg" fade 2.0
+    ambient 0.45 0.4 0.55
+    light "sun" x=0.78 y=0.18 radius=0.65 intensity=1.1 color="#ff9040"
+    light "city" x=0.2 y=0.95 radius=0.5 intensity=0.4 color="#4466ff"
+    camera y=0.02 zoom=1.06 over=2.0
+    music layer "wind" "sfx_wind.ogg" volume=0.25 fade=2.0
     n "We climbed the stairs to the rooftop, the city spreading out beneath us."
     n "The sky was a canvas of {color=#ff8800}orange{/color}, {color=#ff4080}pink{/color}, and {color=#4040ff}deep purple{/color}."
-    show eileen happy at center
+    show eileen happy at center with slideright 0.6
     e "Isn't it beautiful?"
     e "I could stay up here forever."
     n "She leaned against the railing, her hair catching the last light."
@@ -165,6 +171,7 @@ label sunset:
             $ eileen_affection = 2
         "The view is nice, but it's kind of windy.":
             show eileen thinking at center
+            music layer "wind" volume=0.6 fade=1.0
             e "You're always so practical."
             e "Can't you just enjoy the moment?"
             $ eileen_affection = 0
@@ -219,6 +226,11 @@ label home:
 
 label ending:
     stop music fade 2.0
+    unlight "sun"
+    unlight "city"
+    ambient 1.0 1.0 1.0
+    camera x=0.0 y=0.0 zoom=1.0
+    hide eileen with dissolve 1.0
     scene bg black with fade 2.0
     play music "bgm_ending.ogg" fade 3.0
     pause 1.0

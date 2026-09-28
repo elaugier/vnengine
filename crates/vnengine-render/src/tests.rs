@@ -3,7 +3,7 @@ use crate::renderer::{full_screen_quad, quad_vertices_color, quad_vertices_textu
 #[test]
 fn full_screen_quad_wide_image() {
     // 16:9 image on 16:9 screen: should fill entirely.
-    let q = full_screen_quad(1920, 1080, 1.0);
+    let q = full_screen_quad(1920, 1080, 16.0 / 9.0, 1.0);
     assert!((q.hw - 1.0).abs() < 0.01);
     assert!((q.hh - 1.0).abs() < 0.01);
     assert_eq!(q.color, [1.0, 1.0, 1.0, 1.0]);
@@ -12,7 +12,7 @@ fn full_screen_quad_wide_image() {
 #[test]
 fn full_screen_quad_tall_image() {
     // 9:16 image on 16:9 screen: should be letterboxed (hw < 1).
-    let q = full_screen_quad(720, 1280, 0.5);
+    let q = full_screen_quad(720, 1280, 16.0 / 9.0, 0.5);
     assert!(q.hw < 1.0);
     assert!((q.hh - 1.0).abs() < 0.01);
     assert!((q.color[3] - 0.5).abs() < 0.01);
@@ -21,28 +21,28 @@ fn full_screen_quad_tall_image() {
 #[test]
 fn full_screen_quad_wide_image_letterbox() {
     // 21:9 image on 16:9 screen: should be pillarboxed (hh < 1).
-    let q = full_screen_quad(2520, 1080, 1.0);
+    let q = full_screen_quad(2520, 1080, 16.0 / 9.0, 1.0);
     assert!((q.hw - 1.0).abs() < 0.01);
     assert!(q.hh < 1.0);
 }
 
 #[test]
 fn full_screen_quad_centered() {
-    let q = full_screen_quad(100, 100, 1.0);
+    let q = full_screen_quad(100, 100, 16.0 / 9.0, 1.0);
     assert!((q.x - 0.5).abs() < 0.01);
     assert!((q.y - 0.5).abs() < 0.01);
 }
 
 #[test]
 fn quad_vertices_textured_count() {
-    let q = full_screen_quad(1920, 1080, 1.0);
+    let q = full_screen_quad(1920, 1080, 16.0 / 9.0, 1.0);
     let verts = quad_vertices_textured(&q);
     assert_eq!(verts.len(), 6);
 }
 
 #[test]
 fn quad_vertices_textured_uv_range() {
-    let q = full_screen_quad(1920, 1080, 1.0);
+    let q = full_screen_quad(1920, 1080, 16.0 / 9.0, 1.0);
     let verts = quad_vertices_textured(&q);
     for v in &verts {
         assert!(v.uv[0] >= 0.0 && v.uv[0] <= 1.0);
@@ -55,7 +55,7 @@ fn quad_vertices_textured_ndc_range() {
     // A full-screen 16:9 quad: hw=1.0, hh=1.0, centered at (0.5, 0.5).
     // NDC = v*2-1, so x in [0.5-1, 0.5+1] = [-0.5, 1.5] -> NDC [-2, 2].
     // The quad intentionally extends beyond the screen for full coverage.
-    let q = full_screen_quad(1920, 1080, 1.0);
+    let q = full_screen_quad(1920, 1080, 16.0 / 9.0, 1.0);
     let verts = quad_vertices_textured(&q);
     // All vertices should be within reasonable NDC bounds.
     for v in &verts {
@@ -116,4 +116,27 @@ fn quad_vertices_color_propagates_color() {
     for v in &verts {
         assert_eq!(v.color, [0.5, 0.5, 0.5, 0.8]);
     }
+}
+
+#[test]
+fn quad_rotation_moves_corners() {
+    // A 90-degree rotation swaps the quad's axes around its center.
+    let mut q = full_screen_quad(200, 100, 16.0 / 9.0, 1.0);
+    q.x = 0.5;
+    q.y = 0.5;
+    q.hw = 0.2;
+    q.hh = 0.1;
+    q.rotation = std::f32::consts::FRAC_PI_2;
+    let verts = quad_vertices_textured(&q);
+    // Corner (-hw,-hh) rotated +90° around center → (-0.4, +0.7) in
+    // normalized coords → NDC (-1.8, -0.4)... verify extremes swap:
+    let xs: Vec<f32> = verts.iter().map(|v| v.pos[0]).collect();
+    let ys: Vec<f32> = verts.iter().map(|v| v.pos[1]).collect();
+    // x extent = 2*hh (was 2*hw before rotation).
+    let x_span =
+        xs.iter().cloned().fold(f32::MIN, f32::max) - xs.iter().cloned().fold(f32::MAX, f32::min);
+    let y_span =
+        ys.iter().cloned().fold(f32::MIN, f32::max) - ys.iter().cloned().fold(f32::MAX, f32::min);
+    assert!((x_span - 0.4).abs() < 0.01, "x_span {x_span}");
+    assert!((y_span - 0.8).abs() < 0.01, "y_span {y_span}");
 }

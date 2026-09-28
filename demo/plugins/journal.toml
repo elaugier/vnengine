@@ -1,0 +1,5 @@
+name = "journal"
+version = "1.0"
+permissions = ["log", "kv"]
+fuel_per_tick = 100000
+memory_max_bytes = 1048576

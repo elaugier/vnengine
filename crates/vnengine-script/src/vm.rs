@@ -172,6 +172,10 @@ pub enum StepResult {
 /// hanging the game loop.
 const MAX_STEPS_PER_CALL: usize = 100_000;
 
+/// Maximum call/block stack depth. A runaway `call` chain (infinite
+/// recursion) aborts with an error instead of exhausting memory.
+const MAX_STACK_DEPTH: usize = 1024;
+
 pub struct Vm {
     pub script: Script,
     pub state: VmState,
@@ -363,11 +367,20 @@ impl Vm {
                     continue;
                 }
                 Ok(ExecOutcome::Call(label)) => {
-                    // Push a new frame for the called label.
+                    if self.state.stack.len() >= MAX_STACK_DEPTH {
+                        log::error!("script error: call stack overflow");
+                        self.state.finished = true;
+                        return StepResult::Finished;
+                    }
                     self.state.stack.push(Frame::call(label));
                     continue;
                 }
                 Ok(ExecOutcome::Push(frame)) => {
+                    if self.state.stack.len() >= MAX_STACK_DEPTH {
+                        log::error!("script error: block stack overflow");
+                        self.state.finished = true;
+                        return StepResult::Finished;
+                    }
                     self.state.stack.push(frame);
                     continue;
                 }
@@ -410,6 +423,17 @@ impl Vm {
     /// Resume execution after a blocking command. For a menu, pass the
     /// selected index in `response`. For other blocking commands, pass
     /// `None`.
+    /// Studio/debug: reset execution to the start of `name`'s body.
+    /// Returns false when the label does not exist (state untouched).
+    pub fn jump_to_label(&mut self, name: &str) -> bool {
+        if self.script.find_label_index(name).is_none() {
+            return false;
+        }
+        self.state.stack = vec![Frame::label(name)];
+        self.state.pending_menu = None;
+        true
+    }
+
     pub fn resume(&mut self, response: Option<MenuResponse>) {
         if let Some(menu) = self.state.pending_menu.take() {
             if let Some(MenuResponse::Selected(idx)) = response {
@@ -463,8 +487,9 @@ impl Vm {
                 position,
                 scale,
                 z,
-                transition: _,
+                transition,
             } => {
+                let transition = transition.and_then(|t| Transition::parse(&t.name, t.duration));
                 let anchor = anchor_to_anchor(&anchor);
                 let pos = position.and_then(|(x, y)| {
                     let xv =
@@ -492,6 +517,7 @@ impl Vm {
                     position: pos.map(|(x, y)| (x as f32, y as f32)),
                     scale,
                     z,
+                    transition,
                 })))
             }
             Stmt::Hide {
@@ -833,6 +859,108 @@ impl Vm {
                 });
                 Ok(ExecOutcome::Push(frame))
             }
+            Stmt::Plugin { name, args } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in &args {
+                    values.push(
+                        eval_expr_rng(arg, &self.state.variables, &mut self.state.rng_seed)
+                            .map_err(|e| format!("plugin `{name}` argument error: {e}"))?,
+                    );
+                }
+                // Public payload: plain JSON (strings/numbers/bools/
+                // null/arrays), not the internal tagged-Value encoding.
+                let json: Vec<serde_json::Value> = values.iter().map(value_to_json).collect();
+                let payload = serde_json::to_string(&json)
+                    .map_err(|e| format!("plugin `{name}` payload error: {e}"))?;
+                Ok(ExecOutcome::Command(Command::PluginCall {
+                    plugin: name,
+                    payload,
+                }))
+            }
+            Stmt::Light {
+                name,
+                x,
+                y,
+                radius,
+                intensity,
+                color,
+            } => {
+                let mut f = |e: &Expr| -> Result<f32, String> {
+                    eval_expr_rng(e, &self.state.variables, &mut self.state.rng_seed)
+                        .and_then(|v| v.as_float().ok_or("expected number".into()))
+                        .map(|f| f as f32)
+                };
+                Ok(ExecOutcome::Command(Command::LightSet(
+                    vnengine_core::model::PointLight {
+                        name,
+                        x: f(&x)?,
+                        y: f(&y)?,
+                        radius: f(&radius)?,
+                        intensity: f(&intensity)?,
+                        color: color.unwrap_or([1.0, 1.0, 1.0]),
+                    },
+                )))
+            }
+            Stmt::Unlight { name } => Ok(ExecOutcome::Command(Command::LightRemove { name })),
+            Stmt::Ambient { r, g, b } => {
+                let mut f = |e: &Expr| -> Result<f32, String> {
+                    eval_expr_rng(e, &self.state.variables, &mut self.state.rng_seed)
+                        .and_then(|v| v.as_float().ok_or("expected number".into()))
+                        .map(|f| f as f32)
+                };
+                Ok(ExecOutcome::Command(Command::Ambient {
+                    color: [f(&r)?, f(&g)?, f(&b)?],
+                }))
+            }
+            Stmt::Camera { x, y, zoom, over } => {
+                let mut f = |e: &Option<Expr>| -> Result<Option<f32>, String> {
+                    match e {
+                        Some(e) => {
+                            eval_expr_rng(e, &self.state.variables, &mut self.state.rng_seed)
+                                .and_then(|v| v.as_float().ok_or("expected number".into()))
+                                .map(|f| Some(f as f32))
+                        }
+                        None => Ok(None),
+                    }
+                };
+                Ok(ExecOutcome::Command(Command::Camera {
+                    x: f(&x)?,
+                    y: f(&y)?,
+                    zoom: f(&zoom)?,
+                    duration: f(&over)?.unwrap_or(0.0),
+                }))
+            }
+            Stmt::MusicLayer {
+                name,
+                track,
+                volume,
+                fade,
+                off,
+            } => {
+                let mut f = |e: &Option<Expr>| -> Result<Option<f32>, String> {
+                    match e {
+                        Some(e) => {
+                            eval_expr_rng(e, &self.state.variables, &mut self.state.rng_seed)
+                                .and_then(|v| v.as_float().ok_or("expected number".into()))
+                                .map(|f| Some(f as f32))
+                        }
+                        None => Ok(None),
+                    }
+                };
+                let fade = f(&fade)?.unwrap_or(0.0);
+                if off {
+                    return Ok(ExecOutcome::Command(Command::MusicLayerOff { name, fade }));
+                }
+                if track.is_none() && volume.is_none() {
+                    return Err("music layer requires a track or volume".into());
+                }
+                Ok(ExecOutcome::Command(Command::MusicLayer {
+                    name,
+                    track,
+                    volume: f(&volume)?,
+                    fade,
+                }))
+            }
             Stmt::End => {
                 self.state.finished = true;
                 Ok(ExecOutcome::Command(Command::End))
@@ -968,6 +1096,18 @@ fn eval_builtin(
             Ok(Value::Int(seed))
         }
         _ => Err(format!("unknown function `{name}()`")),
+    }
+}
+
+/// Convert a script [`Value`] to plain JSON for the plugin ABI.
+fn value_to_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::Str(s) => serde_json::Value::String(s.clone()),
+        Value::Int(i) => serde_json::json!(*i),
+        Value::Float(f) => serde_json::json!(*f),
+        Value::Bool(b) => serde_json::json!(*b),
+        Value::None => serde_json::Value::Null,
+        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
     }
 }
 

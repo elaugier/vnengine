@@ -186,6 +186,16 @@ impl AssetSource for Package {
     }
 }
 
+/// Asset directories mirrored into `assets/` inside the package.
+fn asset_dirs(config: &EngineConfig) -> [&str; 4] {
+    [
+        config.image_dir.as_str(),
+        config.audio_dir.as_str(),
+        config.voice_dir.as_str(),
+        "translations",
+    ]
+}
+
 /// Load and validate `project.toml` for a project directory.
 pub fn load_config(project: &Path) -> Result<EngineConfig> {
     let config_path = project.join("project.toml");
@@ -207,7 +217,7 @@ pub fn validate(project: &Path) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", script_path.display()))?;
 
     let mut assets = Vec::new();
-    for dir in [&config.image_dir, &config.audio_dir, &config.voice_dir] {
+    for dir in asset_dirs(&config) {
         collect_files(&project.join(dir), &mut |fs_path| {
             assets.push(fs_path.to_path_buf());
             Ok(())
@@ -243,7 +253,7 @@ pub fn build(project: &Path, output: &Path) -> Result<()> {
 
     // Collect assets sorted by archive name for deterministic output.
     let mut members: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for dir in [&config.image_dir, &config.audio_dir, &config.voice_dir] {
+    for dir in asset_dirs(&config) {
         let root = project.join(dir);
         collect_files(&root, &mut |fs_path| {
             let rel = fs_path
@@ -264,7 +274,7 @@ pub fn build(project: &Path, output: &Path) -> Result<()> {
             .expect("walked path is under root")
             .to_string_lossy()
             .replace('\\', "/");
-        if rel.ends_with(".wasm") || rel.ends_with(".toml") {
+        if rel.ends_with(".wasm") || rel.ends_with(".wat") || rel.ends_with(".toml") {
             let key = format!("assets/plugins/{rel}");
             members.insert(key.clone(), fs::read(fs_path)?);
             plugins.push(key);

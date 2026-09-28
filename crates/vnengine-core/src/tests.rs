@@ -231,6 +231,7 @@ fn scene_set_sprite_replaces_same_character() {
         position: None,
         scale: None,
         z: None,
+        transition: None,
     };
     scene.set_sprite(&spec1);
     assert_eq!(scene.sprites.len(), 1);
@@ -243,6 +244,7 @@ fn scene_set_sprite_replaces_same_character() {
         position: None,
         scale: None,
         z: None,
+        transition: None,
     };
     scene.set_sprite(&spec2);
     assert_eq!(scene.sprites.len(), 1);
@@ -260,6 +262,7 @@ fn scene_set_sprite_multiple_characters() {
         position: None,
         scale: None,
         z: None,
+        transition: None,
     });
     scene.set_sprite(&SpriteSpec {
         character: "bob".into(),
@@ -268,6 +271,7 @@ fn scene_set_sprite_multiple_characters() {
         position: None,
         scale: None,
         z: None,
+        transition: None,
     });
     assert_eq!(scene.sprites.len(), 2);
 }
@@ -282,10 +286,34 @@ fn scene_hide_sprite() {
         position: None,
         scale: None,
         z: None,
+        transition: None,
     });
-    assert!(scene.hide_sprite("alice").is_some());
+    assert!(scene.hide_sprite("alice", crate::transition::Transition::Cut));
     assert_eq!(scene.sprites.len(), 0);
-    assert!(scene.hide_sprite("alice").is_none());
+    assert!(!scene.hide_sprite("alice", crate::transition::Transition::Cut));
+}
+
+#[test]
+fn scene_hide_sprite_with_transition_goes_to_exiting() {
+    let mut scene = Scene::default();
+    scene.set_sprite(&SpriteSpec {
+        character: "alice".into(),
+        image: "a.png".into(),
+        anchor: Anchor::Center,
+        position: None,
+        scale: None,
+        z: None,
+        transition: None,
+    });
+    assert!(scene.hide_sprite(
+        "alice",
+        crate::transition::Transition::Dissolve { duration: 0.5 }
+    ));
+    assert_eq!(scene.sprites.len(), 0);
+    assert_eq!(scene.exiting.len(), 1);
+    assert_eq!(scene.exiting[0].sprite.character, "alice");
+    assert_eq!(scene.exiting[0].duration, 0.5);
+    assert_eq!(scene.exiting[0].progress(), 0.0);
 }
 
 #[test]
@@ -298,6 +326,7 @@ fn scene_sprite_lookup() {
         position: None,
         scale: None,
         z: None,
+        transition: None,
     });
     assert!(scene.sprite("alice").is_some());
     assert!(scene.sprite("bob").is_none());
@@ -314,6 +343,7 @@ fn scene_z_sorting() {
         position: None,
         scale: None,
         z: Some(0),
+        transition: None,
     });
     scene.set_sprite(&SpriteSpec {
         character: "front".into(),
@@ -322,6 +352,7 @@ fn scene_z_sorting() {
         position: None,
         scale: None,
         z: Some(10),
+        transition: None,
     });
     assert_eq!(scene.sprites[0].character, "back");
     assert_eq!(scene.sprites[1].character, "front");
@@ -341,6 +372,7 @@ fn scene_serde_roundtrip() {
         position: None,
         scale: None,
         z: None,
+        transition: None,
     });
     let json = serde_json::to_string(&scene).unwrap();
     let scene2: Scene = serde_json::from_str(&json).unwrap();
@@ -371,6 +403,7 @@ fn save_state_write_read_roundtrip() {
         plugin_kv: [("plug.k".to_string(), "v".to_string())]
             .into_iter()
             .collect(),
+        music_layers: std::collections::BTreeMap::new(),
         thumbnail: None,
         saved_at: 1700000000,
     };
@@ -406,6 +439,7 @@ fn save_state_list_multiple_slots() {
             music: None,
             journal: vec![],
             plugin_kv: Default::default(),
+            music_layers: std::collections::BTreeMap::new(),
             thumbnail: None,
             saved_at: 0,
         }
@@ -434,6 +468,7 @@ fn save_state_delete() {
         music: None,
         journal: vec![],
         plugin_kv: Default::default(),
+        music_layers: std::collections::BTreeMap::new(),
         thumbnail: None,
         saved_at: 0,
     }
@@ -520,4 +555,45 @@ fn settings_save_load_roundtrip() {
 fn settings_load_missing_returns_default() {
     let s = UserSettings::load(Path::new("/nonexistent/settings.json")).unwrap();
     assert_eq!(s.master_volume, 1.0);
+}
+
+#[test]
+fn light_at_falloff() {
+    use crate::model::{light_at, PointLight};
+    let lights = vec![PointLight {
+        name: "l".into(),
+        x: 0.5,
+        y: 0.5,
+        radius: 0.5,
+        intensity: 1.0,
+        color: [1.0, 0.5, 0.0],
+    }];
+    // At the light center: full intensity added to a 0.2 ambient.
+    let c = light_at(0.5, 0.5, &lights, [0.2, 0.2, 0.2]);
+    assert!((c[0] - 1.2).abs() < 0.01);
+    assert!((c[1] - 0.7).abs() < 0.01);
+    assert!((c[2] - 0.2).abs() < 0.01);
+    // Outside radius: ambient only.
+    let c = light_at(0.0, 0.0, &lights, [0.2, 0.2, 0.2]);
+    assert_eq!(c, [0.2, 0.2, 0.2]);
+}
+
+#[test]
+fn scene_light_upsert_and_remove() {
+    use crate::model::PointLight;
+    let mut scene = Scene::default();
+    let l = PointLight {
+        name: "a".into(),
+        x: 0.0,
+        y: 0.0,
+        radius: 1.0,
+        intensity: 1.0,
+        color: [1.0; 3],
+    };
+    scene.set_light(l.clone());
+    scene.set_light(l);
+    assert_eq!(scene.lights.len(), 1);
+    assert!(scene.remove_light("a"));
+    assert!(!scene.remove_light("a"));
+    assert_eq!(scene.ambient, [1.0, 1.0, 1.0]);
 }

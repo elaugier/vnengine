@@ -145,6 +145,36 @@ pub enum Stmt {
         opacity: Option<Expr>,
         layer: Option<String>,
     },
+    /// light <name> x=<e> y=<e> radius=<e> intensity=<e> [color=#hex]
+    Light {
+        name: String,
+        x: Expr,
+        y: Expr,
+        radius: Expr,
+        intensity: Expr,
+        color: Option<[f32; 3]>,
+    },
+    /// unlight <name>
+    Unlight { name: String },
+    /// ambient <r> <g> <b>
+    Ambient { r: Expr, g: Expr, b: Expr },
+    /// music layer "<n>" ["<track>"] [volume=<e>] [fade=<e>] — or `off`
+    /// to remove the layer.
+    MusicLayer {
+        name: String,
+        track: Option<String>,
+        volume: Option<Expr>,
+        fade: Option<Expr>,
+        off: bool,
+    },
+    /// camera [x=<e>] [y=<e>] [zoom=<e>] [over=<e>]
+    Camera {
+        x: Option<Expr>,
+        y: Option<Expr>,
+        zoom: Option<Expr>,
+        /// Animation duration in seconds (`over=`); absent = instant.
+        over: Option<Expr>,
+    },
     /// `def <name>(<params>): <body>` — user-defined function.
     Def {
         name: String,
@@ -153,6 +183,8 @@ pub enum Stmt {
     },
     /// `shake intensity=<expr> duration=<expr>`
     Shake { intensity: Expr, duration: Expr },
+    /// `plugin <name> [<expr>, ...]` — send a command to a WASM plugin.
+    Plugin { name: String, args: Vec<Expr> },
     /// `end`
     End,
 }

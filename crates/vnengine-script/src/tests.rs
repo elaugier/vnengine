@@ -1428,3 +1428,97 @@ label start:
         vm2.state.variables["b"].as_float()
     );
 }
+
+#[test]
+fn parse_plugin_command() {
+    let src = r##"
+label start:
+    plugin codex "unlock", "chapel", 42
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    match &script.labels[0].body[0] {
+        Stmt::Plugin { name, args } => {
+            assert_eq!(name, "codex");
+            assert_eq!(args.len(), 3);
+        }
+        other => panic!("expected Plugin, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_emits_plugin_call_with_json_payload() {
+    let src = r##"
+label start:
+    $ who = "chapel"
+    plugin codex "unlock", who, 42
+    "after"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let cmd = loop {
+        match vm.step() {
+            StepResult::Command(c) => break c,
+            StepResult::Finished => panic!("unexpected finish"),
+            _ => {}
+        }
+    };
+    match cmd {
+        Command::PluginCall { plugin, payload } => {
+            assert_eq!(plugin, "codex");
+            let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(v, serde_json::json!(["unlock", "chapel", 42]));
+        }
+        other => panic!("expected PluginCall, got {other:?}"),
+    }
+}
+
+#[test]
+fn call_stack_overflow_terminates() {
+    // `a` calls itself forever: the depth limit must end the script
+    // instead of growing the stack without bound.
+    let src = "label a:\n    call a\n";
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    vm.state.stack = vec![crate::vm::Frame {
+        body: crate::vm::FrameBody::Label("a".into()),
+        stmt: 0,
+        is_call: false,
+        for_loop: None,
+        while_loop: None,
+    }];
+    while !matches!(vm.step(), StepResult::Finished) {}
+    assert!(vm.state.finished);
+    assert!(vm.state.stack.len() <= 1024);
+}
+
+#[test]
+fn light_statement_parses() {
+    let src = "label start:\n    light \"torch\" x=0.7 y=0.4 radius=0.3 intensity=1.2 color=\"#ffaa44\"\n    unlight \"torch\"\n    ambient 0.3 0.3 0.4\n    camera x=0.1 zoom=1.2\n    end\n";
+    let script = Parser::parse(src).unwrap();
+    let body = &script.labels[0].body;
+    match &body[0] {
+        Stmt::Light { name, color, .. } => {
+            assert_eq!(name, "torch");
+            let c = color.unwrap();
+            assert!((c[0] - 1.0).abs() < 0.01);
+            assert!((c[1] - 0.667).abs() < 0.01);
+        }
+        other => panic!("expected Light, got {other:?}"),
+    }
+    assert!(matches!(&body[1], Stmt::Unlight { name } if name == "torch"));
+    assert!(matches!(&body[2], Stmt::Ambient { .. }));
+    match &body[3] {
+        Stmt::Camera { x, y, zoom, .. } => {
+            assert!(x.is_some() && y.is_none() && zoom.is_some());
+        }
+        other => panic!("expected Camera, got {other:?}"),
+    }
+}
+
+#[test]
+fn light_requires_named_params() {
+    let src = "label start:\n    light \"torch\" x=0.5\n    end\n";
+    assert!(Parser::parse(src).is_err());
+}

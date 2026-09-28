@@ -27,6 +27,24 @@ pub struct UserSettings {
     pub skip_unread: bool,
     /// Mute audio entirely.
     pub muted: bool,
+    /// UI/dialogue language (`translations/<lang>.json` in assets).
+    /// Older settings files deserialize to English.
+    #[serde(default = "default_language")]
+    pub language: String,
+    /// Accessibility: global text scale (1.0 = 100%).
+    #[serde(default = "default_text_scale")]
+    pub text_scale: f32,
+    /// Accessibility: flatten transitions, camera moves and shakes.
+    #[serde(default)]
+    pub reduce_motion: bool,
+}
+
+fn default_language() -> String {
+    "en".to_string()
+}
+
+fn default_text_scale() -> f32 {
+    1.0
 }
 
 impl Default for UserSettings {
@@ -42,6 +60,9 @@ impl Default for UserSettings {
             fullscreen: false,
             skip_unread: false,
             muted: false,
+            language: default_language(),
+            text_scale: 1.0,
+            reduce_motion: false,
         }
     }
 }

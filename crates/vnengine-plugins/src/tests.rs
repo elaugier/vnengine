@@ -186,3 +186,34 @@ fn logs_are_forwarded() {
     let mut kv = PluginKv::new();
     host.init_all(&mut kv); // exercises vn_log; message lands in the log sink
 }
+
+#[test]
+fn send_command_delivers_payload() {
+    let mut host = host();
+    // vn_alloc returns a fixed buffer at 128; vn_on_command stores the
+    // payload back under key "last_cmd".
+    let wat = r#"
+        (module
+            (import "env" "vn_kv_set" (func $set (param i32 i32 i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "last_cmd")
+            (func (export "vn_alloc") (param i32) (result i32)
+                (i32.const 128))
+            (func (export "vn_on_command") (param $ptr i32) (param $len i32)
+                (call $set
+                    (i32.const 0) (i32.const 8)
+                    (local.get $ptr) (local.get $len))))"#;
+    host.load(
+        wat.as_bytes(),
+        manifest("version = \"1\"\npermissions = [\"kv\"]\n"),
+    )
+    .unwrap();
+    let mut kv = PluginKv::new();
+    assert!(host.send_command(&mut kv, "plug", "[\"unlock\",\"chapel\"]"));
+    assert_eq!(
+        kv.get("plug.last_cmd"),
+        Some(&"[\"unlock\",\"chapel\"]".to_string())
+    );
+    // Unknown plugin: returns false, no state change.
+    assert!(!host.send_command(&mut kv, "ghost", "[]"));
+}

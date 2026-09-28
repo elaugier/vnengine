@@ -7,9 +7,9 @@
 //! consume [`RuntimeEvent`]s and apply side effects themselves.
 
 use vnengine_core::command::Command;
-use vnengine_core::model::Scene;
+use vnengine_core::model::{CameraAnim, Scene};
 use vnengine_core::save::GalleryState;
-pub use vnengine_core::save::JournalEntry;
+pub use vnengine_core::save::{JournalEntry, MusicLayerState};
 use vnengine_script::vm::{MenuResponse, StepResult, Vm, VmState};
 
 /// Maximum number of rollback snapshots kept.
@@ -51,6 +51,7 @@ struct RollbackSnapshot {
     history_len: usize,
     music: Option<String>,
     plugin_kv: std::collections::BTreeMap<String, String>,
+    music_layers: std::collections::BTreeMap<String, MusicLayerState>,
 }
 
 /// Everything needed to resume a game, as stored in a save file.
@@ -64,6 +65,8 @@ pub struct RuntimeSnapshot {
     pub journal: Vec<JournalEntry>,
     /// Plugin key/value state (persisted with the game).
     pub plugin_kv: std::collections::BTreeMap<String, String>,
+    /// Adaptive-music stems playing at save time.
+    pub music_layers: std::collections::BTreeMap<String, MusicLayerState>,
 }
 
 /// The headless runtime.
@@ -79,12 +82,17 @@ pub struct Runtime {
     pub music: Option<String>,
     /// Fade duration of the most recent music command, in seconds.
     pub music_fade: f32,
+    /// Fade duration of the most recent `music layer` command.
+    pub music_layer_fade: f32,
     /// Player inputs recorded for deterministic replay.
     pub journal: Vec<JournalEntry>,
     /// Shared plugin key/value state. The host passes it to plugin
     /// calls (`PluginHost::tick_all` etc.); it is part of saves and
     /// rollback so plugin state restores with the game.
     pub plugin_kv: std::collections::BTreeMap<String, String>,
+    /// Adaptive-music stems keyed by layer name. Tracked through
+    /// snapshots/rollback like `music`; the host resyncs audio from it.
+    pub music_layers: std::collections::BTreeMap<String, MusicLayerState>,
     /// Remaining time of a `pause` command, driven by
     /// [`Runtime::update`] — the runtime's logical clock, not wall time.
     pause_remaining: Option<f32>,
@@ -108,8 +116,10 @@ impl Runtime {
             gallery: GalleryState::default(),
             music: None,
             music_fade: 1.0,
+            music_layer_fade: 1.0,
             journal: Vec::new(),
             plugin_kv: std::collections::BTreeMap::new(),
+            music_layers: std::collections::BTreeMap::new(),
             pause_remaining: None,
             rollback_stack: Vec::new(),
             rollforward_stack: Vec::new(),
@@ -125,6 +135,7 @@ impl Runtime {
         rt.music = snap.music;
         rt.journal = snap.journal;
         rt.plugin_kv = snap.plugin_kv;
+        rt.music_layers = snap.music_layers;
         rt
     }
 
@@ -136,6 +147,7 @@ impl Runtime {
             music: self.music.clone(),
             journal: self.journal.clone(),
             plugin_kv: self.plugin_kv.clone(),
+            music_layers: self.music_layers.clone(),
         }
     }
 
@@ -158,6 +170,29 @@ impl Runtime {
         self.vm.state.pending_menu.is_some()
     }
 
+    /// Hot-reload: swap the script while keeping the current execution
+    /// point. Label frames resolve against the new script by name;
+    /// inline frames (menu bodies, loop bodies, call frames) keep their
+    /// embedded statements, matching Ren'Py-style "reload continues
+    /// where you were". Defaults are not re-applied to existing
+    /// variables.
+    pub fn reload_script(&mut self, script: vnengine_script::ast::Script) {
+        let state = self.vm.save_state();
+        self.vm = Vm::restore(script, state);
+    }
+
+    /// Studio/debug: jump execution to `label`, clearing any pending
+    /// pause. Variables, scene and history are preserved — the jump is
+    /// a development action, not recorded in the replay journal.
+    /// Returns false when the label does not exist.
+    pub fn jump_to_label(&mut self, label: &str) -> bool {
+        if !self.vm.jump_to_label(label) {
+            return false;
+        }
+        self.pause_remaining = None;
+        true
+    }
+
     /// Resume a menu selection. The host should call [`Runtime::step`]
     /// afterwards to continue execution.
     pub fn resume_menu(&mut self, index: usize) {
@@ -169,6 +204,29 @@ impl Runtime {
     /// command is in progress and expires, execution continues and the
     /// resulting event is returned.
     pub fn update(&mut self, dt: f32) -> Option<RuntimeEvent> {
+        // Advance sprite enter/exit transitions on the logical clock;
+        // finished exits leave the model (and the save) entirely.
+        for e in &mut self.scene.exiting {
+            e.elapsed += dt;
+        }
+        self.scene.exiting.retain(|e| e.progress() < 1.0);
+        // Camera move on the same logical clock.
+        if let Some(anim) = &mut self.scene.camera_anim {
+            anim.elapsed += dt;
+            self.scene.camera = anim.value();
+            if anim.progress() >= 1.0 {
+                self.scene.camera_anim = None;
+            }
+        }
+        for s in &mut self.scene.sprites {
+            if let Some(anim) = &mut s.entering {
+                anim.elapsed += dt;
+                if anim.progress() >= 1.0 {
+                    s.entering = None;
+                }
+            }
+        }
+
         if let Some(remaining) = &mut self.pause_remaining {
             *remaining -= dt;
             if *remaining <= 0.0 {
@@ -250,6 +308,7 @@ impl Runtime {
         self.history.truncate(snap.history_len);
         self.music = snap.music;
         self.plugin_kv = snap.plugin_kv;
+        self.music_layers = snap.music_layers;
         self.replaying = true;
         let event = self.step();
         self.replaying = false;
@@ -266,6 +325,7 @@ impl Runtime {
             history_len: self.history.len(),
             music: self.music.clone(),
             plugin_kv: self.plugin_kv.clone(),
+            music_layers: self.music_layers.clone(),
         });
         if self.rollback_stack.len() > MAX_ROLLBACK {
             self.rollback_stack.remove(0);
@@ -307,8 +367,11 @@ impl Runtime {
                     Command::Show(spec) => {
                         self.scene.set_sprite(&spec);
                     }
-                    Command::Hide { character, .. } => {
-                        self.scene.hide_sprite(&character);
+                    Command::Hide {
+                        character,
+                        transition,
+                    } => {
+                        self.scene.hide_sprite(&character, transition);
                     }
                     Command::Say {
                         speaker,
@@ -342,18 +405,94 @@ impl Runtime {
                     Command::PlayMusic { ref track, fade } => {
                         self.music = Some(track.clone());
                         self.music_fade = fade;
+                        // A new base track resets the stem layers.
+                        self.music_layers.clear();
                         return RuntimeEvent::Effect(cmd);
                     }
                     Command::StopMusic { fade } => {
                         self.music = None;
                         self.music_fade = fade;
+                        self.music_layers.clear();
                         return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::MusicLayer {
+                        ref name,
+                        ref track,
+                        volume,
+                        fade,
+                    } => {
+                        match self.music_layers.get_mut(name) {
+                            Some(l) => {
+                                if let Some(t) = track {
+                                    l.track = t.clone();
+                                }
+                                if let Some(v) = volume {
+                                    l.volume = v;
+                                }
+                            }
+                            None => {
+                                if let Some(t) = track {
+                                    self.music_layers.insert(
+                                        name.clone(),
+                                        MusicLayerState {
+                                            track: t.clone(),
+                                            volume: volume.unwrap_or(1.0),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        self.music_layer_fade = fade;
+                        return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::MusicLayerOff { ref name, fade } => {
+                        self.music_layers.remove(name);
+                        self.music_layer_fade = fade;
+                        return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::LightSet(light) => {
+                        self.scene.set_light(light);
+                    }
+                    Command::LightRemove { name } => {
+                        self.scene.remove_light(&name);
+                    }
+                    Command::Ambient { color } => {
+                        self.scene.ambient = color;
+                    }
+                    Command::Camera {
+                        x,
+                        y,
+                        zoom,
+                        duration,
+                    } => {
+                        let mut to = self.scene.camera;
+                        if let Some(v) = x {
+                            to.x = v;
+                        }
+                        if let Some(v) = y {
+                            to.y = v;
+                        }
+                        if let Some(v) = zoom {
+                            to.zoom = v;
+                        }
+                        if duration > 0.0 {
+                            self.scene.camera_anim = Some(CameraAnim {
+                                from: self.scene.camera,
+                                to,
+                                elapsed: 0.0,
+                                duration,
+                            });
+                        } else {
+                            self.scene.camera = to;
+                            self.scene.camera_anim = None;
+                        }
                     }
                     Command::PlaySfx { .. }
                     | Command::PlayVoice { .. }
                     | Command::StopVoice
                     | Command::PlayTransition(_)
-                    | Command::Shake { .. } => {
+                    | Command::Shake { .. }
+                    | Command::PluginCall { .. } => {
                         return RuntimeEvent::Effect(cmd);
                     }
                     Command::Pause { seconds } => {

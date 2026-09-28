@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         let script = pkg.script().clone();
-        vnengine_app::App::run_source(config, Box::new(pkg), save_root, script)?;
+        vnengine_app::App::run_source(config, Box::new(pkg), save_root, script, None)?;
         return Ok(());
     }
 

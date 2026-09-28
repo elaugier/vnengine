@@ -48,6 +48,14 @@ pub enum Action {
     Rollback,
     /// Rollforward.
     Rollforward,
+    /// Toggle the debug/studio overlay.
+    Debug,
+    /// Studio overlay: select the previous label (jump target).
+    DebugPrev,
+    /// Studio overlay: select the next label (jump target).
+    DebugNext,
+    /// Studio overlay: jump execution to the selected label.
+    DebugJump,
 }
 
 /// Mouse click position in logical pixels.
@@ -174,6 +182,10 @@ pub fn key_to_action(key: winit::keyboard::KeyCode) -> Option<Action> {
         KeyCode::KeyH => Some(Action::Backlog),
         KeyCode::PageUp => Some(Action::Rollback),
         KeyCode::PageDown => Some(Action::Rollforward),
+        KeyCode::F8 => Some(Action::Debug),
+        KeyCode::BracketLeft => Some(Action::DebugPrev),
+        KeyCode::BracketRight => Some(Action::DebugNext),
+        KeyCode::F10 => Some(Action::DebugJump),
         _ => None,
     }
 }

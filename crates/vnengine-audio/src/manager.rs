@@ -10,12 +10,21 @@ use std::time::Duration;
 use vnengine_core::assets::{AssetSource, AUDIO_EXTS};
 use vnengine_core::settings::UserSettings;
 
+/// A looping adaptive-music stem layered over the base BGM.
+struct StemLayer {
+    /// Track path currently loaded (re-started when it changes).
+    track: String,
+    handle: kira::sound::static_sound::StaticSoundHandle,
+}
+
 pub struct AudioEngine {
     manager: KiraManager<DefaultBackend>,
     /// Handle to the currently playing BGM (so we can stop it).
     current_bgm: Option<kira::sound::static_sound::StaticSoundHandle>,
     /// Handle to the currently playing voice line.
     current_voice: Option<kira::sound::static_sound::StaticSoundHandle>,
+    /// Adaptive-music stems keyed by layer name.
+    layers: std::collections::HashMap<String, StemLayer>,
     /// Cached settings for volume calculations.
     settings: UserSettings,
 }
@@ -27,6 +36,7 @@ impl AudioEngine {
             manager,
             current_bgm: None,
             current_voice: None,
+            layers: std::collections::HashMap::new(),
             settings: UserSettings::default(),
         };
         audio.apply_settings(settings);
@@ -58,6 +68,7 @@ impl AudioEngine {
                 return;
             }
         };
+        self.stop_all_layers(fade);
         if let Some(mut h) = self.current_bgm.take() {
             let tween = if fade > 0.0 {
                 Tween {
@@ -77,8 +88,9 @@ impl AudioEngine {
         }
     }
 
-    /// Stop the currently playing BGM.
+    /// Stop the currently playing BGM and all stem layers.
     pub fn stop_music(&mut self, fade: f32) {
+        self.stop_all_layers(fade);
         if let Some(mut h) = self.current_bgm.take() {
             let tween = if fade > 0.0 {
                 Tween {
@@ -89,6 +101,75 @@ impl AudioEngine {
                 Tween::default()
             };
             h.stop(tween);
+        }
+    }
+
+    fn stop_all_layers(&mut self, fade: f32) {
+        for (_, mut l) in self.layers.drain() {
+            l.handle.stop(tween_of(fade));
+        }
+    }
+
+    /// Upsert or retune an adaptive-music stem. A new or changed `track`
+    /// starts its loop seeked to the base BGM's position so stems stay
+    /// in sync; `volume` tweens with `fade`.
+    pub fn set_music_layer(
+        &mut self,
+        src: &dyn AssetSource,
+        dir: &str,
+        name: &str,
+        track: Option<&str>,
+        volume: Option<f32>,
+        fade: f32,
+    ) {
+        let tween = tween_of(fade);
+        // Retune an existing stem in place when the track is unchanged.
+        if let Some(l) = self.layers.get_mut(name) {
+            if track.map(|t| t == l.track).unwrap_or(true) {
+                if let Some(v) = volume {
+                    let vol = db_from_linear(self.settings.music_volume * v as f64);
+                    l.handle.set_volume(vol, tween);
+                }
+                return;
+            }
+            // Track changed: stop the old stem, fall through to reload.
+            if let Some(mut l) = self.layers.remove(name) {
+                l.handle.stop(tween);
+            }
+        }
+        let Some(track) = track else { return };
+        let v = volume.unwrap_or(1.0);
+        let vol = db_from_linear(self.settings.music_volume * v as f64);
+        let settings = StaticSoundSettings::new().loop_region(0.0..).volume(vol);
+        let data = match load_sound(src, dir, track, settings) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("failed to load music layer `{dir}/{track}`: {e}");
+                return;
+            }
+        };
+        match self.manager.play(data) {
+            Ok(mut handle) => {
+                // Sync the stem to the base track's playback position.
+                if let Some(bgm) = &self.current_bgm {
+                    handle.seek_to(bgm.position());
+                }
+                self.layers.insert(
+                    name.to_string(),
+                    StemLayer {
+                        track: track.to_string(),
+                        handle,
+                    },
+                );
+            }
+            Err(e) => log::warn!("failed to play music layer `{track}`: {e}"),
+        }
+    }
+
+    /// Remove a stem layer with a fade-out.
+    pub fn remove_music_layer(&mut self, name: &str, fade: f32) {
+        if let Some(mut l) = self.layers.remove(name) {
+            l.handle.stop(tween_of(fade));
         }
     }
 
@@ -144,6 +225,17 @@ fn load_sound(
 ) -> anyhow::Result<StaticSoundData> {
     let (_, bytes) = src.read_any(&format!("{dir}/{track}"), AUDIO_EXTS)?;
     Ok(StaticSoundData::from_cursor(std::io::Cursor::new(bytes))?.with_settings(settings))
+}
+
+fn tween_of(secs: f32) -> Tween {
+    if secs > 0.0 {
+        Tween {
+            duration: Duration::from_secs_f32(secs),
+            ..Default::default()
+        }
+    } else {
+        Tween::default()
+    }
 }
 
 /// Convert a linear volume (0..1) to decibels.

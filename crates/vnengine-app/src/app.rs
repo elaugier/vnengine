@@ -116,8 +116,26 @@ pub struct App {
     /// BGM track last applied to the audio engine — compared against
     /// `runtime.music` to keep playback in sync (incl. after load).
     last_bgm: Option<String>,
+    /// Stem layers last applied to the audio engine — diffed against
+    /// `runtime.music_layers` each frame.
+    last_layers: std::collections::BTreeMap<String, vnengine_core::save::MusicLayerState>,
     /// Sandboxed WASM plugins (None if the project ships none).
     pub plugins: Option<vnengine_plugins::PluginHost>,
+    /// Script file to watch for hot reload (loose project only).
+    script_path: Option<PathBuf>,
+    /// Last seen modification time of `script_path`.
+    script_mtime: Option<std::time::SystemTime>,
+    /// Polling accumulator for the file watcher.
+    watch_timer: f32,
+    /// Studio debug overlay (F8): variables, scene and audio state.
+    debug_overlay: bool,
+    /// Label selected in the overlay as jump target (`[`/`]` + F10).
+    debug_label: usize,
+    /// Locales shipped under `translations/` (`en`, `fr`, ...).
+    locales: Vec<String>,
+    /// Active string translations for `settings.language`
+    /// (original text → localized text).
+    translations: std::collections::BTreeMap<String, String>,
     /// Play time accumulator.
     play_time: f32,
     /// Last frame time.
@@ -183,16 +201,25 @@ impl App {
         let script_src = std::fs::read_to_string(&script_path)?;
         let script = Parser::parse(&script_src)?;
         let save_root = project_root.clone();
-        Self::run_source(config, Box::new(DirAssets(project_root)), save_root, script)
+        Self::run_source(
+            config,
+            Box::new(DirAssets(project_root)),
+            save_root,
+            script,
+            Some(script_path),
+        )
     }
 
     /// Create and run the application with an arbitrary asset source
     /// (directory or package) and an already-loaded script.
+    /// `watch` enables hot reload: when the given script file's mtime
+    /// changes, it is re-parsed and swapped into the runtime in place.
     pub fn run_source(
         config: EngineConfig,
         assets: Box<dyn AssetSource>,
         save_root: PathBuf,
         script: Script,
+        watch: Option<PathBuf>,
     ) -> anyhow::Result<()> {
         let event_loop = winit::event_loop::EventLoop::new()?;
         let title = config.title.clone();
@@ -279,6 +306,17 @@ impl App {
             blocking: None,
             transition: None,
             last_bgm: None,
+            last_layers: std::collections::BTreeMap::new(),
+            script_mtime: watch
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.modified().ok()),
+            watch_timer: 0.0,
+            script_path: watch,
+            debug_overlay: false,
+            debug_label: 0,
+            locales: Vec::new(),
+            translations: std::collections::BTreeMap::new(),
             plugins,
             play_time: 0.0,
             last_frame: Instant::now(),
@@ -290,6 +328,8 @@ impl App {
             window_size: (window_size.width, window_size.height),
         };
 
+        let mut app = app;
+        app.reload_translations();
         let app = Arc::new(Mutex::new(app));
         let window_clone = window.clone();
         let app_clone = app.clone();
@@ -331,8 +371,8 @@ impl App {
             }
             RuntimeEvent::Menu { prompt, choices } => {
                 self.screen = Screen::Menu {
-                    prompt,
-                    choices,
+                    prompt: prompt.map(|p| self.tr(&p)),
+                    choices: choices.iter().map(|c| self.tr(c)).collect(),
                     hovered: 0,
                 };
                 true
@@ -348,6 +388,39 @@ impl App {
     /// shake, gallery persistence. Scene state itself is already updated
     /// by the runtime.
     fn apply_effect(&mut self, cmd: Command) {
+        // Accessibility: reduce motion flattens every animated effect —
+        // transitions play instantly, camera moves snap, shakes/overlay
+        // transitions are dropped. Scene state still converges because
+        // durations of zero finish on the first logical tick.
+        if self.settings.reduce_motion {
+            let scene = &mut self.runtime.scene;
+            match cmd {
+                Command::Scene { .. } => {
+                    scene.prev_background = None;
+                    scene.prev_bg_opacity = 0.0;
+                    scene.bg_opacity = 1.0;
+                    scene.bg_zoom = 1.0;
+                    scene.prev_bg_zoom = 1.0;
+                    scene.fade_overlay = [0.0; 4];
+                    return;
+                }
+                Command::Show(_) | Command::Hide { .. } => {
+                    for s in &mut scene.sprites {
+                        s.entering = None;
+                    }
+                    scene.exiting.clear();
+                    return;
+                }
+                Command::Camera { .. } => {
+                    if let Some(anim) = scene.camera_anim.take() {
+                        scene.camera = anim.to;
+                    }
+                    return;
+                }
+                Command::Shake { .. } | Command::PlayTransition(_) => return,
+                _ => {}
+            }
+        }
         match cmd {
             Command::Scene { transition, .. } => {
                 let duration = transition.default_duration();
@@ -384,6 +457,11 @@ impl App {
             } => {
                 self.shake = Some((duration, intensity));
             }
+            Command::PluginCall { plugin, payload } => {
+                if let Some(host) = &mut self.plugins {
+                    host.send_command(&mut self.runtime.plugin_kv, &plugin, &payload);
+                }
+            }
             Command::RegisterCg { .. } => {
                 let gallery_path = self
                     .save_root
@@ -409,6 +487,8 @@ impl App {
             Command::Narrate { text } => (text.clone(), None, None),
             _ => (String::new(), None, None),
         };
+        let text = self.tr(&text);
+        let speaker = speaker.map(|s| self.tr(&s));
         // Voice playback for Say.
         if let Command::Say {
             voice: Some(track), ..
@@ -434,6 +514,38 @@ impl App {
             side_image,
         });
         self.screen = Screen::Dialogue;
+    }
+
+    /// Localize a dialogue/UI string via the active translation table
+    /// (identity when no translation is loaded).
+    fn tr(&self, text: &str) -> String {
+        self.translations
+            .get(text)
+            .cloned()
+            .unwrap_or_else(|| text.to_string())
+    }
+
+    /// Discover locales under `translations/<lang>.json` and load the
+    /// table for `settings.language` (empty table if missing).
+    fn reload_translations(&mut self) {
+        self.locales = self
+            .assets
+            .list("translations")
+            .into_iter()
+            .filter_map(|f| {
+                f.strip_prefix("translations/")
+                    .and_then(|n| n.strip_suffix(".json"))
+                    .map(str::to_string)
+            })
+            .collect();
+        self.locales.sort();
+        let path = format!("translations/{}.json", self.settings.language);
+        self.translations = self
+            .assets
+            .read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
     }
 
     /// Advance past the current blocking command.
@@ -478,6 +590,68 @@ impl App {
         self.last_bgm = self.runtime.music.clone();
     }
 
+    /// Apply `runtime.music_layers` to the audio engine whenever it
+    /// drifts — covers live `music layer` commands, save/load and
+    /// rollback/rollforward, like `resync_music` for the base track.
+    fn resync_layers(&mut self) {
+        if self.runtime.music_layers == self.last_layers {
+            return;
+        }
+        let fade = self.runtime.music_layer_fade;
+        for (name, l) in &self.runtime.music_layers {
+            if self.last_layers.get(name) != Some(l) {
+                self.audio.set_music_layer(
+                    &*self.assets,
+                    &self.config.audio_dir,
+                    name,
+                    Some(&l.track),
+                    Some(l.volume),
+                    fade,
+                );
+            }
+        }
+        for name in self.last_layers.keys() {
+            if !self.runtime.music_layers.contains_key(name) {
+                self.audio.remove_music_layer(name, fade);
+            }
+        }
+        self.last_layers = self.runtime.music_layers.clone();
+    }
+
+    /// Poll the entry script's mtime (~2 Hz) and hot-reload it in
+    /// place when it changes. Parse errors keep the old script —
+    /// development never crashes on a half-saved file.
+    fn poll_hot_reload(&mut self, dt: f32) {
+        let Some(path) = &self.script_path else {
+            return;
+        };
+        self.watch_timer += dt;
+        if self.watch_timer < 0.5 {
+            return;
+        }
+        self.watch_timer = 0.0;
+        let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+            return;
+        };
+        if self.script_mtime == Some(mtime) {
+            return;
+        }
+        self.script_mtime = Some(mtime);
+        match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|src| Parser::parse(&src).map_err(|e| format!("{e:?}")))
+        {
+            Ok(script) => {
+                self.runtime.reload_script(script.clone());
+                self.script = script;
+                // Edited image files reload too.
+                self.renderer.textures.clear();
+                log::info!("hot reload: {}", path.display());
+            }
+            Err(e) => log::warn!("hot reload skipped — script error: {e}"),
+        }
+    }
+
     /// Select a menu choice.
     fn select_choice(&mut self, index: usize) {
         if self.runtime.is_on_menu() {
@@ -510,6 +684,8 @@ impl App {
         // Keep BGM playback in sync with the runtime's tracked music
         // state — this is also what restores music after load/rollback.
         self.resync_music();
+        self.resync_layers();
+        self.poll_hot_reload(dt);
 
         // Auto-save every 60 seconds.
         self.auto_save_timer += dt;
@@ -531,9 +707,18 @@ impl App {
             t.elapsed += dt;
             let progress = (t.elapsed / t.duration).min(1.0);
             match &t.transition {
-                Transition::Fade { .. } => {
-                    self.runtime.scene.bg_opacity = progress;
-                    self.runtime.scene.prev_bg_opacity = 1.0 - progress;
+                Transition::Fade { color, .. } => {
+                    // Two-phase fade through the overlay color: the old
+                    // scene vanishes into it, then the new one emerges.
+                    if progress < 0.5 {
+                        self.runtime.scene.bg_opacity = 0.0;
+                        self.runtime.scene.prev_bg_opacity = 1.0 - progress * 2.0;
+                    } else {
+                        self.runtime.scene.prev_bg_opacity = 0.0;
+                        self.runtime.scene.bg_opacity = progress * 2.0 - 1.0;
+                    }
+                    let overlay = (1.0 - (progress * 2.0 - 1.0).abs()).max(0.0);
+                    self.runtime.scene.fade_overlay = [color[0], color[1], color[2], overlay];
                 }
                 Transition::Dissolve { .. } => {
                     self.runtime.scene.bg_opacity = progress;
@@ -558,14 +743,21 @@ impl App {
                     }
                 }
                 Transition::Zoom { .. } => {
+                    // New background zooms in from 80% while fading in;
+                    // the old one zooms out as it fades.
                     self.runtime.scene.bg_opacity = progress;
                     self.runtime.scene.prev_bg_opacity = 1.0 - progress;
+                    self.runtime.scene.bg_zoom = 0.8 + 0.2 * progress;
+                    self.runtime.scene.prev_bg_zoom = 1.0 + 0.3 * progress;
                 }
             }
             if t.elapsed >= t.duration {
                 self.runtime.scene.prev_background = None;
                 self.runtime.scene.prev_bg_opacity = 0.0;
                 self.runtime.scene.bg_opacity = 1.0;
+                self.runtime.scene.bg_zoom = 1.0;
+                self.runtime.scene.prev_bg_zoom = 1.0;
+                self.runtime.scene.fade_overlay = [0.0; 4];
                 for s in &mut self.runtime.scene.sprites {
                     s.offset = [0.0, 0.0];
                 }
@@ -617,6 +809,31 @@ impl App {
         // Global actions (work on most screens).
         if self.input.pressed(Action::Fullscreen) {
             self.settings.fullscreen = !self.settings.fullscreen;
+        }
+        if self.input.pressed(Action::Debug) {
+            self.debug_overlay = !self.debug_overlay;
+        }
+        // Studio label jump: `[`/`]` pick a target, F10 executes it.
+        // Only active while the overlay is open; normal play unaffected.
+        if self.debug_overlay {
+            let n = self.runtime.vm.script.labels.len();
+            if n > 0 {
+                if self.input.pressed(Action::DebugNext) {
+                    self.debug_label = (self.debug_label + 1) % n;
+                }
+                if self.input.pressed(Action::DebugPrev) {
+                    self.debug_label = (self.debug_label + n - 1) % n;
+                }
+                self.debug_label = self.debug_label.min(n - 1);
+                if self.input.pressed(Action::DebugJump) {
+                    let name = self.runtime.vm.script.labels[self.debug_label].name.clone();
+                    if self.runtime.jump_to_label(&name) {
+                        self.blocking = None;
+                        self.screen = Screen::Dialogue;
+                        self.step_vm();
+                    }
+                }
+            }
         }
 
         // Handle confirm dialog first — it intercepts most input.
@@ -944,7 +1161,7 @@ impl App {
             }
             Screen::Settings { selected } => {
                 let mut sel = *selected;
-                let n_settings = 10;
+                let n_settings = 13;
                 if self.input.pressed(Action::Down) {
                     sel = (sel + 1) % n_settings;
                 }
@@ -997,6 +1214,25 @@ impl App {
                         7 => self.settings.auto_advance = !self.settings.auto_advance,
                         8 => self.settings.skip_unread = !self.settings.skip_unread,
                         9 => self.settings.muted = !self.settings.muted,
+                        10 => {
+                            // Cycle shipped locales ("" = no translation).
+                            let mut langs = vec![String::new()];
+                            langs.extend(self.locales.iter().cloned());
+                            let cur = langs
+                                .iter()
+                                .position(|l| *l == self.settings.language)
+                                .unwrap_or(0);
+                            let next = (cur as isize + dir as isize)
+                                .rem_euclid(langs.len() as isize)
+                                as usize;
+                            self.settings.language = langs[next].clone();
+                            self.reload_translations();
+                        }
+                        11 => {
+                            self.settings.text_scale =
+                                (self.settings.text_scale + dir as f32 * 0.1).clamp(0.5, 2.0)
+                        }
+                        12 => self.settings.reduce_motion = !self.settings.reduce_motion,
                         _ => {}
                     }
                     self.audio.apply_settings(self.settings.clone());
@@ -1479,6 +1715,16 @@ impl App {
                     format!("Auto-Advance: {}", self.settings.auto_advance),
                     format!("Skip Unread: {}", self.settings.skip_unread),
                     format!("Muted: {}", self.settings.muted),
+                    format!(
+                        "Language: {}",
+                        if self.settings.language.is_empty() {
+                            "default"
+                        } else {
+                            &self.settings.language
+                        }
+                    ),
+                    format!("Text Scale: {:.0}%", self.settings.text_scale * 100.0),
+                    format!("Reduce Motion: {}", self.settings.reduce_motion),
                 ];
                 let start_y = h * 0.15;
                 let line_h = 40.0;
@@ -1745,7 +1991,93 @@ impl App {
             }
         }
 
+        if self.debug_overlay {
+            self.debug_panel(&mut ui);
+        }
+        // Accessibility: global text scale (settings.text_scale).
+        if (self.settings.text_scale - 1.0).abs() > f32::EPSILON {
+            for t in &mut ui.text {
+                t.font_size *= self.settings.text_scale;
+            }
+        }
         ui
+    }
+
+    /// Studio overlay (F8): current position, variables, scene state,
+    /// music/layers and plugin KV — live inspection for creators.
+    fn debug_panel(&self, ui: &mut UiDraw) {
+        let (w, h) = (self.window_size.0 as f32, self.window_size.1 as f32);
+        let px = w * 0.62;
+        let py = h * 0.02;
+        let pw = w * 0.36;
+        let ph = h * 0.5;
+        ui.boxes.push(UiBox {
+            x: px / w,
+            y: py / h,
+            w: pw / w,
+            h: ph / h,
+            color: [0.0, 0.0, 0.0, 0.75],
+        });
+        // Normalize to pixels for text placement.
+        let line_h = 16.0;
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(f) = self.runtime.vm.state.stack.last() {
+            let label = match &f.body {
+                vnengine_script::vm::FrameBody::Label(l) => l.clone(),
+                vnengine_script::vm::FrameBody::Inline(_) => "<inline>".into(),
+            };
+            lines.push(format!(
+                "frame: {label} +{} (depth {})",
+                f.stmt,
+                self.runtime.vm.state.stack.len()
+            ));
+        }
+        let labels = &self.runtime.vm.script.labels;
+        if !labels.is_empty() {
+            let sel = self.debug_label.min(labels.len() - 1);
+            lines.push(format!("jump: [{}] {}  (F10)", sel, labels[sel].name));
+        }
+        lines.push(format!(
+            "music: {}",
+            self.runtime.music.as_deref().unwrap_or("-")
+        ));
+        for (n, l) in &self.runtime.music_layers {
+            lines.push(format!("  layer {n}: {} vol {:.2}", l.track, l.volume));
+        }
+        let cam = self.runtime.scene.camera;
+        lines.push(format!(
+            "camera: ({:.2}, {:.2}) zoom {:.2} | lights: {} ambient {:.2}",
+            cam.x,
+            cam.y,
+            cam.zoom,
+            self.runtime.scene.lights.len(),
+            self.runtime.scene.ambient[0]
+        ));
+        lines.push(format!(
+            "sprites: {} exiting: {} | plugins kv: {}",
+            self.runtime.scene.sprites.len(),
+            self.runtime.scene.exiting.len(),
+            self.runtime.plugin_kv.len()
+        ));
+        let mut vars: Vec<_> = self.runtime.vm.state.variables.iter().collect();
+        vars.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in vars.iter().take(14) {
+            lines.push(format!("{k} = {v:?}"));
+        }
+        if vars.len() > 14 {
+            lines.push(format!("… {} more vars", vars.len() - 14));
+        }
+        for (i, line) in lines.iter().enumerate() {
+            ui.text.push(UiText {
+                text: line.clone(),
+                left: px + 10.0,
+                top: py + 8.0 + i as f32 * line_h,
+                font_size: 13.0,
+                color: [0.7, 0.95, 0.7],
+                bounds: None,
+                rich: false,
+            });
+        }
     }
 
     /// Save the game to a slot.
@@ -1771,6 +2103,7 @@ impl App {
             music: snap.music,
             journal: snap.journal,
             plugin_kv: snap.plugin_kv,
+            music_layers: snap.music_layers,
             thumbnail,
             saved_at: chrono::Utc::now().timestamp(),
         };
@@ -1809,6 +2142,7 @@ impl App {
                 music: state.music,
                 journal: state.journal,
                 plugin_kv: state.plugin_kv,
+                music_layers: state.music_layers,
             },
         );
         self.blocking = None;

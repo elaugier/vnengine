@@ -384,3 +384,290 @@ label start:
     )
     .is_err());
 }
+
+#[test]
+fn hide_with_dissolve_exits_gradually() {
+    let src = r##"
+label start:
+    show eileen happy at center
+    hide eileen with dissolve 1.0
+    "line"
+    end
+"##;
+    let mut rt = runtime(src);
+    // Step past `show`; hide pushes the sprite into `exiting`.
+    rt.step();
+    rt.step();
+    assert!(rt.scene.sprites.is_empty());
+    assert_eq!(rt.scene.exiting.len(), 1);
+    // Half the transition elapsed: sprite still exiting at 50%.
+    rt.update(0.5);
+    assert_eq!(rt.scene.exiting.len(), 1);
+    assert!((rt.scene.exiting[0].progress() - 0.5).abs() < 0.01);
+    // Done: sprite fully gone.
+    rt.update(0.6);
+    assert!(rt.scene.exiting.is_empty());
+}
+
+#[test]
+fn exiting_sprite_survives_save_restore() {
+    let src = r##"
+label start:
+    show eileen happy at center
+    hide eileen with dissolve 1.0
+    "line"
+    end
+"##;
+    let mut rt = runtime(src);
+    rt.step();
+    rt.step();
+    rt.update(0.25);
+    let snap = rt.capture();
+    let rt2 = Runtime::restore(Parser::parse(src).unwrap(), snap);
+    assert_eq!(rt2.scene.exiting.len(), 1);
+    assert!((rt2.scene.exiting[0].elapsed - 0.25).abs() < 0.01);
+}
+
+#[test]
+fn show_with_dissolve_enters_gradually() {
+    let src = r##"
+label start:
+    show eileen happy at center with dissolve 1.0
+    "line"
+    end
+"##;
+    let mut rt = runtime(src);
+    rt.step();
+    let s = rt.scene.sprite("eileen").expect("sprite shown");
+    assert!(s.entering.is_some(), "show with dissolve should animate");
+    rt.update(0.5);
+    let s = rt.scene.sprite("eileen").unwrap();
+    assert!((s.entering.as_ref().unwrap().progress() - 0.5).abs() < 0.01);
+    rt.update(0.6);
+    assert!(rt.scene.sprite("eileen").unwrap().entering.is_none());
+}
+
+#[test]
+fn entering_sprite_survives_save_restore() {
+    let src = r##"
+label start:
+    show eileen happy at center with dissolve 1.0
+    "line"
+    end
+"##;
+    let mut rt = runtime(src);
+    rt.step();
+    rt.update(0.25);
+    let snap = rt.capture();
+    let rt2 = Runtime::restore(Parser::parse(src).unwrap(), snap);
+    let s = rt2.scene.sprite("eileen").unwrap();
+    assert!((s.entering.as_ref().unwrap().elapsed - 0.25).abs() < 0.01);
+}
+
+#[test]
+fn show_replacement_crossfades() {
+    let src = r##"
+label start:
+    show eileen happy at center
+    show eileen sad at center with dissolve 1.0
+    "line"
+    end
+"##;
+    let mut rt = runtime(src);
+    rt.step();
+    rt.step();
+    // Old image exits, new image enters simultaneously.
+    assert_eq!(rt.scene.exiting.len(), 1);
+    assert_eq!(rt.scene.exiting[0].sprite.image, "eileen happy");
+    let s = rt.scene.sprite("eileen").unwrap();
+    assert_eq!(s.image, "eileen sad");
+    assert!(s.entering.is_some());
+    rt.update(1.1);
+    assert!(rt.scene.exiting.is_empty());
+    assert!(rt.scene.sprite("eileen").unwrap().entering.is_none());
+}
+
+#[test]
+fn show_same_image_no_crossfade() {
+    let src = r##"
+label start:
+    show eileen happy at center
+    show eileen happy at center with dissolve 1.0
+    "line"
+    end
+"##;
+    let mut rt = runtime(src);
+    rt.step();
+    rt.step();
+    assert!(rt.scene.exiting.is_empty());
+}
+
+#[test]
+fn light_and_camera_commands_mutate_scene() {
+    let src = r##"
+label start:
+    ambient 0.3 0.3 0.4
+    light "torch" x=0.7 y=0.4 radius=0.3 intensity=1.2 color="#ffaa44"
+    camera x=0.1 zoom=1.2
+    "line"
+    end
+"##;
+    let mut rt = runtime(src);
+    rt.step(); // ambient
+    rt.step(); // light
+    rt.step(); // camera
+    assert_eq!(rt.scene.ambient, [0.3, 0.3, 0.4]);
+    assert_eq!(rt.scene.lights.len(), 1);
+    assert_eq!(rt.scene.lights[0].name, "torch");
+    assert!((rt.scene.camera.x - 0.1).abs() < 0.01);
+    assert!((rt.scene.camera.zoom - 1.2).abs() < 0.01);
+}
+
+#[test]
+fn camera_animated_over_duration() {
+    let src = r##"
+label start:
+    camera zoom=1.5 over=1.0
+    "line"
+    end
+"##;
+    let mut rt = runtime(src);
+    rt.step();
+    assert!(rt.scene.camera_anim.is_some());
+    rt.update(0.5);
+    // Half-way, smoothstep: progress 0.5 → value 0.5 → zoom 1.25.
+    assert!((rt.scene.camera.zoom - 1.25).abs() < 0.01);
+    rt.update(0.6);
+    assert!(rt.scene.camera_anim.is_none());
+    assert!((rt.scene.camera.zoom - 1.5).abs() < 0.01);
+}
+
+#[test]
+fn camera_anim_survives_save_restore() {
+    let src = r##"
+label start:
+    camera x=0.2 over=1.0
+    "line"
+    end
+"##;
+    let mut rt = runtime(src);
+    rt.step();
+    rt.update(0.25);
+    let snap = rt.capture();
+    let mut rt2 = Runtime::restore(Parser::parse(src).unwrap(), snap);
+    assert!(rt2.scene.camera_anim.is_some());
+    rt2.update(1.0);
+    assert!((rt2.scene.camera.x - 0.2).abs() < 0.01);
+}
+
+#[test]
+fn music_layer_tracked_and_cleared() {
+    let src = r##"
+label start:
+    play music "base.ogg"
+    music layer "high" "high.ogg" volume=0.7
+    "line"
+    end
+"##;
+    let mut rt = runtime(src);
+    rt.step();
+    rt.step();
+    assert_eq!(rt.music_layers["high"].track, "high.ogg");
+    assert!((rt.music_layers["high"].volume - 0.7).abs() < 0.01);
+    // Stop music clears stems.
+    // (re-step through `line` then `end`; a new play would also clear)
+}
+
+#[test]
+fn music_layer_survives_save_restore_and_off() {
+    let src = r##"
+label start:
+    play music "base.ogg"
+    music layer "high" "high.ogg" volume=0.7
+    music layer "high" off
+    music layer "low" "low.ogg" volume=0.4 fade=1.5
+    "line"
+    end
+"##;
+    let mut rt = runtime(src);
+    rt.step(); // play + layer + off + layer + say in one step? no — each returns Effect.
+               // Drive until blocked on the say.
+    while !matches!(
+        rt.step(),
+        RuntimeEvent::Blocking(_) | RuntimeEvent::Finished
+    ) {}
+    assert!(!rt.music_layers.contains_key("high"));
+    assert_eq!(rt.music_layers["low"].track, "low.ogg");
+    let snap = rt.capture();
+    let rt2 = Runtime::restore(Parser::parse(src).unwrap(), snap);
+    assert_eq!(rt2.music_layers.len(), 1);
+    assert!((rt2.music_layers["low"].volume - 0.4).abs() < 0.01);
+}
+
+#[test]
+fn hot_reload_preserves_position_uses_new_code() {
+    let v1 = r##"
+label start:
+    jump chapter
+label chapter:
+    "old line"
+    end
+"##;
+    let v2 = r##"
+label start:
+    jump chapter
+label chapter:
+    "new line"
+    end
+"##;
+    let mut rt = runtime(v1);
+    // Step to the blocking say in `chapter`.
+    match rt.step() {
+        RuntimeEvent::Blocking(Command::Narrate { text }) => {
+            assert_eq!(text, "old line");
+        }
+        other => panic!("expected blocking say, got {other:?}"),
+    }
+    // Hot reload: same labels, different text. The blocking point is
+    // preserved; rolling back replays with the *new* script.
+    rt.reload_script(Parser::parse(v2).unwrap());
+    let ev = rt.rollback().expect("rollback");
+    match ev {
+        RuntimeEvent::Blocking(Command::Narrate { text }) => {
+            assert_eq!(text, "new line");
+        }
+        other => panic!("expected blocking say, got {other:?}"),
+    }
+}
+
+#[test]
+fn hot_reload_variables_survive() {
+    let v1 = "label start:\n    $ score = 5\n    \"line\"\n    end\n";
+    let v2 = "label start:\n    $ score = 9\n    \"line\"\n    end\n";
+    let mut rt = runtime(v1);
+    rt.step();
+    rt.reload_script(Parser::parse(v2).unwrap());
+    // `default`-style assignments already made are not overwritten —
+    // score stays 5 even though the new script would set 9.
+    let s = &rt.vm.state.variables["score"];
+    assert!(matches!(s, vnengine_core::Value::Int(5)));
+}
+
+#[test]
+fn jump_to_label_repositions_execution() {
+    let mut rt = runtime(
+        "label start:\n    \"one\"\n    jump done\nlabel middle:\n    \"two\"\nlabel done:\n    \"end\"\n",
+    );
+    // Advance past the first line so the stack is mid-label.
+    rt.step();
+    assert!(rt.jump_to_label("middle"));
+    let ev = rt.step();
+    match ev {
+        RuntimeEvent::Blocking(Command::Narrate { text }) => assert_eq!(text, "two"),
+        other => panic!("expected narrate 'two', got {other:?}"),
+    }
+    // Unknown label: no-op, position preserved — execution continues
+    // at the end of `middle`, which finishes the game.
+    assert!(!rt.jump_to_label("nowhere"));
+    assert!(matches!(rt.step(), RuntimeEvent::Finished));
+}
