@@ -17,11 +17,22 @@ fn default_scene() -> Scene {
     }
 }
 
+fn default_window_mode() -> String {
+    "auto".to_string()
+}
+
 /// One recorded player input, used to replay a session deterministically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JournalEntry {
     /// The player selected menu choice N.
     Menu(usize),
+    /// The player clicked clickable-button N (across the pending
+    /// `call screen` first, then shown screens in order).
+    Screen(usize),
+    /// The player entered this text at an `input` prompt.
+    Input(String),
+    /// The player answered an `confirm` prompt (`true` = yes).
+    Confirm(bool),
 }
 
 /// One adaptive-music stem layer (a synced loop faded in/out
@@ -65,6 +76,15 @@ pub struct SaveState {
     /// Adaptive-music stem layers active at save time.
     #[serde(default)]
     pub music_layers: std::collections::BTreeMap<String, MusicLayerState>,
+    /// Declarative screens shown at save time (`show screen`).
+    #[serde(default)]
+    pub screens: Vec<crate::screen::ScreenInst>,
+    /// Index into the dialogue history where the current NVL page starts.
+    #[serde(default)]
+    pub nvl_start: usize,
+    /// `window` mode at save time: `show`, `hide` or `auto`.
+    #[serde(default = "default_window_mode")]
+    pub window_mode: String,
     /// Thumbnail image path (PNG bytes) of the scene.
     pub thumbnail: Option<Vec<u8>>,
     /// Real-world save time (Unix timestamp).

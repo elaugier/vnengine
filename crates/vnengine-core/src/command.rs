@@ -6,6 +6,7 @@
 
 use crate::atl::SpriteTrack;
 use crate::model::{Layer, SpriteLayer};
+use crate::screen::ScreenInst;
 use crate::{transition::Transition, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -98,6 +99,10 @@ pub enum Command {
         voice: Option<String>,
         /// Optional side image (character portrait next to dialogue box).
         side_image: Option<String>,
+        /// Speaker kind — `nvl` renders the line in full-screen NVL
+        /// mode instead of the dialogue box.
+        #[serde(default)]
+        nvl: bool,
     },
     /// Narration text (no speaker).
     Narrate { text: String },
@@ -152,6 +157,18 @@ pub enum Command {
     /// Send a command to a WASM plugin. `payload` is a JSON array of the
     /// evaluated argument values, e.g. `["unlock","chapel"]`.
     PluginCall { plugin: String, payload: String },
+    /// Show a declarative screen (`show screen <name>`). Resolved by
+    /// the VM; the runtime stores it in `screens` (replaces by name).
+    ShowScreen(ScreenInst),
+    /// Hide a declarative screen by name (`hide screen <name>`).
+    HideScreen { name: String },
+    /// Control the dialogue window (`window show|hide|auto`).
+    Window {
+        /// `show`, `hide` or `auto` (hidden during menus/transitions).
+        mode: String,
+    },
+    /// Clear the NVL page (`nvl clear`).
+    NvlClear,
     /// Insert or replace a named point light in the scene.
     LightSet(crate::model::PointLight),
     /// Remove a point light by name.

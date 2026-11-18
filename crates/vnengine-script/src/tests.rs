@@ -182,8 +182,8 @@ use vnengine_core::command::Command;
 fn step_until_command(vm: &mut Vm) -> Command {
     match vm.step() {
         StepResult::Command(c) => c,
-        StepResult::Menu { .. } => panic!("unexpected menu"),
         StepResult::Finished => panic!("VM finished unexpectedly"),
+        _ => panic!("unexpected blocking step"),
     }
 }
 
@@ -301,6 +301,7 @@ label start:
             }
             StepResult::Command(_) => {}
             StepResult::Finished => panic!("unexpected finish"),
+            _ => panic!("unexpected blocking step"),
         }
     }
     // Now we should get the narration from the second choice.
@@ -1035,6 +1036,7 @@ fn run_collecting(src: &str, picker: impl Fn(usize) -> usize) -> Vec<String> {
                 vm.resume(Some(MenuResponse::Selected(idx)));
             }
             StepResult::Finished => return out,
+            _ => panic!("unexpected blocking step"),
         }
     }
     panic!("VM did not finish within step budget")
@@ -2305,4 +2307,361 @@ label start:
         other => panic!("expected Show, got {other:?}"),
  
     }
+}
+
+// ============ Phase 3: screen language / input / confirm / nvl / window ============
+
+#[test]
+fn parse_screen_def_all_nodes() {
+    let src = r##"
+screen hud:
+    text "Score: [score]" x=0.02 y=0.02 size=20 color="#ff0000"
+    box x=0.0 y=0.9 w=1.0 h=0.1 color="#000000"
+    image "icon" x=0.5 y=0.5 w=0.1 h=0.1 alpha=0.8
+    button "Go" x=0.4 y=0.5 w=0.2 h=0.06:
+        jump "target"
+    if flag:
+        text "flag on" x=0.1 y=0.1
+    for it in items:
+        text it x=0.1 y=0.2
+
+label start:
+    "done"
+"##;
+    let script = Parser::parse(src).unwrap();
+    assert_eq!(script.screens.len(), 1);
+    let scr = &script.screens[0];
+    assert_eq!(scr.name, "hud");
+    assert_eq!(scr.body.len(), 6);
+    match &scr.body[0] {
+        ScreenStmt::Text { size, color, .. } => {
+            assert!(size.is_some());
+            assert!(color.is_some());
+        }
+        other => panic!("expected Text, got {other:?}"),
+    }
+    match &scr.body[1] {
+        ScreenStmt::Box { .. } => {}
+        other => panic!("expected Box, got {other:?}"),
+    }
+    match &scr.body[2] {
+        ScreenStmt::Image { alpha, .. } => assert!(alpha.is_some()),
+        other => panic!("expected Image, got {other:?}"),
+    }
+    match &scr.body[3] {
+        ScreenStmt::Button { actions, .. } => {
+            assert_eq!(actions.len(), 1);
+            assert!(matches!(actions[0], ButtonAction::Jump(_)));
+        }
+        other => panic!("expected Button, got {other:?}"),
+    }
+    match &scr.body[4] {
+        ScreenStmt::If { body, .. } => assert_eq!(body.len(), 1),
+        other => panic!("expected If, got {other:?}"),
+    }
+    match &scr.body[5] {
+        ScreenStmt::For { var, body, .. } => {
+            assert_eq!(var, "it");
+            assert_eq!(body.len(), 1);
+        }
+        other => panic!("expected For, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_screen_lifecycle_stmts() {
+    let src = r##"
+label start:
+    show screen "hud"
+    hide screen "hud"
+    call screen pick set choice_made
+    input player_name "Your name?"
+    confirm answer "Sure?"
+    nvl clear
+    window hide
+    window show
+"##;
+    let script = Parser::parse(src).unwrap();
+    let stmts = &script.labels[0].body;
+    assert!(matches!(stmts[0], Stmt::ShowScreen { .. }));
+    assert!(matches!(stmts[1], Stmt::HideScreen { .. }));
+    match &stmts[2] {
+        Stmt::CallScreen { set_var, .. } => {
+            assert_eq!(set_var.as_deref(), Some("choice_made"))
+        }
+        other => panic!("expected CallScreen, got {other:?}"),
+    }
+    match &stmts[3] {
+        Stmt::Input { var, prompt } => {
+            assert_eq!(var, "player_name");
+            assert!(prompt.is_some());
+        }
+        other => panic!("expected Input, got {other:?}"),
+    }
+    match &stmts[4] {
+        Stmt::Confirm { var, message } => {
+            assert_eq!(var, "answer");
+            assert!(message.is_some());
+        }
+        other => panic!("expected Confirm, got {other:?}"),
+    }
+    assert!(matches!(stmts[5], Stmt::NvlClear));
+    assert!(matches!(&stmts[6], Stmt::Window { mode } if mode == "hide"));
+    assert!(matches!(&stmts[7], Stmt::Window { mode } if mode == "show"));
+}
+
+#[test]
+fn parse_button_multiple_actions() {
+    let src = r##"
+screen pick:
+    button "Yes" x=0.3 y=0.5:
+        set picked = True
+        return 1
+
+label start:
+    "x"
+"##;
+    let script = Parser::parse(src).unwrap();
+    match &script.screens[0].body[0] {
+        ScreenStmt::Button { actions, .. } => {
+            assert_eq!(actions.len(), 2);
+            assert!(matches!(&actions[0], ButtonAction::Set { name, .. } if name == "picked"));
+            assert!(matches!(actions[1], ButtonAction::Return(_)));
+        }
+        other => panic!("expected Button, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_character_voice_image_kind() {
+    let src = r##"
+define e = Character("Eileen", voice="e_v.ogg", image="e side", kind="nvl")
+
+label start:
+    e "hi"
+"##;
+    let script = Parser::parse(src).unwrap();
+    match &script.definitions[0] {
+        Definition::Character {
+            voice,
+            image,
+            kind,
+            ..
+        } => {
+            assert!(voice.is_some());
+            assert!(image.is_some());
+            assert!(kind.is_some());
+        }
+        other => panic!("expected Character, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_show_and_hide_screen() {
+    let src = r##"
+screen hud:
+    text "Score: [score]" x=0.02 y=0.02
+
+label start:
+    $ score = 42
+    show screen hud
+    hide screen "hud"
+    "done"
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let mut shown = false;
+    let mut hidden = false;
+    for _ in 0..20 {
+        match vm.step() {
+            StepResult::Command(Command::ShowScreen(inst)) => {
+                assert_eq!(inst.name, "hud");
+                assert_eq!(inst.nodes.len(), 1);
+                // `text` interpolated with the current variable value.
+                match &inst.nodes[0].text {
+                    Some(t) => assert_eq!(t, "Score: 42"),
+                    None => panic!("text node missing"),
+                }
+                shown = true;
+            }
+            StepResult::Command(Command::HideScreen { name }) => {
+                assert_eq!(name, "hud");
+                hidden = true;
+            }
+            StepResult::Command(_) => {}
+            StepResult::Finished => break,
+            _ => panic!("unexpected blocking step"),
+        }
+    }
+    assert!(shown && hidden);
+}
+
+#[test]
+fn vm_call_screen_return_binds_var() {
+    let src = r##"
+screen pick:
+    button "One" x=0.2 y=0.4:
+        return 1
+    button "Two" x=0.6 y=0.4:
+        return 2
+
+label start:
+    call screen pick set chosen
+    "picked [chosen]"
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    match vm.step() {
+        StepResult::Screen { inst } => {
+            assert_eq!(inst.name, "pick");
+            assert_eq!(inst.clickables().len(), 2);
+            // Click the second button.
+            vm.resume_screen(1);
+        }
+        other => panic!("expected Screen, got {other:?}"),
+    }
+    assert!(!vm.is_on_screen());
+    assert_eq!(
+        vm.state.variables.get("chosen"),
+        Some(&vnengine_core::Value::Int(2))
+    );
+    // Next step produces the narration line.
+    match vm.step() {
+        StepResult::Command(Command::Narrate { text }) => {
+            assert_eq!(text, "picked 2");
+        }
+        other => panic!("expected Narrate, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_screen_set_action_stays_up() {
+    let src = r##"
+screen counter:
+    button "Add" x=0.2 y=0.4:
+        set count = count + 1
+
+label start:
+    $ count = 0
+    call screen counter
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    match vm.step() {
+        StepResult::Screen { inst } => {
+            assert_eq!(inst.clickables().len(), 1);
+            vm.resume_screen(0);
+        }
+        other => panic!("expected Screen, got {other:?}"),
+    }
+    // `set` is non-dismissing: the screen is still pending.
+    assert!(vm.is_on_screen());
+    assert_eq!(
+        vm.state.variables.get("count"),
+        Some(&vnengine_core::Value::Int(1))
+    );
+}
+
+#[test]
+fn vm_input_and_confirm_bind_variables() {
+    let src = r##"
+label start:
+    input player_name "Your name?"
+    confirm ok "Really?"
+    "hello [player_name], ok=[ok]"
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    match vm.step() {
+        StepResult::Input { prompt } => {
+            assert_eq!(prompt.as_deref(), Some("Your name?"));
+            vm.resume_input("Alice".to_string());
+        }
+        other => panic!("expected Input, got {other:?}"),
+    }
+    match vm.step() {
+        StepResult::Confirm { message } => {
+            assert_eq!(message.as_deref(), Some("Really?"));
+            vm.resume_confirm(true);
+        }
+        other => panic!("expected Confirm, got {other:?}"),
+    }
+    match vm.step() {
+        StepResult::Command(Command::Narrate { text }) => {
+            assert_eq!(text, "hello Alice, ok=true");
+        }
+        other => panic!("expected Narrate, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_nvl_character_marks_say() {
+    let src = r##"
+define n = Character("Narrator", kind="nvl")
+
+label start:
+    n "full screen text"
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    match vm.step() {
+        StepResult::Command(Command::Say { nvl, .. }) => assert!(nvl),
+        other => panic!("expected nvl Say, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_window_and_nvlclear_commands() {
+    let src = r##"
+label start:
+    window hide
+    nvl clear
+    window show
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    match vm.step() {
+        StepResult::Command(Command::Window { mode }) => assert_eq!(mode, "hide"),
+        other => panic!("expected Window, got {other:?}"),
+    }
+    match vm.step() {
+        StepResult::Command(Command::NvlClear) => {}
+        other => panic!("expected NvlClear, got {other:?}"),
+    }
+    match vm.step() {
+        StepResult::Command(Command::Window { mode }) => assert_eq!(mode, "show"),
+        other => panic!("expected Window, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_screen_if_for_expands() {
+    let src = r##"
+screen listing:
+    if show_extra:
+        text "extra" x=0.1 y=0.1
+    for it in items:
+        text it x=0.1 y=0.2
+
+label start:
+    $ show_extra = True
+    $ items = ["a", "b"]
+    show screen listing
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let mut inst = None;
+    for _ in 0..10 {
+        match vm.step() {
+            StepResult::Command(Command::ShowScreen(i)) => inst = Some(i),
+            StepResult::Command(_) => {}
+            StepResult::Finished => break,
+            _ => panic!("unexpected blocking step"),
+        }
+    }
+    let inst = inst.expect("screen was shown");
+    // 1 conditional text + 2 loop iterations.
+    assert_eq!(inst.nodes.len(), 3);
+    assert_eq!(inst.nodes[1].text.as_deref(), Some("a"));
+    assert_eq!(inst.nodes[2].text.as_deref(), Some("b"));
 }

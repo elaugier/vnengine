@@ -73,6 +73,9 @@ pub struct Input {
     held: HashSet<Action>,
     /// Mouse clicks this frame.
     clicks: Vec<Click>,
+    /// Text typed this frame (from winit `KeyEvent.text`), for the
+    /// script `input` prompt.
+    typed: Vec<char>,
     /// Mouse position in logical pixels.
     mouse_pos: (f32, f32),
 }
@@ -89,6 +92,7 @@ impl Input {
             pressed: HashSet::new(),
             held: HashSet::new(),
             clicks: Vec::new(),
+            typed: Vec::new(),
             mouse_pos: (0.0, 0.0),
         }
     }
@@ -97,12 +101,14 @@ impl Input {
     pub fn begin_frame(&mut self) {
         self.pressed.clear();
         self.clicks.clear();
+        self.typed.clear();
     }
 
     /// Clear per-frame state at the end of a frame (after processing).
     pub fn end_frame(&mut self) {
         self.pressed.clear();
         self.clicks.clear();
+        self.typed.clear();
     }
 
     /// Record a key press.
@@ -125,6 +131,20 @@ impl Input {
     /// Record a mouse click.
     pub fn mouse_click(&mut self, x: f32, y: f32) {
         self.clicks.push(Click { x, y });
+    }
+
+    /// Record typed text (printable characters from the OS).
+    pub fn text_input(&mut self, text: &str) {
+        for c in text.chars() {
+            if !c.is_control() {
+                self.typed.push(c);
+            }
+        }
+    }
+
+    /// Characters typed this frame.
+    pub fn typed(&self) -> &[char] {
+        &self.typed
     }
 
     /// Update mouse position.

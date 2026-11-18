@@ -220,6 +220,13 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
         Stmt::Def { .. } => "def",
         Stmt::Shake { .. } => "shake",
         Stmt::Plugin { .. } => "plugin",
+        Stmt::ShowScreen { .. } => "show screen",
+        Stmt::HideScreen { .. } => "hide screen",
+        Stmt::CallScreen { .. } => "call screen",
+        Stmt::Input { .. } => "input",
+        Stmt::Confirm { .. } => "confirm",
+        Stmt::NvlClear => "nvl clear",
+        Stmt::Window { .. } => "window",
         Stmt::End => "end",
     }
 }

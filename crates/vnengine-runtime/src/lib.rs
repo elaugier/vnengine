@@ -9,6 +9,7 @@
 use vnengine_core::command::Command;
 use vnengine_core::model::{CameraAnim, Scene};
 use vnengine_core::save::GalleryState;
+use vnengine_core::screen::ScreenInst;
 pub use vnengine_core::save::{JournalEntry, MusicLayerState};
 use vnengine_script::vm::{MenuResponse, StepResult, Vm, VmState};
 
@@ -37,6 +38,15 @@ pub enum RuntimeEvent {
         prompt: Option<String>,
         choices: Vec<String>,
     },
+    /// A `call screen` is displayed and waits for a click. Call
+    /// [`Runtime::resume_screen`] with the clicked index.
+    Screen { inst: ScreenInst },
+    /// An `input` prompt waits for text. Call
+    /// [`Runtime::resume_input`].
+    Input { prompt: Option<String> },
+    /// A `confirm` prompt waits for a yes/no answer. Call
+    /// [`Runtime::resume_confirm`].
+    Confirm { message: Option<String> },
     /// The script finished.
     Finished,
 }
@@ -52,6 +62,9 @@ struct RollbackSnapshot {
     music: Option<String>,
     plugin_kv: std::collections::BTreeMap<String, String>,
     music_layers: std::collections::BTreeMap<String, MusicLayerState>,
+    screens: Vec<ScreenInst>,
+    nvl_start: usize,
+    window_mode: String,
 }
 
 /// Everything needed to resume a game, as stored in a save file.
@@ -67,6 +80,12 @@ pub struct RuntimeSnapshot {
     pub plugin_kv: std::collections::BTreeMap<String, String>,
     /// Adaptive-music stems playing at save time.
     pub music_layers: std::collections::BTreeMap<String, MusicLayerState>,
+    /// Declarative screens shown at save time (`show screen`).
+    pub screens: Vec<ScreenInst>,
+    /// Index into `history` where the current NVL page starts.
+    pub nvl_start: usize,
+    /// `window` mode at save time: `show`, `hide` or `auto`.
+    pub window_mode: String,
 }
 
 /// The headless runtime.
@@ -96,6 +115,17 @@ pub struct Runtime {
     /// Remaining time of a `pause` command, driven by
     /// [`Runtime::update`] — the runtime's logical clock, not wall time.
     pause_remaining: Option<f32>,
+    /// Declarative screens currently shown (`show screen`), in draw
+    /// order. The host renders them on top of the dialogue UI.
+    pub screens: Vec<ScreenInst>,
+    /// Index into `history` where the current NVL page starts —
+    /// `nvl clear` sets it to `history.len()`. NVL-mode `say` lines
+    /// accumulate on the page; the host renders
+    /// `history[nvl_start..]` for `nvl` dialogue.
+    pub nvl_start: usize,
+    /// Dialogue window mode from `window show|hide|auto`. The host
+    /// hides the textbox when this is `hide`.
+    pub window_mode: String,
     rollback_stack: Vec<RollbackSnapshot>,
     rollforward_stack: Vec<RollbackSnapshot>,
     /// True while re-executing a restored snapshot. Suppresses clearing
@@ -121,6 +151,9 @@ impl Runtime {
             plugin_kv: std::collections::BTreeMap::new(),
             music_layers: std::collections::BTreeMap::new(),
             pause_remaining: None,
+            screens: Vec::new(),
+            nvl_start: 0,
+            window_mode: "auto".to_string(),
             rollback_stack: Vec::new(),
             rollforward_stack: Vec::new(),
             replaying: false,
@@ -136,6 +169,9 @@ impl Runtime {
         rt.journal = snap.journal;
         rt.plugin_kv = snap.plugin_kv;
         rt.music_layers = snap.music_layers;
+        rt.screens = snap.screens;
+        rt.nvl_start = snap.nvl_start;
+        rt.window_mode = snap.window_mode;
         rt
     }
 
@@ -148,6 +184,9 @@ impl Runtime {
             journal: self.journal.clone(),
             plugin_kv: self.plugin_kv.clone(),
             music_layers: self.music_layers.clone(),
+            screens: self.screens.clone(),
+            nvl_start: self.nvl_start,
+            window_mode: self.window_mode.clone(),
         }
     }
 
@@ -160,6 +199,21 @@ impl Runtime {
             return RuntimeEvent::Menu {
                 prompt: menu.prompt.clone(),
                 choices: menu.choices.iter().map(|c| c.text.clone()).collect(),
+            };
+        }
+        if let Some(p) = &self.vm.state.pending_screen {
+            return RuntimeEvent::Screen {
+                inst: p.inst.clone(),
+            };
+        }
+        if let Some(p) = &self.vm.state.pending_input {
+            return RuntimeEvent::Input {
+                prompt: p.prompt.clone(),
+            };
+        }
+        if let Some(p) = &self.vm.state.pending_confirm {
+            return RuntimeEvent::Confirm {
+                message: p.message.clone(),
             };
         }
         self.step()
@@ -198,6 +252,99 @@ impl Runtime {
     pub fn resume_menu(&mut self, index: usize) {
         self.journal.push(JournalEntry::Menu(index));
         self.vm.resume(Some(MenuResponse::Selected(index)));
+    }
+
+    /// Resume a `call screen` with the clicked clickable index. The
+    /// click is journaled for deterministic replay. Variable and flow
+    /// actions (`set`/`return`/`jump`) are applied by the VM; screen
+    /// effects (`show screen`/`hide screen`) update `self.screens`.
+    /// The host should call [`Runtime::step`] when
+    /// [`Runtime::is_on_screen`] becomes false.
+    pub fn resume_screen(&mut self, index: usize) {
+        self.journal.push(JournalEntry::Screen(index));
+        let pending_name = self
+            .vm
+            .state
+            .pending_screen
+            .as_ref()
+            .map(|p| p.inst.name.clone());
+        for effect in self.vm.resume_screen(index) {
+            self.apply_screen_action(&effect);
+        }
+        // If the click dismissed the `call screen`, drop it from the
+        // shown screens too (it was inserted when the event fired).
+        if !self.vm.is_on_screen() {
+            if let Some(name) = pending_name {
+                self.screens.retain(|s| s.name != name);
+            }
+        }
+    }
+
+    /// Apply a `show screen`/`hide screen` action to `self.screens`.
+    fn apply_screen_action(
+        &mut self,
+        action: &vnengine_core::screen::ScreenAction,
+    ) {
+        use vnengine_core::screen::ScreenAction;
+        match action {
+            ScreenAction::ShowScreen(name) => {
+                // Re-resolve in the current context so the new screen
+                // reflects up-to-date variables; the raw action exprs
+                // register for click-time evaluation.
+                match self.vm.resolve_screen(name) {
+                    Ok((inst, raw)) => {
+                        self.vm
+                            .state
+                            .shown_screen_actions
+                            .insert(inst.name.clone(), raw);
+                        self.screens.retain(|s| s.name != inst.name);
+                        self.screens.push(inst);
+                    }
+                    Err(e) => log::error!("screen `{name}` could not be resolved: {e}"),
+                }
+            }
+            ScreenAction::HideScreen(name) => {
+                self.screens.retain(|s| &s.name != name);
+                self.vm.state.shown_screen_actions.remove(name);
+            }
+            _ => {}
+        }
+    }
+
+    /// Click on an ambient (non-blocking `show screen`) button. The
+    /// VM evaluates the node's raw actions at click time
+    /// (`set`/`jump`/`return`/`show screen`/`hide screen`). Returns
+    /// true if a `jump` fired and the host should resume stepping.
+    pub fn screen_action(
+        &mut self,
+        screen_idx: usize,
+        node_idx: usize,
+    ) -> bool {
+        let Some(name) = self.screens.get(screen_idx).map(|s| s.name.clone()) else {
+            return false;
+        };
+        let (effects, jumped) = self.vm.apply_screen_actions(&name, node_idx);
+        for effect in effects {
+            self.apply_screen_action(&effect);
+        }
+        jumped
+    }
+
+    /// Whether a `call screen` is still awaiting a dismissing action.
+    pub fn is_on_screen(&self) -> bool {
+        self.vm.is_on_screen()
+    }
+
+    /// Resume an `input` prompt with the entered text.
+    pub fn resume_input(&mut self, text: String) {
+        self.journal.push(JournalEntry::Input(text.clone()));
+        self.vm.resume_input(text);
+    }
+
+    /// Resume a `confirm` prompt with the answer (`true` = yes).
+    pub fn resume_confirm(&mut self, yes: bool) {
+        self.journal.push(JournalEntry::Confirm(yes));
+        self.vm.resume_confirm(yes);
     }
 
     /// Advance the runtime's logical clock by `dt` seconds. If a `pause`
@@ -292,6 +439,30 @@ impl Runtime {
                     ji += 1;
                     rt.resume_menu(choice);
                 }
+                RuntimeEvent::Screen { ref inst } => {
+                    let Some(&JournalEntry::Screen(click)) = journal.get(ji) else {
+                        return Err(format!("journal exhausted at screen #{ji}"));
+                    };
+                    if click >= inst.clickables().len() {
+                        return Err(format!("journal entry #{ji} is out of range"));
+                    }
+                    ji += 1;
+                    rt.resume_screen(click);
+                }
+                RuntimeEvent::Input { .. } => {
+                    let Some(JournalEntry::Input(text)) = journal.get(ji) else {
+                        return Err(format!("journal exhausted at input #{ji}"));
+                    };
+                    ji += 1;
+                    rt.resume_input(text.clone());
+                }
+                RuntimeEvent::Confirm { .. } => {
+                    let Some(&JournalEntry::Confirm(yes)) = journal.get(ji) else {
+                        return Err(format!("journal exhausted at confirm #{ji}"));
+                    };
+                    ji += 1;
+                    rt.resume_confirm(yes);
+                }
                 RuntimeEvent::Finished => break,
                 RuntimeEvent::Effect(_) | RuntimeEvent::Blocking(_) => {}
             }
@@ -337,6 +508,9 @@ impl Runtime {
         self.music = snap.music;
         self.plugin_kv = snap.plugin_kv;
         self.music_layers = snap.music_layers;
+        self.screens = snap.screens;
+        self.nvl_start = snap.nvl_start;
+        self.window_mode = snap.window_mode;
         self.replaying = true;
         let event = self.step();
         self.replaying = false;
@@ -354,6 +528,9 @@ impl Runtime {
             music: self.music.clone(),
             plugin_kv: self.plugin_kv.clone(),
             music_layers: self.music_layers.clone(),
+            screens: self.screens.clone(),
+            nvl_start: self.nvl_start,
+            window_mode: self.window_mode.clone(),
         });
         if self.rollback_stack.len() > MAX_ROLLBACK {
             self.rollback_stack.remove(0);
@@ -452,12 +629,14 @@ impl Runtime {
                         text,
                         voice,
                         side_image,
+                        nvl,
                     } => {
                         let cmd = Command::Say {
                             speaker: speaker.clone(),
                             text: text.clone(),
                             voice,
                             side_image,
+                            nvl,
                         };
                         self.push_rollback(pre_state);
                         self.history.push(HistoryEntry { speaker, text });
@@ -569,6 +748,24 @@ impl Runtime {
                     | Command::PluginCall { .. } => {
                         return RuntimeEvent::Effect(cmd);
                     }
+                    Command::ShowScreen(ref inst) => {
+                        // Replaces a screen of the same name.
+                        self.screens.retain(|s| s.name != inst.name);
+                        self.screens.push(inst.clone());
+                        return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::HideScreen { ref name } => {
+                        self.screens.retain(|s| &s.name != name);
+                        return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::Window { ref mode } => {
+                        self.window_mode = mode.clone();
+                        return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::NvlClear => {
+                        // New NVL page starts after the current history.
+                        self.nvl_start = self.history.len();
+                    }
                     Command::Pause { seconds } => {
                         self.pause_remaining = Some(seconds);
                         self.push_rollback(pre_state);
@@ -625,6 +822,22 @@ impl Runtime {
                         prompt,
                         choices: choices.iter().map(|c| c.text.clone()).collect(),
                     };
+                }
+                StepResult::Screen { inst } => {
+                    // A `call screen` also shows its inst while pending
+                    // so the host renders it like a shown screen.
+                    self.screens.retain(|s| s.name != inst.name);
+                    self.screens.push(inst.clone());
+                    self.push_rollback(pre_state);
+                    return RuntimeEvent::Screen { inst };
+                }
+                StepResult::Input { prompt } => {
+                    self.push_rollback(pre_state);
+                    return RuntimeEvent::Input { prompt };
+                }
+                StepResult::Confirm { message } => {
+                    self.push_rollback(pre_state);
+                    return RuntimeEvent::Confirm { message };
                 }
                 StepResult::Finished => return RuntimeEvent::Finished,
             }

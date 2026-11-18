@@ -175,6 +175,7 @@ fn command_is_blocking() {
         text: "hi".into(),
         voice: None,
         side_image: None,
+        nvl: false,
     }
     .is_blocking());
     assert!(Command::Narrate { text: "n".into() }.is_blocking());
@@ -444,6 +445,9 @@ fn save_state_write_read_roundtrip() {
             .into_iter()
             .collect(),
         music_layers: std::collections::BTreeMap::new(),
+        screens: Vec::new(),
+        nvl_start: 0,
+        window_mode: "auto".into(),
         thumbnail: None,
         saved_at: 1700000000,
     };
@@ -480,6 +484,9 @@ fn save_state_list_multiple_slots() {
             journal: vec![],
             plugin_kv: Default::default(),
             music_layers: std::collections::BTreeMap::new(),
+            screens: Vec::new(),
+            nvl_start: 0,
+            window_mode: "auto".into(),
             thumbnail: None,
             saved_at: 0,
         }
@@ -509,6 +516,9 @@ fn save_state_delete() {
         journal: vec![],
         plugin_kv: Default::default(),
         music_layers: std::collections::BTreeMap::new(),
+        screens: Vec::new(),
+        nvl_start: 0,
+        window_mode: "auto".into(),
         thumbnail: None,
         saved_at: 0,
     }

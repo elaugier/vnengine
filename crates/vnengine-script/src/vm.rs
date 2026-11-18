@@ -108,6 +108,20 @@ pub struct VmState {
     /// Pending menu awaiting a selection. `None` unless we're blocked on
     /// a menu.
     pub pending_menu: Option<PendingMenu>,
+    /// Pending `call screen` awaiting a button action.
+    #[serde(default)]
+    pub pending_screen: Option<PendingScreen>,
+    /// Raw button-action expressions of ambient shown screens, keyed
+    /// by screen name — evaluated at click time (Ren'Py semantics).
+    #[serde(default)]
+    pub shown_screen_actions:
+        std::collections::BTreeMap<String, Vec<Vec<crate::ast::ButtonAction>>>,
+    /// Pending `input` awaiting a text entry.
+    #[serde(default)]
+    pub pending_input: Option<PendingInput>,
+    /// Pending `confirm` awaiting a yes/no answer.
+    #[serde(default)]
+    pub pending_confirm: Option<PendingConfirm>,
     /// PRNG state for `random()`/`randint()`/`srand()`. Serialized so
     /// save/load and replay reproduce the same sequence.
     #[serde(default = "default_rng_seed")]
@@ -139,12 +153,49 @@ pub struct MenuChoiceAst {
     pub body: Vec<Stmt>,
 }
 
+/// A `call screen` block in flight, kept serializable so the same
+/// screen can be rebuilt after a save/restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingScreen {
+    /// The resolved screen being displayed.
+    pub inst: vnengine_core::screen::ScreenInst,
+    /// `call screen ... set <var>` — receives the `return` value.
+    #[serde(default)]
+    pub set_var: Option<String>,
+    /// Raw button-action expressions parallel to `inst.nodes` —
+    /// evaluated at click time.
+    #[serde(default)]
+    pub node_actions: Vec<Vec<crate::ast::ButtonAction>>,
+}
+
+/// An `input` block in flight — binds `var` to the entered text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingInput {
+    pub var: String,
+    /// The prompt shown to the player (kept for save/restore).
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// A `confirm` block in flight — binds `var` to the yes/no answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingConfirm {
+    pub var: String,
+    /// The message shown to the player (kept for save/restore).
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
 impl VmState {
     pub fn new() -> Self {
         Self {
             stack: vec![Frame::label("start")],
             variables: HashMap::new(),
             pending_menu: None,
+            pending_screen: None,
+            shown_screen_actions: std::collections::BTreeMap::new(),
+            pending_input: None,
+            pending_confirm: None,
             rng_seed: default_rng_seed(),
             finished: false,
         }
@@ -169,6 +220,16 @@ pub enum StepResult {
         prompt: Option<String>,
         choices: Vec<MenuChoice>,
     },
+    /// The VM is blocked on a `call screen`. The engine displays the
+    /// resolved screen and calls `resume_screen` with the clicked
+    /// clickable index.
+    Screen {
+        inst: vnengine_core::screen::ScreenInst,
+    },
+    /// The VM is blocked on an `input` statement.
+    Input { prompt: Option<String> },
+    /// The VM is blocked on a `confirm` statement.
+    Confirm { message: Option<String> },
     /// The VM finished executing (game over).
     Finished,
 }
@@ -189,6 +250,12 @@ pub struct Vm {
     pub character_names: HashMap<String, String>,
     /// Character name colors.
     pub character_colors: HashMap<String, [f32; 3]>,
+    /// Character default voice tracks (`Character(..., voice=...)`).
+    pub character_voice: HashMap<String, Expr>,
+    /// Character default side images (`Character(..., image=...)`).
+    pub character_image: HashMap<String, Expr>,
+    /// Character kinds (`kind="nvl"` → NVL display).
+    pub character_kind: HashMap<String, Expr>,
     /// Defined constants.
     pub constants: HashMap<String, Value>,
     /// User-defined functions, keyed by name.
@@ -225,6 +292,9 @@ impl Vm {
             state: VmState::new(),
             character_names: HashMap::new(),
             character_colors: HashMap::new(),
+            character_voice: HashMap::new(),
+            character_image: HashMap::new(),
+            character_kind: HashMap::new(),
             constants: HashMap::new(),
             functions,
             deferred: VecDeque::new(),
@@ -243,10 +313,26 @@ impl Vm {
     pub fn process_definitions(&mut self) {
         for def in &self.script.definitions.clone() {
             match def {
-                Definition::Character { id, name, color } => {
+                Definition::Character {
+                    id,
+                    name,
+                    color,
+                    voice,
+                    image,
+                    kind,
+                } => {
                     self.character_names.insert(id.clone(), name.clone());
                     if let Some(c) = color {
                         self.character_colors.insert(id.clone(), *c);
+                    }
+                    if let Some(v) = voice {
+                        self.character_voice.insert(id.clone(), v.clone());
+                    }
+                    if let Some(i) = image {
+                        self.character_image.insert(id.clone(), i.clone());
+                    }
+                    if let Some(k) = kind {
+                        self.character_kind.insert(id.clone(), k.clone());
                     }
                 }
                 Definition::Constant { id, value } => {
@@ -288,8 +374,12 @@ impl Vm {
             return StepResult::Finished;
         }
 
-        // If we have a pending menu, the engine must resume first.
-        if self.state.pending_menu.is_some() {
+        // If a blocking prompt is pending, the engine must resume first.
+        if self.state.pending_menu.is_some()
+            || self.state.pending_screen.is_some()
+            || self.state.pending_input.is_some()
+            || self.state.pending_confirm.is_some()
+        {
             // This shouldn't happen if the engine drives correctly; return a
             // no-op pause to avoid spinning.
             return StepResult::Command(Command::Pause { seconds: 0.0 });
@@ -410,6 +500,15 @@ impl Vm {
                     // still points at the menu statement; it advances when
                     // the choice body completes.
                     return StepResult::Menu { prompt, choices };
+                }
+                Ok(ExecOutcome::Screen { inst }) => {
+                    return StepResult::Screen { inst };
+                }
+                Ok(ExecOutcome::Input { prompt }) => {
+                    return StepResult::Input { prompt };
+                }
+                Ok(ExecOutcome::Confirm { message }) => {
+                    return StepResult::Confirm { message };
                 }
                 Ok(ExecOutcome::Jump(label)) => {
                     // `jump` abandons the enclosing block context: unwind
@@ -566,6 +665,415 @@ impl Vm {
             }
         }
     }
+
+    /// Resolve a `screen <name>:` definition into a `ScreenInst` —
+    /// every expression is evaluated in the current variable context,
+    /// `if`/`for` expanded. Returns the inst plus the *raw* button
+    /// action expressions (parallel to `nodes`), which the VM keeps so
+    /// `set`/`return` evaluate at click time — not at show time.
+    pub fn resolve_screen(
+        &mut self,
+        name: &str,
+    ) -> Result<
+        (
+            vnengine_core::screen::ScreenInst,
+            Vec<Vec<crate::ast::ButtonAction>>,
+        ),
+        String,
+    > {
+        let def = self
+            .script
+            .find_screen(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown screen `{name}`"))?;
+        let mut nodes = Vec::new();
+        let mut raw_actions = Vec::new();
+        self.resolve_screen_body(&def.body, &mut nodes, &mut raw_actions)?;
+        Ok((
+            vnengine_core::screen::ScreenInst {
+                name: name.to_string(),
+                nodes,
+            },
+            raw_actions,
+        ))
+    }
+
+    fn resolve_screen_body(
+        &mut self,
+        body: &[crate::ast::ScreenStmt],
+        out: &mut Vec<vnengine_core::screen::UiNode>,
+        out_actions: &mut Vec<Vec<crate::ast::ButtonAction>>,
+    ) -> Result<(), String> {
+        use crate::ast::ScreenStmt;
+        use vnengine_core::screen::{UiNode, UiNodeKind};
+        for stmt in body {
+            match stmt {
+                ScreenStmt::Box { x, y, w, h, color } => {
+                    out.push(UiNode {
+                        kind: UiNodeKind::Box,
+                        rect: [
+                            self.eval_f32(x)?,
+                            self.eval_f32(y)?,
+                            self.eval_f32(w)?,
+                            self.eval_f32(h)?,
+                        ],
+                        text: None,
+                        image: None,
+                        color: match color {
+                            Some(c) => self.eval_color(c)?,
+                            None => [0.0, 0.0, 0.0, 0.5],
+                        },
+                        font_size: 24.0,
+                        action: Vec::new(),
+                        rich: false,
+                    });
+                    out_actions.push(Vec::new());
+                }
+                ScreenStmt::Text {
+                    text,
+                    x,
+                    y,
+                    size,
+                    color,
+                } => {
+                    let raw = self.eval_str(text)?;
+                    out.push(UiNode {
+                        kind: UiNodeKind::Text,
+                        rect: [self.eval_f32(x)?, self.eval_f32(y)?, 0.0, 0.0],
+                        text: Some(self.interpolate(&raw)),
+                        image: None,
+                        color: match color {
+                            Some(c) => self.eval_color(c)?,
+                            None => [1.0, 1.0, 1.0, 1.0],
+                        },
+                        font_size: match size {
+                            Some(s) => self.eval_f32(s)?,
+                            None => 24.0,
+                        },
+                        action: Vec::new(),
+                        rich: true,
+                    });
+                    out_actions.push(Vec::new());
+                }
+                ScreenStmt::Image {
+                    image,
+                    x,
+                    y,
+                    w,
+                    h,
+                    alpha,
+                } => {
+                    out.push(UiNode {
+                        kind: UiNodeKind::Image,
+                        rect: [
+                            self.eval_f32(x)?,
+                            self.eval_f32(y)?,
+                            match w {
+                                Some(e) => self.eval_f32(e)?,
+                                None => 0.0,
+                            },
+                            match h {
+                                Some(e) => self.eval_f32(e)?,
+                                None => 0.0,
+                            },
+                        ],
+                        text: None,
+                        image: Some(self.eval_str(image)?),
+                        color: [
+                            1.0,
+                            1.0,
+                            1.0,
+                            match alpha {
+                                Some(e) => self.eval_f32(e)?,
+                                None => 1.0,
+                            },
+                        ],
+                        font_size: 24.0,
+                        action: Vec::new(),
+                        rich: false,
+                    });
+                    out_actions.push(Vec::new());
+                }
+                ScreenStmt::Button {
+                    label,
+                    x,
+                    y,
+                    w,
+                    h,
+                    color,
+                    actions,
+                } => {
+                    let raw = self.eval_str(label)?;
+                    out.push(UiNode {
+                        kind: UiNodeKind::Button,
+                        rect: [
+                            self.eval_f32(x)?,
+                            self.eval_f32(y)?,
+                            match w {
+                                Some(e) => self.eval_f32(e)?,
+                                None => 0.15,
+                            },
+                            match h {
+                                Some(e) => self.eval_f32(e)?,
+                                None => 0.06,
+                            },
+                        ],
+                        text: Some(self.interpolate(&raw)),
+                        image: None,
+                        color: match color {
+                            Some(c) => self.eval_color(c)?,
+                            None => [0.2, 0.2, 0.4, 0.9],
+                        },
+                        font_size: 22.0,
+                        // Display-only resolved copy; the raw exprs in
+                        // `out_actions` are what actually run on click.
+                        action: self.resolve_button_actions(actions)?,
+                        rich: true,
+                    });
+                    out_actions.push(actions.clone());
+                }
+                ScreenStmt::If { cond, body } => {
+                    if self.eval(cond)?.is_truthy() {
+                        self.resolve_screen_body(body, out, out_actions)?;
+                    }
+                }
+                ScreenStmt::For {
+                    var,
+                    iterable,
+                    body,
+                } => {
+                    let iter_val = self.eval(iterable)?;
+                    let items: Vec<Value> = match &iter_val {
+                        Value::List(items) => items.clone(),
+                        Value::Dict(map) => map.keys().cloned().map(Value::Str).collect(),
+                        Value::Str(s) => {
+                            s.chars().map(|c| Value::Str(c.to_string())).collect()
+                        }
+                        _ => {
+                            return Err(format!(
+                                "screen `for` iterable must be list/dict/str, got {iter_val}"
+                            ))
+                        }
+                    };
+                    for item in items {
+                        self.state.variables.insert(var.clone(), item);
+                        self.resolve_screen_body(body, out, out_actions)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Screen name evaluation: a bare identifier is a literal screen
+    /// name (like `jump` targets); other expressions are evaluated.
+    fn eval_screen_name(&mut self, e: &Expr) -> Result<String, String> {
+        match e {
+            // A bare identifier is a literal screen name unless it is a
+            // defined variable — mirrors `jump` label semantics.
+            Expr::Var(name) if !self.state.variables.contains_key(name) => {
+                Ok(name.clone())
+            }
+            _ => self.eval_str(e),
+        }
+    }
+
+    /// Resolve a button's action block into serializable actions.
+    fn resolve_button_actions(
+        &mut self,
+        actions: &[crate::ast::ButtonAction],
+    ) -> Result<Vec<vnengine_core::screen::ScreenAction>, String> {
+        use vnengine_core::screen::ScreenAction;
+        let mut out = Vec::new();
+        for a in actions {
+            out.push(match a {
+                crate::ast::ButtonAction::Jump(e) => {
+                    ScreenAction::Jump(self.eval_str(e)?)
+                }
+                crate::ast::ButtonAction::Set { name, value } => ScreenAction::SetVariable {
+                    name: name.clone(),
+                    value: self.eval(value)?,
+                },
+                crate::ast::ButtonAction::Return(e) => ScreenAction::Return(match e {
+                    Some(e) => self.eval(e)?,
+                    None => Value::None,
+                }),
+                crate::ast::ButtonAction::ShowScreen(e) => {
+                    ScreenAction::ShowScreen(self.eval_screen_name(e)?)
+                }
+                crate::ast::ButtonAction::HideScreen(e) => {
+                    ScreenAction::HideScreen(self.eval_screen_name(e)?)
+                }
+            });
+        }
+        Ok(out)
+    }
+
+    /// Evaluate a `color=` screen attribute: hex string `#rrggbb` or a
+    /// 3/4-element list of 0..1 floats.
+    fn eval_color(&mut self, e: &Expr) -> Result<[f32; 4], String> {
+        match self.eval(e)? {
+            Value::Str(s) => {
+                let h = s.trim_start_matches('#');
+                if h.len() == 6 {
+                    let r = u8::from_str_radix(&h[0..2], 16).map_err(|_| "bad hex")?;
+                    let g = u8::from_str_radix(&h[2..4], 16).map_err(|_| "bad hex")?;
+                    let b = u8::from_str_radix(&h[4..6], 16).map_err(|_| "bad hex")?;
+                    Ok([
+                        r as f32 / 255.0,
+                        g as f32 / 255.0,
+                        b as f32 / 255.0,
+                        1.0,
+                    ])
+                } else {
+                    Err(format!("bad color `{s}`"))
+                }
+            }
+            Value::List(items) => {
+                let mut c = [1.0, 1.0, 1.0, 1.0];
+                for (i, v) in items.iter().take(4).enumerate() {
+                    c[i] = v
+                        .as_float()
+                        .ok_or_else(|| "color components must be numbers".to_string())?
+                        as f32;
+                }
+                Ok(c)
+            }
+            v => Err(format!("bad color value {v}")),
+        }
+    }
+
+    /// Evaluate a node's raw button actions at click time. Returns
+    /// `(screen_effects, jumped)` — `set`/`return`/`jump` act on VM
+    /// state, `show screen`/`hide screen` come back as effects for the
+    /// runtime's `screens` list.
+    fn run_button_actions(
+        &mut self,
+        actions: &[crate::ast::ButtonAction],
+    ) -> (Vec<vnengine_core::screen::ScreenAction>, bool) {
+        use vnengine_core::screen::ScreenAction;
+        let mut effects = Vec::new();
+        let mut jumped = false;
+        for action in actions {
+            match action {
+                crate::ast::ButtonAction::Jump(e) => {
+                    let label = match e {
+                        Expr::Var(n) => n.clone(),
+                        other => self.eval_str(other).unwrap_or_default(),
+                    };
+                    self.state.stack = vec![Frame::label(&label)];
+                    self.state.pending_screen = None;
+                    jumped = true;
+                }
+                crate::ast::ButtonAction::Set { name, value } => {
+                    if let Ok(v) = self.eval(value) {
+                        self.state.variables.insert(name.clone(), v);
+                    }
+                }
+                crate::ast::ButtonAction::Return(e) => {
+                    let v = match e {
+                        Some(e) => self.eval(e).unwrap_or(Value::None),
+                        None => Value::None,
+                    };
+                    let p = self.state.pending_screen.take();
+                    if let Some(var) = p.and_then(|p| p.set_var) {
+                        self.state.variables.insert(var, v);
+                    }
+                }
+                crate::ast::ButtonAction::ShowScreen(e) => {
+                    if let Ok(name) = self.eval_screen_name(e) {
+                        effects.push(ScreenAction::ShowScreen(name));
+                    }
+                }
+                crate::ast::ButtonAction::HideScreen(e) => {
+                    if let Ok(name) = self.eval_screen_name(e) {
+                        effects.push(ScreenAction::HideScreen(name));
+                    }
+                }
+            }
+            // `jump` abandons execution; `return` dismisses the call —
+            // later actions are moot in both cases.
+            if jumped || matches!(action, crate::ast::ButtonAction::Return(_)) {
+                break;
+            }
+        }
+        (effects, jumped)
+    }
+
+    /// Resume a `call screen` with the clicked clickable index.
+    /// Button actions are evaluated at click time (Ren'Py semantics);
+    /// `ShowScreen`/`HideScreen` effects are returned for the runtime
+    /// to apply to its `screens` list.
+    pub fn resume_screen(
+        &mut self,
+        idx: usize,
+    ) -> Vec<vnengine_core::screen::ScreenAction> {
+        let Some(pending) = &self.state.pending_screen else {
+            return Vec::new();
+        };
+        let Some(&node_idx) = pending.inst.clickables().get(idx) else {
+            return Vec::new();
+        };
+        let actions = pending
+            .node_actions
+            .get(node_idx)
+            .cloned()
+            .unwrap_or_default();
+        let (effects, jumped) = self.run_button_actions(&actions);
+        // The `call screen` statement is complete: advance the frame so
+        // `step` doesn't re-execute it (a `jump` reset the stack, so
+        // only non-jump dismissals advance here).
+        if self.state.pending_screen.is_none() && !jumped {
+            if let Some(f) = self.state.stack.last_mut() {
+                f.stmt += 1;
+            }
+        }
+        effects
+    }
+
+    /// Whether a `call screen` is still awaiting a dismissing action.
+    pub fn is_on_screen(&self) -> bool {
+        self.state.pending_screen.is_some()
+    }
+
+    /// Bind the pending `input` variable to `text` and continue.
+    pub fn resume_input(&mut self, text: String) {
+        if let Some(p) = self.state.pending_input.take() {
+            self.state.variables.insert(p.var, Value::Str(text));
+            if let Some(f) = self.state.stack.last_mut() {
+                f.stmt += 1;
+            }
+        }
+    }
+
+    /// Bind the pending `confirm` variable to `yes` and continue.
+    pub fn resume_confirm(&mut self, yes: bool) {
+        if let Some(p) = self.state.pending_confirm.take() {
+            self.state.variables.insert(p.var, Value::Bool(yes));
+            if let Some(f) = self.state.stack.last_mut() {
+                f.stmt += 1;
+            }
+        }
+    }
+
+    /// Apply a click on an ambient `show screen` button. Evaluates the
+    /// node's raw actions at click time; returns `(effects, jumped)` —
+    /// the runtime applies the effects and resumes stepping when a
+    /// `jump` fired.
+    pub fn apply_screen_actions(
+        &mut self,
+        screen: &str,
+        node_idx: usize,
+    ) -> (Vec<vnengine_core::screen::ScreenAction>, bool) {
+        let actions = self
+            .state
+            .shown_screen_actions
+            .get(screen)
+            .and_then(|v| v.get(node_idx))
+            .cloned()
+            .unwrap_or_default();
+        self.run_button_actions(&actions)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -578,6 +1086,15 @@ enum ExecOutcome {
     Menu {
         prompt: Option<String>,
         choices: Vec<MenuChoice>,
+    },
+    Screen {
+        inst: vnengine_core::screen::ScreenInst,
+    },
+    Input {
+        prompt: Option<String>,
+    },
+    Confirm {
+        message: Option<String>,
     },
     Jump(String),
     Call(String),
@@ -1007,13 +1524,27 @@ impl Vm {
                 transition,
             } => {
                 let text = self.interpolate(&text);
-                let voice = match &voice {
+                // Character defaults fill unset voice/side_image and
+                // decide the NVL display kind.
+                let (char_voice, char_image, char_kind) = match &speaker {
+                    Some(id) => (
+                        self.character_voice.get(id).cloned(),
+                        self.character_image.get(id).cloned(),
+                        self.character_kind.get(id).cloned(),
+                    ),
+                    None => (None, None, None),
+                };
+                let voice = match voice.or(char_voice).as_ref() {
                     Some(e) => Some(self.eval_str(e)?),
                     None => None,
                 };
-                let side_image = match &side_image {
+                let side_image = match side_image.or(char_image).as_ref() {
                     Some(e) => Some(self.eval_str(e)?),
                     None => None,
+                };
+                let nvl = match &char_kind {
+                    Some(e) => self.eval_str(e).map(|k| k == "nvl").unwrap_or(false),
+                    None => false,
                 };
                 let cmd = if let Some(id) = &speaker {
                     let speaker_name = self.character_names.get(id).cloned();
@@ -1022,6 +1553,7 @@ impl Vm {
                         text,
                         voice,
                         side_image,
+                        nvl,
                     }
                 } else {
                     Command::Narrate { text }
@@ -1468,6 +2000,59 @@ impl Vm {
                     fade,
                 }))
             }
+            Stmt::ShowScreen { screen } => {
+                let name = self.eval_screen_name(&screen)?;
+                let (inst, raw) = self.resolve_screen(&name)?;
+                self.state
+                    .shown_screen_actions
+                    .insert(name, raw);
+                Ok(ExecOutcome::Command(Command::ShowScreen(inst)))
+            }
+            Stmt::HideScreen { screen } => {
+                let name = self.eval_screen_name(&screen)?;
+                self.state.shown_screen_actions.remove(&name);
+                Ok(ExecOutcome::Command(Command::HideScreen { name }))
+            }
+            Stmt::CallScreen { screen, set_var } => {
+                let name = self.eval_screen_name(&screen)?;
+                let (inst, raw) = self.resolve_screen(&name)?;
+                self.state.pending_screen = Some(PendingScreen {
+                    inst: inst.clone(),
+                    set_var,
+                    node_actions: raw,
+                });
+                Ok(ExecOutcome::Screen { inst })
+            }
+            Stmt::Input { var, prompt } => {
+                let prompt = match &prompt {
+                    Some(e) => {
+                        let s = self.eval_str(e)?;
+                        Some(self.interpolate(&s))
+                    }
+                    None => None,
+                };
+                self.state.pending_input = Some(PendingInput {
+                    var,
+                    prompt: prompt.clone(),
+                });
+                Ok(ExecOutcome::Input { prompt })
+            }
+            Stmt::Confirm { var, message } => {
+                let message = match &message {
+                    Some(e) => {
+                        let s = self.eval_str(e)?;
+                        Some(self.interpolate(&s))
+                    }
+                    None => None,
+                };
+                self.state.pending_confirm = Some(PendingConfirm {
+                    var,
+                    message: message.clone(),
+                });
+                Ok(ExecOutcome::Confirm { message })
+            }
+            Stmt::NvlClear => Ok(ExecOutcome::Command(Command::NvlClear)),
+            Stmt::Window { mode } => Ok(ExecOutcome::Command(Command::Window { mode })),
             Stmt::End => {
                 self.state.finished = true;
                 Ok(ExecOutcome::Command(Command::End))

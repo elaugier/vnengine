@@ -203,6 +203,11 @@ impl Parser {
                     script.images.push(def);
                     idx += consumed;
                 }
+                Token::Ident(s) if s == "screen" => {
+                    let (def, consumed) = self.parse_screen_def(&lines[idx..])?;
+                    script.screens.push(def);
+                    idx += consumed;
+                }
                 _ => {
                     return Err(err(
                         line.line_no,
@@ -302,13 +307,42 @@ impl Parser {
         // Character ( "Name" [, color = (r, g, b)] )
         // toks[0] = Ident("Character")
         expect_token(&toks[1], Token::LParen, line_no, "(")?;
-        let name = expect_string(&toks[2], line_no, "character name")?;
+        // `Character("Name")` or `Character(None, ...)` — `None` gives
+        // a nameless narrator-style speaker (useful with `kind="nvl"`).
+        let name = match &toks[2].token {
+            Token::None => String::new(),
+            Token::Ident(s) if s == "None" => String::new(),
+            _ => expect_string(&toks[2], line_no, "character name")?,
+        };
         let mut color = None;
+        let mut voice = None;
+        let mut image = None;
+        let mut kind = None;
         let mut i = 3;
         while i < toks.len() && matches!(toks[i].token, Token::Comma) {
             i += 1;
-            // expect ident "color"
             if let Some(t) = toks.get(i) {
+                // `voice` lexes as a keyword token; `image`/`kind` are idents.
+                let attr = match &t.token {
+                    Token::Voice => Some("voice"),
+                    Token::Ident(s) if s == "image" || s == "kind" => {
+                        Some(s.as_str())
+                    }
+                    _ => None,
+                };
+                if let Some(attr) = attr {
+                    i += 1;
+                    expect_token(&toks[i], Token::Assign, line_no, "=")?;
+                    i += 1;
+                    let (e, used) = parse_expr_with_len(&toks[i..], line_no)?;
+                    i += used;
+                    match attr {
+                        "voice" => voice = Some(e),
+                        "image" => image = Some(e),
+                        _ => kind = Some(e),
+                    }
+                    continue;
+                }
                 if let Token::Ident(ref s) = t.token {
                     if s == "color" {
                         i += 1;
@@ -349,6 +383,9 @@ impl Parser {
             id: id.to_string(),
             name,
             color,
+            voice,
+            image,
+            kind,
         })
     }
 
@@ -424,6 +461,18 @@ impl Parser {
                 Ok((Stmt::Jump { label }, 1))
             }
             Token::Call => {
+                // `call screen <expr> [set <var>]` — blocking screen.
+                if matches!(toks.get(1).map(|t| &t.token), Some(Token::Ident(s)) if s == "screen")
+                {
+                    let (screen, used) = parse_expr_with_len(&toks[2..], line_no)?;
+                    let mut i = 2 + used;
+                    let mut set_var = None;
+                    if matches!(toks.get(i).map(|t| &t.token), Some(Token::Set)) {
+                        i += 1;
+                        set_var = Some(expect_ident(&toks[i], line_no, "variable name")?);
+                    }
+                    return Ok((Stmt::CallScreen { screen, set_var }, 1));
+                }
                 let (label, _) = self.parse_jump_target(&toks[1..], line_no)?;
                 Ok((Stmt::Call { label }, 1))
             }
@@ -510,6 +559,52 @@ impl Parser {
                     args.push(self.parse_expr_tokens(chunk, line_no)?);
                 }
                 Ok((Stmt::Plugin { name, args }, 1))
+            }
+            Token::Ident(s) if s == "input" => {
+                // `input <var> [<prompt-expr>]`
+                let var = expect_ident(&toks[1], line_no, "variable name")?;
+                let prompt = if toks.len() > 2 {
+                    Some(self.parse_expr_tokens(&toks[2..], line_no)?)
+                } else {
+                    None
+                };
+                Ok((Stmt::Input { var, prompt }, 1))
+            }
+            Token::Ident(s) if s == "confirm" => {
+                // `confirm <var> [<message-expr>]`
+                let var = expect_ident(&toks[1], line_no, "variable name")?;
+                let message = if toks.len() > 2 {
+                    Some(self.parse_expr_tokens(&toks[2..], line_no)?)
+                } else {
+                    None
+                };
+                Ok((Stmt::Confirm { var, message }, 1))
+            }
+            Token::Ident(s) if s == "nvl" => {
+                // `nvl clear`
+                match toks.get(1).map(|t| &t.token) {
+                    Some(Token::Ident(c)) if c == "clear" => Ok((Stmt::NvlClear, 1)),
+                    _ => Err(err(line_no, "expected `nvl clear`")),
+                }
+            }
+            Token::Ident(s) if s == "window" => {
+                // `window show|hide|auto` — `show`/`hide` are keyword
+                // tokens, `auto` stays an identifier.
+                let mode = match toks.get(1).map(|t| &t.token) {
+                    Some(Token::Show) => "show",
+                    Some(Token::Hide) => "hide",
+                    Some(Token::Ident(m)) => m.as_str(),
+                    _ => return Err(err(line_no, "expected `window show|hide|auto`")),
+                };
+                if !["show", "hide", "auto"].contains(&mode) {
+                    return Err(err(line_no, "expected `window show|hide|auto`"));
+                }
+                Ok((
+                    Stmt::Window {
+                        mode: mode.to_string(),
+                    },
+                    1,
+                ))
             }
             Token::Ident(s) if s == "light" => {
                 // `light <name> x=<e> y=<e> radius=<e> intensity=<e> [color=#hex]`
@@ -773,6 +868,11 @@ impl Parser {
         toks: &[Spanned],
         line_no: usize,
     ) -> Result<(Stmt, usize), ParseError> {
+        // `show screen <expr>` — declarative screen.
+        if matches!(toks.get(1).map(|t| &t.token), Some(Token::Ident(s)) if s == "screen") {
+            let screen = self.parse_expr_tokens(&toks[2..], line_no)?;
+            return Ok((Stmt::ShowScreen { screen }, 1));
+        }
         // show <character> <image> [at <anchor>] [layer=<layer>] [with <transition>]
         // image may be static words or carry a dynamic `[expr]` suffix.
         let character = expect_ident(&toks[1], line_no, "character id")?;
@@ -924,6 +1024,11 @@ impl Parser {
         toks: &[Spanned],
         line_no: usize,
     ) -> Result<(Stmt, usize), ParseError> {
+        // `hide screen <expr>` — declarative screen.
+        if matches!(toks.get(1).map(|t| &t.token), Some(Token::Ident(s)) if s == "screen") {
+            let screen = self.parse_expr_tokens(&toks[2..], line_no)?;
+            return Ok((Stmt::HideScreen { screen }, 1));
+        }
         // `hide`, `hide all` or `hide with <trans>` hides every sprite.
         let mut character = None;
         let mut i = 1;
@@ -1606,6 +1711,313 @@ impl Parser {
             )),
             None => Ok((AtlStmt::Set { props }, 1)),
         }
+    }
+
+    /// Parse `screen <name>:` + an indented screen body (top level).
+    fn parse_screen_def(&self, lines: &[Line]) -> Result<(ScreenDef, usize), ParseError> {
+        let first = &lines[0];
+        let line_no = first.line_no;
+        let name = expect_ident(&first.tokens[1], line_no, "screen name")?;
+        if let Some(t) = first.tokens.get(2) {
+            expect_token(t, Token::Colon, line_no, ":")?;
+        }
+        let mut consumed = 1;
+        let body = self.parse_screen_block(lines, first.indent, &mut consumed)?;
+        if body.is_empty() {
+            return Err(err(line_no, "screen block requires at least one node"));
+        }
+        Ok((ScreenDef { name, body }, consumed))
+    }
+
+    /// Parse an indented screen-statement block (also the sub-block of
+    /// `if:`/`for:`/`button:`).
+    fn parse_screen_block(
+        &self,
+        lines: &[Line],
+        parent_indent: usize,
+        consumed: &mut usize,
+    ) -> Result<Vec<ScreenStmt>, ParseError> {
+        let mut out = Vec::new();
+        while *consumed < lines.len() {
+            let line = &lines[*consumed];
+            if line.tokens.is_empty() {
+                *consumed += 1;
+                continue;
+            }
+            if line.indent <= parent_indent {
+                break;
+            }
+            let (stmt, extra) = self.parse_screen_stmt(&lines[*consumed..])?;
+            out.push(stmt);
+            *consumed += extra;
+        }
+        Ok(out)
+    }
+
+    /// Parse one screen statement: `box`/`text`/`image`/`button` lines
+    /// or `if:`/`for:` sub-blocks.
+    fn parse_screen_stmt(&self, lines: &[Line]) -> Result<(ScreenStmt, usize), ParseError> {
+        let line = &lines[0];
+        let toks = &line.tokens;
+        let line_no = line.line_no;
+        match &toks[0].token {
+            // `if <expr>:` — conditional children.
+            Token::If => {
+                expect_token(&toks[toks.len() - 1], Token::Colon, line_no, ":")?;
+                let cond = self.parse_expr_tokens(&toks[1..toks.len() - 1], line_no)?;
+                let mut consumed = 1;
+                let body = self.parse_screen_block(lines, line.indent, &mut consumed)?;
+                Ok((ScreenStmt::If { cond, body }, consumed))
+            }
+            // `for <v> in <expr>:` — repeated children.
+            Token::For => {
+                let var = expect_ident(&toks[1], line_no, "loop variable")?;
+                expect_token(&toks[2], Token::In, line_no, "in")?;
+                expect_token(&toks[toks.len() - 1], Token::Colon, line_no, ":")?;
+                let iterable = self.parse_expr_tokens(&toks[3..toks.len() - 1], line_no)?;
+                let mut consumed = 1;
+                let body = self.parse_screen_block(lines, line.indent, &mut consumed)?;
+                Ok((
+                    ScreenStmt::For {
+                        var,
+                        iterable,
+                        body,
+                    },
+                    consumed,
+                ))
+            }
+            Token::Ident(kw) => match kw.as_str() {
+                "box" => {
+                    let (x, y, w, h, color) = self.screen_rect_attrs(toks, 1, line_no)?;
+                    Ok((
+                        ScreenStmt::Box {
+                            x,
+                            y,
+                            w,
+                            h,
+                            color,
+                        },
+                        1,
+                    ))
+                }
+                "text" => {
+                    let (text, used) = parse_expr_with_len(&toks[1..], line_no)?;
+                    let mut size = None;
+                    let mut color = None;
+                    let mut x = None;
+                    let mut y = None;
+                    for (k, vt) in kv_pairs(toks, 1 + used, line_no)? {
+                        match k.as_str() {
+                            "x" => x = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "y" => y = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "size" => size = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "color" => color = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            _ => {
+                                return Err(err(line_no, format!("unknown text property `{k}`")))
+                            }
+                        }
+                    }
+                    let (Some(x), Some(y)) = (x, y) else {
+                        return Err(err(line_no, "text requires x= and y="));
+                    };
+                    Ok((
+                        ScreenStmt::Text {
+                            text,
+                            x,
+                            y,
+                            size,
+                            color,
+                        },
+                        1,
+                    ))
+                }
+                "image" => {
+                    let (image, used) = parse_expr_with_len(&toks[1..], line_no)?;
+                    let mut x = None;
+                    let mut y = None;
+                    let mut w = None;
+                    let mut h = None;
+                    let mut alpha = None;
+                    for (k, vt) in kv_pairs(toks, 1 + used, line_no)? {
+                        match k.as_str() {
+                            "x" => x = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "y" => y = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "w" => w = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "h" => h = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "alpha" => alpha = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            _ => {
+                                return Err(err(line_no, format!("unknown image property `{k}`")))
+                            }
+                        }
+                    }
+                    let (Some(x), Some(y)) = (x, y) else {
+                        return Err(err(line_no, "image requires x= and y="));
+                    };
+                    Ok((
+                        ScreenStmt::Image {
+                            image,
+                            x,
+                            y,
+                            w,
+                            h,
+                            alpha,
+                        },
+                        1,
+                    ))
+                }
+                "button" => {
+                    // `button <label> x=<e> y=<e> [w=] [h=] [color=]:`
+                    // followed by an indented action block.
+                    let (label, used) = parse_expr_with_len(&toks[1..], line_no)?;
+                    let rest_start = 1 + used;
+                    // Attrs live before the trailing colon.
+                    let end = toks
+                        .iter()
+                        .position(|t| matches!(t.token, Token::Colon))
+                        .unwrap_or(toks.len());
+                    let mut x = None;
+                    let mut y = None;
+                    let mut w = None;
+                    let mut h = None;
+                    let mut color = None;
+                    for (k, vt) in kv_pairs(&toks[rest_start..end], 0, line_no)? {
+                        match k.as_str() {
+                            "x" => x = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "y" => y = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "w" => w = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "h" => h = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "color" => color = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            _ => {
+                                return Err(err(
+                                    line_no,
+                                    format!("unknown button property `{k}`"),
+                                ))
+                            }
+                        }
+                    }
+                    let (Some(x), Some(y)) = (x, y) else {
+                        return Err(err(line_no, "button requires x= and y="));
+                    };
+                    if end >= toks.len() {
+                        return Err(err(line_no, "button requires `:` + action block"));
+                    }
+                    let mut consumed = 1;
+                    let actions =
+                        self.parse_button_actions(lines, line.indent, &mut consumed)?;
+                    Ok((
+                        ScreenStmt::Button {
+                            label,
+                            x,
+                            y,
+                            w,
+                            h,
+                            color,
+                            actions,
+                        },
+                        consumed,
+                    ))
+                }
+                _ => Err(err(line_no, format!("unknown screen statement `{kw}`"))),
+            },
+            _ => Err(err(line_no, "expected a screen statement")),
+        }
+    }
+
+    /// Shared `x= y= w= h= [color=]` attrs for `box`.
+    fn screen_rect_attrs(
+        &self,
+        toks: &[Spanned],
+        start: usize,
+        line_no: usize,
+    ) -> Result<(Expr, Expr, Expr, Expr, Option<Expr>), ParseError> {
+        let mut x = None;
+        let mut y = None;
+        let mut w = None;
+        let mut h = None;
+        let mut color = None;
+        for (k, vt) in kv_pairs(toks, start, line_no)? {
+            match k.as_str() {
+                "x" => x = Some(self.parse_expr_tokens(&vt, line_no)?),
+                "y" => y = Some(self.parse_expr_tokens(&vt, line_no)?),
+                "w" => w = Some(self.parse_expr_tokens(&vt, line_no)?),
+                "h" => h = Some(self.parse_expr_tokens(&vt, line_no)?),
+                "color" => color = Some(self.parse_expr_tokens(&vt, line_no)?),
+                _ => return Err(err(line_no, format!("unknown rect property `{k}`"))),
+            }
+        }
+        match (x, y, w, h) {
+            (Some(x), Some(y), Some(w), Some(h)) => Ok((x, y, w, h, color)),
+            _ => Err(err(line_no, "requires x=, y=, w= and h=")),
+        }
+    }
+
+    /// Parse the indented action block of a `button:`.
+    fn parse_button_actions(
+        &self,
+        lines: &[Line],
+        parent_indent: usize,
+        consumed: &mut usize,
+    ) -> Result<Vec<ButtonAction>, ParseError> {
+        let mut out = Vec::new();
+        while *consumed < lines.len() {
+            let line = &lines[*consumed];
+            if line.tokens.is_empty() {
+                *consumed += 1;
+                continue;
+            }
+            if line.indent <= parent_indent {
+                break;
+            }
+            let toks = &line.tokens;
+            let line_no = line.line_no;
+            let action = match &toks[0].token {
+                Token::Jump => {
+                    ButtonAction::Jump(self.parse_expr_tokens(&toks[1..], line_no)?)
+                }
+                Token::Set => {
+                    let name = expect_ident(&toks[1], line_no, "variable name")?;
+                    expect_token(&toks[2], Token::Assign, line_no, "=")?;
+                    ButtonAction::Set {
+                        name,
+                        value: self.parse_expr_tokens(&toks[3..], line_no)?,
+                    }
+                }
+                Token::Return => ButtonAction::Return(if toks.len() > 1 {
+                    Some(self.parse_expr_tokens(&toks[1..], line_no)?)
+                } else {
+                    None
+                }),
+                Token::Show => {
+                    match toks.get(1).map(|t| &t.token) {
+                        Some(Token::Ident(s)) if s == "screen" => {}
+                        _ => return Err(err(line_no, "expected `show screen <name>`")),
+                    }
+                    ButtonAction::ShowScreen(self.parse_expr_tokens(&toks[2..], line_no)?)
+                }
+                Token::Hide => {
+                    match toks.get(1).map(|t| &t.token) {
+                        Some(Token::Ident(s)) if s == "screen" => {}
+                        _ => return Err(err(line_no, "expected `hide screen <name>`")),
+                    }
+                    ButtonAction::HideScreen(self.parse_expr_tokens(&toks[2..], line_no)?)
+                }
+                t => {
+                    return Err(err(
+                        line_no,
+                        format!("unsupported button action {t:?}"),
+                    ))
+                }
+            };
+            out.push(action);
+            *consumed += 1;
+        }
+        if out.is_empty() {
+            return Err(err(
+                lines.first().map(|l| l.line_no).unwrap_or(0),
+                "button requires at least one action",
+            ));
+        }
+        Ok(out)
     }
 
     fn parse_shake_stmt(

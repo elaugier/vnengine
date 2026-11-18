@@ -6,6 +6,8 @@
 define e = Character("Eileen", color = "#ff4040")
 define r = Character("Ren", color = "#4080ff")
 define n = Character("Narrator", color = "#cccccc")
+# NVL narrator: `kind="nvl"` renders lines full-window.
+define nv = Character(None, kind="nvl")
 
 # Default variables (only set if not already restored from a save)
 default eileen_affection = 0
@@ -47,6 +49,21 @@ image duo:
     "eileen happy" offset=(-0.18, 0.0) zoom=0.9
     "ren smile" offset=(0.18, 0.0) zoom=0.9 alpha=0.95
 
+# Declarative screens (Phase 3): resolved UI nodes shown over the game.
+screen hud:
+    box x=0.0 y=0.0 w=1.0 h=0.06 color="#000000"
+    text "Affection: [eileen_affection]" x=0.02 y=0.015 size=18 color="#ffcc00"
+    button "Wave" x=0.88 y=0.008 w=0.1 h=0.045:
+        set waved = True
+
+screen greet:
+    box x=0.3 y=0.3 w=0.4 h=0.4 color="#101030"
+    text "How do you greet her?" x=0.35 y=0.36 size=26 color="#ffffff"
+    button "Wave hello" x=0.35 y=0.46 w=0.3 h=0.06:
+        return "wave"
+    button "Bow politely" x=0.35 y=0.56 w=0.3 h=0.06:
+        return "bow"
+
 label start:
     scene bg school with dissolve 1.5
     play music "bgm_school.ogg" fade 2.0
@@ -65,6 +82,16 @@ label start:
     play sfx "sfx_footstep.ogg" volume 0.8
     n "She bounced on her heels, her smile bright despite the wait."
     $ met_eileen = True
+
+    # Declarative screens: an ambient HUD plus a blocking call screen.
+    $ waved = False
+    show screen hud
+    call screen greet set greeting
+    if greeting == "bow":
+        $ eileen_affection += 1
+        e "Oh, so formal! I like that."
+    else:
+        e "Hey! Right back at you."
 
     # Demonstrate rich text and compound assignment
     $ score = 0
@@ -123,6 +150,22 @@ label talk:
     n "Flip a coin... [lucky]!"
     $ doubled = double_it(21)
     n "double_it(21) = [doubled]. Neat, right?"
+
+    # input / confirm: text entry and a yes/no prompt bound to vars.
+    input player_name "What's your name?"
+    confirm sure "Really, [player_name]?"
+    if not sure:
+        $ player_name = "Stranger"
+    e "Nice to meet you, [player_name]!"
+
+    # NVL mode: full-window narrator lines, then a cleared page.
+    nv "Later, I would remember this afternoon in fragments."
+    nv "The gold light. Her voice. The weight of a name spoken aloud."
+    nvl clear
+    window hide
+    scene bg school with dissolve 1.0
+    window show
+    n "The afternoon wore on."
 
     menu set mood:
         "Let's go to the library.":

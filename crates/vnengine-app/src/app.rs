@@ -53,6 +53,11 @@ pub enum Screen {
         /// What to do if the user confirms.
         action: ConfirmAction,
     },
+    /// Script `input` prompt: free-text entry bound to a variable.
+    Input {
+        prompt: Option<String>,
+        buffer: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -68,6 +73,8 @@ pub enum ConfirmAction {
     ToTitle,
     /// Quit the game.
     Quit,
+    /// Answer a script `confirm` prompt (`resume_confirm`).
+    Script,
 }
 
 /// A blocking command currently being displayed (and waiting for input).
@@ -380,6 +387,33 @@ impl App {
                     prompt: prompt.map(|p| self.tr(&p)),
                     choices: choices.iter().map(|c| self.tr(c)).collect(),
                     hovered: 0,
+                };
+                true
+            }
+            RuntimeEvent::Screen { .. } => {
+                // The inst is already in `runtime.screens` — the
+                // dialogue state renders it; clicks route through
+                // `resume_screen` while `is_on_screen` holds.
+                self.screen = Screen::Dialogue;
+                self.blocking = None;
+                true
+            }
+            RuntimeEvent::Input { prompt } => {
+                self.blocking = None;
+                self.screen = Screen::Input {
+                    prompt: prompt.map(|p| self.tr(&p)),
+                    buffer: String::new(),
+                };
+                true
+            }
+            RuntimeEvent::Confirm { message } => {
+                self.blocking = None;
+                self.screen = Screen::Confirm {
+                    message: message
+                        .map(|m| self.tr(&m))
+                        .unwrap_or_else(|| "Are you sure?".to_string()),
+                    selected: 0,
+                    action: ConfirmAction::Script,
                 };
                 true
             }
@@ -901,6 +935,11 @@ impl App {
                 if selected == 0 {
                     // Yes
                     self.execute_confirm_action(&action);
+                } else if action == ConfirmAction::Script {
+                    // "No" is a real answer for script `confirm`.
+                    self.runtime.resume_confirm(false);
+                    self.screen = Screen::Dialogue;
+                    self.step_vm();
                 } else {
                     // No — just close the dialog
                     self.screen = Screen::Dialogue;
@@ -908,7 +947,9 @@ impl App {
                 return;
             }
             if self.input.pressed(Action::Cancel) {
-                self.screen = Screen::Dialogue;
+                if action != ConfirmAction::Script {
+                    self.screen = Screen::Dialogue;
+                }
                 return;
             }
             // Check mouse clicks on Yes/No buttons.
@@ -926,6 +967,10 @@ impl App {
                         return;
                     }
                     if mx >= no_x && mx < no_x + btn_w {
+                        if action == ConfirmAction::Script {
+                            self.runtime.resume_confirm(false);
+                            self.step_vm();
+                        }
                         self.screen = Screen::Dialogue;
                         return;
                     }
@@ -973,7 +1018,36 @@ impl App {
                 }
                 self.screen = Screen::Title { selected: sel };
             }
+            Screen::Input { prompt, buffer } => {
+                let mut buffer = buffer.clone();
+                let prompt = prompt.clone();
+                for c in self.input.typed() {
+                    buffer.push(*c);
+                }
+                // Backspace deletes (Escape shares Action::Cancel — the
+                // script input has no cancel, matching Ren'Py).
+                if self.input.pressed(Action::Cancel) {
+                    buffer.pop();
+                }
+                if self.input.pressed(Action::Advance) {
+                    self.runtime.resume_input(buffer);
+                    self.screen = Screen::Dialogue;
+                    self.step_vm();
+                    return;
+                }
+                self.screen = Screen::Input { prompt, buffer };
+            }
             Screen::Dialogue => {
+                // Screen buttons (`show screen`/`call screen`) take
+                // clicks before the advance path consumes them.
+                if self.check_screen_click() {
+                    return;
+                }
+                // A pending `call screen` blocks advance — only its
+                // buttons continue the script.
+                if self.runtime.is_on_screen() {
+                    return;
+                }
                 // Quick menu hotkeys.
                 if self.input.pressed(Action::Save) {
                     self.screen = Screen::SaveLoad {
@@ -1395,6 +1469,12 @@ impl App {
                 self.runtime.vm.state.finished = true;
                 self.screen = Screen::End;
             }
+            ConfirmAction::Script => {
+                // "Yes" answer to a script `confirm` prompt.
+                self.runtime.resume_confirm(true);
+                self.screen = Screen::Dialogue;
+                self.step_vm();
+            }
         }
     }
 
@@ -1444,6 +1524,127 @@ impl App {
         None
     }
 
+    /// Hit-test script screen buttons (`show screen`/`call screen`)
+    /// against this frame's clicks. Returns true if a click was
+    /// consumed by a screen button.
+    fn check_screen_click(&mut self) -> bool {
+        if self.runtime.screens.is_empty() || self.input.clicks().is_empty() {
+            return false;
+        }
+        let (w, h) = (self.window_size.0 as f32, self.window_size.1 as f32);
+        for click in self.input.clicks() {
+            // Topmost screen is last in draw order — iterate in reverse.
+            for si in (0..self.runtime.screens.len()).rev() {
+                let inst = self.runtime.screens[si].clone();
+                let is_pending = self
+                    .runtime
+                    .vm
+                    .state
+                    .pending_screen
+                    .as_ref()
+                    .map(|p| p.inst.name == inst.name)
+                    .unwrap_or(false);
+                let clickables = inst.clickables();
+                for (ci, &ni) in clickables.iter().enumerate().rev() {
+                    let node = &inst.nodes[ni];
+                    let (x, y, bw, bh) = (
+                        node.rect[0] * w,
+                        node.rect[1] * h,
+                        node.rect[2] * w,
+                        node.rect[3] * h,
+                    );
+                    if click.x >= x && click.x < x + bw && click.y >= y && click.y < y + bh
+                    {
+                        if is_pending {
+                            self.runtime.resume_screen(ci);
+                            if !self.runtime.is_on_screen() {
+                                self.screen = Screen::Dialogue;
+                                self.step_vm();
+                            }
+                        } else if self.runtime.screen_action(si, ni) {
+                            // A `jump` action — resume script execution.
+                            self.step_vm();
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Convert the runtime's shown `ScreenInst`s into draw data —
+    /// `UiNode.rect` is normalized (0..1); text/images take pixels.
+    fn push_screen_nodes(&self, ui: &mut UiDraw, w: f32, h: f32) {
+        use vnengine_core::screen::UiNodeKind;
+        for inst in &self.runtime.screens {
+            for node in &inst.nodes {
+                let (x, y, bw, bh) = (
+                    node.rect[0] * w,
+                    node.rect[1] * h,
+                    node.rect[2] * w,
+                    node.rect[3] * h,
+                );
+                match node.kind {
+                    UiNodeKind::Box | UiNodeKind::Button => {
+                        ui.boxes.push(UiBox {
+                            x: node.rect[0],
+                            y: node.rect[1],
+                            w: node.rect[2],
+                            h: node.rect[3],
+                            color: node.color,
+                        });
+                        if node.kind == UiNodeKind::Button {
+                            if let Some(text) = &node.text {
+                                ui.text.push(UiText {
+                                    text: text.clone(),
+                                    left: x + 10.0,
+                                    top: y + (bh - node.font_size).max(0.0) * 0.5,
+                                    font_size: node.font_size,
+                                    color: [1.0, 1.0, 1.0],
+                                    bounds: None,
+                                    rich: node.rich,
+                                });
+                            }
+                        }
+                    }
+                    UiNodeKind::Text => {
+                        if let Some(text) = &node.text {
+                            ui.text.push(UiText {
+                                text: text.clone(),
+                                left: x,
+                                top: y,
+                                font_size: node.font_size,
+                                color: [
+                                    node.color[0],
+                                    node.color[1],
+                                    node.color[2],
+                                ],
+                                bounds: None,
+                                rich: node.rich,
+                            });
+                        }
+                    }
+                    UiNodeKind::Image => {
+                        if let Some(path) = &node.image {
+                            ui.images.push(vnengine_render::renderer::UiImage {
+                                path: path.clone(),
+                                left: x,
+                                top: y,
+                                size: if bw > 0.0 && bh > 0.0 {
+                                    Some((bw, bh))
+                                } else {
+                                    None
+                                },
+                                opacity: node.color[3],
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Build the UI draw data for this frame.
     fn build_ui(&mut self) -> UiDraw {
         let mut ui = UiDraw::empty();
@@ -1451,7 +1652,78 @@ impl App {
 
         match &self.screen {
             Screen::Dialogue => {
-                if let Some(b) = &self.blocking {
+                let nvl = matches!(
+                    self.blocking.as_ref().map(|b| &b.command),
+                    Some(Command::Say { nvl: true, .. })
+                );
+                if nvl {
+                    // NVL mode: full-window text — the accumulated page
+                    // (`history[nvl_start..]`) plus the current line.
+                    ui.boxes.push(UiBox {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 1.0,
+                        h: 1.0,
+                        color: [0.0, 0.0, 0.0, 0.55],
+                    });
+                    let mut top = h * 0.08;
+                    for entry in &self.runtime.history[self.runtime.nvl_start.min(self.runtime.history.len())..]
+                    {
+                        let mut line = String::new();
+                        if let Some(sp) = &entry.speaker {
+                            line.push_str(&self.tr(sp));
+                            line.push_str(" — ");
+                        }
+                        line.push_str(&self.tr(&entry.text));
+                        ui.text.push(UiText {
+                            text: line,
+                            left: w * 0.08,
+                            top,
+                            font_size: 26.0,
+                            color: [1.0, 1.0, 1.0],
+                            bounds: None,
+                            rich: true,
+                        });
+                        top += 44.0;
+                    }
+                    if let Some(b) = &self.blocking {
+                        let visible_segs =
+                            vnengine_render::richtext::take_visible_chars(&b.text, b.chars_shown);
+                        let visible: String =
+                            visible_segs.iter().map(|s| s.text.as_str()).collect();
+                        let mut line = String::new();
+                        if let Some(sp) = &b.speaker {
+                            line.push_str(sp);
+                            line.push_str(" — ");
+                        }
+                        line.push_str(&visible);
+                        ui.text.push(UiText {
+                            text: line,
+                            left: w * 0.08,
+                            top,
+                            font_size: 26.0,
+                            color: [1.0, 1.0, 0.9],
+                            bounds: None,
+                            rich: true,
+                        });
+                    }
+                } else if let Some(b) = &self.blocking {
+                    if self.runtime.window_mode == "hide" {
+                        // `window hide`: text renders without the box.
+                        let visible_segs =
+                            vnengine_render::richtext::take_visible_chars(&b.text, b.chars_shown);
+                        let visible_text: String =
+                            visible_segs.iter().map(|s| s.text.as_str()).collect();
+                        ui.text.push(UiText {
+                            text: visible_text,
+                            left: w * 0.06,
+                            top: h * 0.85,
+                            font_size: 28.0,
+                            color: [1.0, 1.0, 1.0],
+                            bounds: None,
+                            rich: true,
+                        });
+                    } else {
                     // Dialogue box background.
                     let box_h = 0.25;
                     let box_y = 1.0 - box_h - 0.02;
@@ -1511,6 +1783,7 @@ impl App {
                         bounds: None,
                         rich: true,
                     });
+                    }
                 }
 
                 // Quick menu buttons (bottom-right).
@@ -2014,6 +2287,43 @@ impl App {
                     rich: false,
                 });
             }
+            Screen::Input { prompt, buffer } => {
+                // Script `input` prompt: dim + prompt + entry box.
+                ui.boxes.push(UiBox {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                    color: [0.0, 0.0, 0.0, 0.5],
+                });
+                if let Some(p) = prompt {
+                    ui.text.push(UiText {
+                        text: p.clone(),
+                        left: w * 0.2,
+                        top: h * 0.32,
+                        font_size: 26.0,
+                        color: [1.0, 1.0, 1.0],
+                        bounds: None,
+                        rich: true,
+                    });
+                }
+                ui.boxes.push(UiBox {
+                    x: 0.2,
+                    y: 0.42,
+                    w: 0.6,
+                    h: 0.07,
+                    color: [0.1, 0.1, 0.2, 0.9],
+                });
+                ui.text.push(UiText {
+                    text: format!("{buffer}▌"),
+                    left: w * 0.22,
+                    top: h * 0.435,
+                    font_size: 24.0,
+                    color: [1.0, 1.0, 1.0],
+                    bounds: None,
+                    rich: false,
+                });
+            }
             Screen::End => {
                 ui.text.push(UiText {
                     text: "The End".to_string(),
@@ -2034,6 +2344,19 @@ impl App {
                     rich: false,
                 });
             }
+        }
+
+        // Declarative script screens (`show screen`/`call screen`)
+        // render on top of gameplay UI — not over system screens
+        // like save/load or settings.
+        if matches!(
+            self.screen,
+            Screen::Dialogue
+                | Screen::Menu { .. }
+                | Screen::Input { .. }
+                | Screen::Confirm { .. }
+        ) {
+            self.push_screen_nodes(&mut ui, w, h);
         }
 
         if self.debug_overlay {
@@ -2149,6 +2472,9 @@ impl App {
             journal: snap.journal,
             plugin_kv: snap.plugin_kv,
             music_layers: snap.music_layers,
+            screens: snap.screens,
+            nvl_start: snap.nvl_start,
+            window_mode: snap.window_mode,
             thumbnail,
             saved_at: chrono::Utc::now().timestamp(),
         };
@@ -2188,12 +2514,20 @@ impl App {
                 journal: state.journal,
                 plugin_kv: state.plugin_kv,
                 music_layers: state.music_layers,
+                screens: state.screens,
+                nvl_start: state.nvl_start,
+                window_mode: state.window_mode,
             },
         );
         self.blocking = None;
         self.transition = None;
-        if self.runtime.is_on_menu() {
-            // The save was taken on a menu: re-display it.
+        let pending = self.runtime.is_on_menu()
+            || self.runtime.is_on_screen()
+            || self.runtime.vm.state.pending_input.is_some()
+            || self.runtime.vm.state.pending_confirm.is_some();
+        if pending {
+            // The save was taken on a menu/screen/input/confirm:
+            // re-display it.
             let event = self.runtime.resume_display();
             self.dispatch(event);
         } else if let Some(cmd) = state.blocking {
@@ -2253,6 +2587,11 @@ impl winit::application::ApplicationHandler for AppHandler {
                     match state {
                         ElementState::Pressed => app.input.key_press(key),
                         ElementState::Released => app.input.key_release(key),
+                    }
+                }
+                if event.state == ElementState::Pressed {
+                    if let Some(text) = &event.text {
+                        app.input.text_input(text.as_str());
                     }
                 }
             }

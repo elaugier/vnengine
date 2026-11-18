@@ -19,6 +19,9 @@ pub struct Script {
     /// Composite image definitions (`image name:`).
     #[serde(default)]
     pub images: Vec<ImageDef>,
+    /// Declarative screen definitions (`screen name:`).
+    #[serde(default)]
+    pub screens: Vec<ScreenDef>,
 }
 
 impl Script {
@@ -31,6 +34,83 @@ impl Script {
     pub fn find_image(&self, name: &str) -> Option<&ImageDef> {
         self.images.iter().find(|i| i.name == name)
     }
+
+    /// Find a screen definition by name.
+    pub fn find_screen(&self, name: &str) -> Option<&ScreenDef> {
+        self.screens.iter().find(|s| s.name == name)
+    }
+}
+
+/// A declarative screen: `screen <name>: <body>`. The body compiles to
+/// a `vnengine_core::screen::ScreenInst` when shown/called.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenDef {
+    pub name: String,
+    pub body: Vec<ScreenStmt>,
+}
+
+/// A statement inside a `screen` block. `if`/`for` are expanded at
+/// resolution time (when the screen is shown/called).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ScreenStmt {
+    /// `box x=<e> y=<e> w=<e> h=<e> [color=(r,g,b[,a])|"#hex"]`
+    Box {
+        x: Expr,
+        y: Expr,
+        w: Expr,
+        h: Expr,
+        color: Option<Expr>,
+    },
+    /// `text <expr> x=<e> y=<e> [size=<e>] [color=<e>]`
+    Text {
+        text: Expr,
+        x: Expr,
+        y: Expr,
+        size: Option<Expr>,
+        color: Option<Expr>,
+    },
+    /// `image <expr> x=<e> y=<e> [w=<e>] [h=<e>] [alpha=<e>]`
+    Image {
+        image: Expr,
+        x: Expr,
+        y: Expr,
+        w: Option<Expr>,
+        h: Option<Expr>,
+        alpha: Option<Expr>,
+    },
+    /// `button <label-expr> x=<e> y=<e> [w=<e>] [h=<e>]: <actions>`
+    Button {
+        label: Expr,
+        x: Expr,
+        y: Expr,
+        w: Option<Expr>,
+        h: Option<Expr>,
+        color: Option<Expr>,
+        actions: Vec<ButtonAction>,
+    },
+    /// `if <expr>:` — children emit only when truthy.
+    If { cond: Expr, body: Vec<ScreenStmt> },
+    /// `for <var> in <expr>:` — children emit once per item.
+    For {
+        var: String,
+        iterable: Expr,
+        body: Vec<ScreenStmt>,
+    },
+}
+
+/// An action inside a `button` block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ButtonAction {
+    /// `jump <expr>` — abandon the stack, jump to a label.
+    Jump(Expr),
+    /// `set <var> = <expr>` — set a variable, screen stays up.
+    Set { name: String, value: Expr },
+    /// `return [<expr>]` — end a `call screen` with a value.
+    Return(Option<Expr>),
+    /// `show screen <expr>` — show another screen, stays up.
+    ShowScreen(Expr),
+    /// `hide screen <expr>` — hide a screen, stays up.
+    HideScreen(Expr),
 }
 
 /// A named ATL transform: `transform <name>: <body>`
@@ -117,11 +197,20 @@ impl Script {
 /// A top-level definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Definition {
-    /// `define id = Character("Name", color=...)`
+    /// `define id = Character("Name", color=..., voice=..., image=..., kind=...)`
     Character {
         id: String,
         name: String,
         color: Option<[f32; 3]>,
+        /// Default voice track played with each line (`voice="x.ogg"`).
+        #[serde(default)]
+        voice: Option<Expr>,
+        /// Default side image shown next to the dialogue box.
+        #[serde(default)]
+        image: Option<Expr>,
+        /// Speaker kind — `"nvl"` renders lines full-screen (NVL mode).
+        #[serde(default)]
+        kind: Option<Expr>,
     },
     /// `define id = <value>`
     Constant { id: String, value: Expr },
@@ -295,6 +384,32 @@ pub enum Stmt {
     Shake { intensity: Expr, duration: Expr },
     /// `plugin <name> [<expr>, ...]` — send a command to a WASM plugin.
     Plugin { name: String, args: Vec<Expr> },
+    /// `show screen <expr>` — display a declarative screen (ambient).
+    ShowScreen { screen: Expr },
+    /// `hide screen <expr>` — remove a declarative screen.
+    HideScreen { screen: Expr },
+    /// `call screen <expr> [set <var>]` — block until a `return` action.
+    CallScreen {
+        screen: Expr,
+        #[serde(default)]
+        set_var: Option<String>,
+    },
+    /// `input <var> [<prompt-expr>]` — block for text entry.
+    Input {
+        var: String,
+        #[serde(default)]
+        prompt: Option<Expr>,
+    },
+    /// `confirm <var> [<message-expr>]` — block for a yes/no answer.
+    Confirm {
+        var: String,
+        #[serde(default)]
+        message: Option<Expr>,
+    },
+    /// `nvl clear` — clear the NVL page.
+    NvlClear,
+    /// `window show|hide|auto` — control the dialogue window.
+    Window { mode: String },
     /// `end`
     End,
 }

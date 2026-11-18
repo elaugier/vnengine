@@ -885,3 +885,249 @@ label start:
     assert_eq!(rt.scene.sprites[0].layers.len(), 2);
     assert_eq!(rt.scene.sprites[0].layers[1].image, "b.png");
 }
+
+// ============ Phase 3: screens / input / confirm / nvl / window ============
+
+#[test]
+fn show_hide_screen_tracked() {
+    let mut rt = runtime(
+        r##"
+screen hud:
+    text "HP" x=0.02 y=0.02
+
+label start:
+    show screen hud
+    hide screen hud
+    "done"
+"##,
+    );
+    // show screen → Effect, screens updated.
+    loop {
+        match rt.step() {
+            RuntimeEvent::Effect(Command::ShowScreen(_)) => break,
+            RuntimeEvent::Effect(_) | RuntimeEvent::Blocking(_) => {}
+            other => panic!("expected ShowScreen effect, got {other:?}"),
+        }
+    }
+    assert_eq!(rt.screens.len(), 1);
+    assert_eq!(rt.screens[0].name, "hud");
+    loop {
+        match rt.step() {
+            RuntimeEvent::Effect(Command::HideScreen { name }) => {
+                assert_eq!(name, "hud");
+                break;
+            }
+            RuntimeEvent::Effect(_) | RuntimeEvent::Blocking(_) => {}
+            other => panic!("expected HideScreen effect, got {other:?}"),
+        }
+    }
+    assert!(rt.screens.is_empty());
+}
+
+#[test]
+fn call_screen_blocks_and_resumes() {
+    let mut rt = runtime(
+        r##"
+screen pick:
+    button "One" x=0.2 y=0.4:
+        return 1
+    button "Two" x=0.6 y=0.4:
+        return 2
+
+label start:
+    call screen pick set chosen
+    "picked [chosen]"
+"##,
+    );
+    match next_block(&mut rt) {
+        RuntimeEvent::Screen { inst } => {
+            assert_eq!(inst.name, "pick");
+            assert_eq!(inst.clickables().len(), 2);
+        }
+        other => panic!("expected Screen, got {other:?}"),
+    }
+    // The pending screen also shows in `runtime.screens`.
+    assert_eq!(rt.screens.len(), 1);
+    assert!(rt.is_on_screen());
+    rt.resume_screen(1);
+    assert!(!rt.is_on_screen());
+    // Dismissed screen leaves `runtime.screens`.
+    assert!(rt.screens.is_empty());
+    assert_eq!(blocking_text(&next_block(&mut rt)), "picked 2");
+}
+
+#[test]
+fn call_screen_set_action_stays_up() {
+    let mut rt = runtime(
+        r##"
+screen counter:
+    button "Add" x=0.2 y=0.4:
+        set count = count + 1
+    button "Done" x=0.6 y=0.4:
+        return 0
+
+label start:
+    $ count = 0
+    call screen counter
+    "final [count]"
+"##,
+    );
+    match next_block(&mut rt) {
+        RuntimeEvent::Screen { .. } => {}
+        other => panic!("expected Screen, got {other:?}"),
+    }
+    rt.resume_screen(0); // "Add" — non-dismissing.
+    assert!(rt.is_on_screen());
+    rt.resume_screen(0);
+    assert!(rt.is_on_screen());
+    rt.resume_screen(1); // "Done" — dismisses.
+    assert!(!rt.is_on_screen());
+    assert_eq!(blocking_text(&next_block(&mut rt)), "final 2");
+}
+
+#[test]
+fn input_and_confirm_bind_and_replay() {
+    let src = r##"
+label start:
+    input name "Name?"
+    confirm ok "Sure?"
+    "got [name] [ok]"
+    end
+"##;
+    let mut rt = runtime(src);
+    match next_block(&mut rt) {
+        RuntimeEvent::Input { prompt } => {
+            assert_eq!(prompt.as_deref(), Some("Name?"))
+        }
+        other => panic!("expected Input, got {other:?}"),
+    }
+    rt.resume_input("Bob".to_string());
+    match next_block(&mut rt) {
+        RuntimeEvent::Confirm { message } => {
+            assert_eq!(message.as_deref(), Some("Sure?"))
+        }
+        other => panic!("expected Confirm, got {other:?}"),
+    }
+    rt.resume_confirm(true);
+    assert_eq!(blocking_text(&next_block(&mut rt)), "got Bob true");
+
+    // Journal replay reproduces the same run deterministically.
+    let journal = rt.journal.clone();
+    assert_eq!(journal.len(), 2);
+    let script = Parser::parse(src).unwrap();
+    let mut rt2 = Runtime::replay(script, &journal).unwrap();
+    // Same variable state → the same line was produced.
+    assert_eq!(
+        rt2.history.last().map(|h| h.text.as_str()),
+        Some("got Bob true")
+    );
+}
+
+#[test]
+fn nvl_clear_advances_page_start() {
+    let mut rt = runtime(
+        r##"
+define n = Character("N", kind="nvl")
+
+label start:
+    n "line one"
+    nvl clear
+    n "line two"
+"##,
+    );
+    assert_eq!(blocking_text(&next_block(&mut rt)), "line one");
+    assert_eq!(rt.nvl_start, 0);
+    assert_eq!(blocking_text(&next_block(&mut rt)), "line two");
+    assert_eq!(rt.nvl_start, 1);
+    // The NVL page now only contains "line two".
+    assert_eq!(rt.history[rt.nvl_start..].len(), 1);
+}
+
+#[test]
+fn window_mode_tracked() {
+    let mut rt = runtime(
+        r##"
+label start:
+    window hide
+    "hidden box"
+"##,
+    );
+    // The window command is an effect; the mode is tracked.
+    loop {
+        match rt.step() {
+            RuntimeEvent::Effect(Command::Window { mode }) => {
+                assert_eq!(mode, "hide");
+                break;
+            }
+            RuntimeEvent::Effect(_) | RuntimeEvent::Blocking(_) => {}
+            other => panic!("expected Window effect, got {other:?}"),
+        }
+    }
+    assert_eq!(rt.window_mode, "hide");
+}
+
+#[test]
+fn screens_survive_save_restore() {
+    let mut rt = runtime(
+        r##"
+screen hud:
+    text "HP" x=0.02 y=0.02
+
+label start:
+    show screen hud
+    window hide
+    nvl clear
+    "checkpoint"
+"##,
+    );
+    assert_eq!(blocking_text(&next_block(&mut rt)), "checkpoint");
+    let snap = rt.capture();
+    let script = Parser::parse(
+        r##"
+screen hud:
+    text "HP" x=0.02 y=0.02
+
+label start:
+    show screen hud
+    window hide
+    nvl clear
+    "checkpoint"
+"##,
+    )
+    .unwrap();
+    let rt2 = Runtime::restore(script, snap);
+    assert_eq!(rt2.screens.len(), 1);
+    assert_eq!(rt2.screens[0].name, "hud");
+    assert_eq!(rt2.window_mode, "hide");
+    assert_eq!(rt2.nvl_start, rt.nvl_start);
+}
+
+#[test]
+fn screen_jump_action_restarts_at_label() {
+    let mut rt = runtime(
+        r##"
+screen nav:
+    button "Go" x=0.4 y=0.5:
+        jump "target"
+
+label start:
+    show screen nav
+    "unreached"
+
+label target:
+    "arrived"
+"##,
+    );
+    // show screen is an effect; the say blocks next.
+    loop {
+        match rt.step() {
+            RuntimeEvent::Effect(_) => {}
+            ev => break,
+        }
+    }
+    assert_eq!(rt.screens.len(), 1);
+    // Click the button: jump resets execution to `target`.
+    let clicked = rt.screen_action(0, 0);
+    assert!(clicked);
+    assert_eq!(blocking_text(&next_block(&mut rt)), "arrived");
+}
