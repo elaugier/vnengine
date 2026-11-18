@@ -493,6 +493,16 @@ impl App {
                     .play_voice(&*self.assets, &self.config.voice_dir, &track);
             }
             Command::StopVoice => self.audio.stop_voice(),
+            Command::StopAll { fade } => self.audio.stop_all(fade),
+            // PlayChannel/QueueChannel/StopChannel/VolumeChannel/
+            // FilterChannel are handled by `resync_channels`, which
+            // diffs `runtime.channels` every frame — also covering
+            // queue advance, load and rollback.
+            Command::PlayChannel { .. }
+            | Command::QueueChannel { .. }
+            | Command::StopChannel { .. }
+            | Command::VolumeChannel { .. }
+            | Command::FilterChannel { .. } => {}
             Command::PlayTransition(transition) => {
                 let duration = transition.default_duration();
                 self.transition = Some(ActiveTransition {
@@ -735,6 +745,21 @@ impl App {
         // state — this is also what restores music after load/rollback.
         self.resync_music();
         self.resync_layers();
+
+        // Named audio channels: diff `runtime.channels` into the audio
+        // engine (play/stop/volume/filter), then advance queues of
+        // channels whose current track has finished.
+        let finished = self.audio.resync_channels(
+            &*self.assets,
+            &self.config.audio_dir,
+            &self.runtime.channels,
+        );
+        for name in finished {
+            self.runtime.channel_advance(&name);
+        }
+
+        // Voice ducking on the music category (voice_duck setting).
+        self.audio.update();
         self.poll_hot_reload(dt);
 
         // Auto-save every 60 seconds.
@@ -2475,6 +2500,7 @@ impl App {
             screens: snap.screens,
             nvl_start: snap.nvl_start,
             window_mode: snap.window_mode,
+            channels: snap.channels,
             thumbnail,
             saved_at: chrono::Utc::now().timestamp(),
         };
@@ -2517,6 +2543,7 @@ impl App {
                 screens: state.screens,
                 nvl_start: state.nvl_start,
                 window_mode: state.window_mode,
+                channels: state.channels,
             },
         );
         self.blocking = None;

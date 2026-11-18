@@ -1131,3 +1131,111 @@ label target:
     assert!(clicked);
     assert_eq!(blocking_text(&next_block(&mut rt)), "arrived");
 }
+
+// ---------- Phase 4: named audio channels ----------
+
+#[test]
+fn channel_play_queue_and_advance() {
+    let mut rt = runtime(
+        r##"
+label start:
+    play channel amb "wind.ogg" loop
+    queue channel amb "rain.ogg"
+    queue channel amb "storm.ogg"
+    "hold"
+"##,
+    );
+    assert_eq!(blocking_text(&next_block(&mut rt)), "hold");
+    let st = &rt.channels["amb"];
+    assert_eq!(st.current.as_ref().unwrap().track, "wind.ogg");
+    assert!(st.current.as_ref().unwrap().loop_);
+    assert_eq!(st.queue.len(), 2);
+
+    // Host reports end of a non-looping track — queue advances.
+    rt.channels.get_mut("amb").unwrap().current.as_mut().unwrap().loop_ = false;
+    let next = rt.channel_advance("amb").unwrap();
+    assert_eq!(next.track, "rain.ogg");
+    assert_eq!(rt.channels["amb"].current.as_ref().unwrap().track, "rain.ogg");
+    assert_eq!(rt.channels["amb"].queue.len(), 1);
+
+    rt.channel_advance("amb");
+    assert_eq!(rt.channels["amb"].current.as_ref().unwrap().track, "storm.ogg");
+    // Last track finished, queue empty → channel state released.
+    assert!(rt.channel_advance("amb").is_none());
+    assert!(!rt.channels.contains_key("amb"));
+}
+
+#[test]
+fn channel_stop_volume_filter_stopall() {
+    let mut rt = runtime(
+        r##"
+label start:
+    play channel amb "wind.ogg"
+    volume channel amb 0.7
+    filter channel amb lowpass cutoff=800 mix=0.9
+    play channel aux "beep.ogg"
+    stop channel aux
+    "hold"
+"##,
+    );
+    assert_eq!(blocking_text(&next_block(&mut rt)), "hold");
+    let st = &rt.channels["amb"];
+    assert!((st.volume - 0.7).abs() < 1e-6);
+    assert!(matches!(st.filter, Some(vnengine_core::command::ChannelFilter::Filter { .. })));
+    assert!(!rt.channels.contains_key("aux"));
+
+    let mut rt = runtime(
+        r##"
+label start:
+    play channel amb "wind.ogg"
+    play channel aux "beep.ogg"
+    play music "bgm.ogg"
+    stop all
+    "hold"
+"##,
+    );
+    assert_eq!(blocking_text(&next_block(&mut rt)), "hold");
+    assert!(rt.channels.is_empty());
+    assert!(rt.music.is_none());
+}
+
+#[test]
+fn channel_state_survives_save_restore() {
+    let src = r##"
+label start:
+    play channel amb "wind.ogg" loop
+    queue channel amb "rain.ogg"
+    volume channel amb 0.5
+    "checkpoint"
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut rt = Runtime::new(script.clone());
+    assert_eq!(blocking_text(&next_block(&mut rt)), "checkpoint");
+    let snap = rt.capture();
+
+    let rt2 = Runtime::restore(script, snap);
+    let st = &rt2.channels["amb"];
+    assert_eq!(st.current.as_ref().unwrap().track, "wind.ogg");
+    assert_eq!(st.queue.len(), 1);
+    assert!((st.volume - 0.5).abs() < 1e-6);
+}
+
+#[test]
+fn channel_state_survives_rollback() {
+    let mut rt = runtime(
+        r##"
+label start:
+    "first"
+    play channel amb "wind.ogg"
+    "second"
+    end
+"##,
+    );
+    assert_eq!(blocking_text(&next_block(&mut rt)), "first");
+    assert_eq!(blocking_text(&next_block(&mut rt)), "second");
+    assert!(rt.channels.contains_key("amb"));
+    let ev = rt.rollback().expect("rollback");
+    assert_eq!(blocking_text(&ev), "first");
+    // Channel was added after `first` — rollback drops it.
+    assert!(!rt.channels.contains_key("amb"));
+}

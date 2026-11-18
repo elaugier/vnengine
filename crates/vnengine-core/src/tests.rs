@@ -448,6 +448,7 @@ fn save_state_write_read_roundtrip() {
         screens: Vec::new(),
         nvl_start: 0,
         window_mode: "auto".into(),
+        channels: std::collections::BTreeMap::new(),
         thumbnail: None,
         saved_at: 1700000000,
     };
@@ -487,6 +488,7 @@ fn save_state_list_multiple_slots() {
             screens: Vec::new(),
             nvl_start: 0,
             window_mode: "auto".into(),
+            channels: std::collections::BTreeMap::new(),
             thumbnail: None,
             saved_at: 0,
         }
@@ -519,6 +521,7 @@ fn save_state_delete() {
         screens: Vec::new(),
         nvl_start: 0,
         window_mode: "auto".into(),
+        channels: std::collections::BTreeMap::new(),
         thumbnail: None,
         saved_at: 0,
     }

@@ -37,10 +37,18 @@ pub struct UserSettings {
     /// Accessibility: flatten transitions, camera moves and shakes.
     #[serde(default)]
     pub reduce_motion: bool,
+    /// Music duck level while a voice line plays (0..1 multiplier on
+    /// the music category; 1.0 disables ducking).
+    #[serde(default = "default_voice_duck")]
+    pub voice_duck: f64,
 }
 
 fn default_language() -> String {
     "en".to_string()
+}
+
+fn default_voice_duck() -> f64 {
+    0.5
 }
 
 fn default_text_scale() -> f32 {
@@ -63,6 +71,7 @@ impl Default for UserSettings {
             language: default_language(),
             text_scale: 1.0,
             reduce_motion: false,
+            voice_duck: 0.5,
         }
     }
 }

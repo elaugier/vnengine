@@ -317,6 +317,42 @@ pub enum Stmt {
     PlayVoice { track: Expr },
     /// `stop voice`
     StopVoice,
+    /// `play channel <name> <track> [volume=<e>] [fade=<e>] [loop]` —
+    /// replaces the channel's current track and clears its queue.
+    PlayChannel {
+        channel: Expr,
+        track: Expr,
+        volume: Option<Expr>,
+        fade: Option<Expr>,
+        loop_: bool,
+    },
+    /// `queue channel <name> <track> [volume=<e>] [fade=<e>] [loop]` —
+    /// appends to the channel's queue (plays immediately if idle).
+    QueueChannel {
+        channel: Expr,
+        track: Expr,
+        volume: Option<Expr>,
+        fade: Option<Expr>,
+        loop_: bool,
+    },
+    /// `stop channel <name> [fade=<e>]` — stops the channel and clears
+    /// its queue.
+    StopChannel { channel: Expr, fade: Option<Expr> },
+    /// `stop all [fade=<e>]` — stops every channel, music and voice.
+    StopAll { fade: Option<Expr> },
+    /// `volume channel <name> <e> [fade=<e>]`.
+    VolumeChannel {
+        channel: Expr,
+        volume: Expr,
+        fade: Option<Expr>,
+    },
+    /// `filter channel <name> <kind> <k=v>...` — kind is `lowpass` /
+    /// `highpass` / `bandpass` / `notch` / `reverb` / `off`.
+    FilterChannel {
+        channel: Expr,
+        kind: String,
+        params: Vec<(String, Expr)>,
+    },
     /// `$ <name> = <expr>` or `set <name> = <expr>`
     Assign { name: String, value: Expr },
     /// `$ <name> += <expr>` etc.

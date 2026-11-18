@@ -50,6 +50,10 @@ fn err(line: usize, msg: impl Into<String>) -> ParseError {
 
 /// Collect `key=<tokens>` pairs starting at `start`. A value runs until
 /// the next `ident =` pair or end of line.
+fn is_channel_stmt(toks: &[Spanned]) -> bool {
+    matches!(toks.get(1).map(|t| &t.token), Some(Token::Ident(c)) if c == "channel")
+}
+
 fn kv_pairs(
     toks: &[Spanned],
     start: usize,
@@ -698,6 +702,61 @@ impl Parser {
                         volume,
                         fade,
                         off,
+                    },
+                    1,
+                ))
+            }
+            Token::Ident(s)
+                if s == "queue" && is_channel_stmt(toks) =>
+            {
+                // `queue channel <name> <track> [volume=<e>] [fade=<e>] [loop]`
+                self.parse_channel_track_stmt(toks, line_no, true)
+            }
+            Token::Ident(s)
+                if s == "volume" && is_channel_stmt(toks) =>
+            {
+                // `volume channel <name> <e> [fade=<e>]`
+                let (channel, mut i) = self.parse_channel_name(toks, 2, line_no)?;
+                let (volume, used) = parse_expr_with_len(&toks[i..], line_no)?;
+                i += used;
+                let mut fade = None;
+                for (k, vt) in kv_pairs(toks, i, line_no)? {
+                    if k == "fade" {
+                        fade = Some(self.parse_expr_tokens(&vt, line_no)?);
+                    }
+                }
+                Ok((
+                    Stmt::VolumeChannel {
+                        channel,
+                        volume,
+                        fade,
+                    },
+                    1,
+                ))
+            }
+            Token::Ident(s)
+                if s == "filter" && is_channel_stmt(toks) =>
+            {
+                // `filter channel <name> <kind> [k=<e> ...]`
+                let (channel, i) = self.parse_channel_name(toks, 2, line_no)?;
+                let kind = match toks.get(i).map(|t| &t.token) {
+                    Some(Token::Ident(k)) | Some(Token::StringLit(k)) => k.clone(),
+                    _ => {
+                        return Err(err(
+                            line_no,
+                            "expected filter kind (lowpass|highpass|bandpass|notch|reverb|off)",
+                        ))
+                    }
+                };
+                let mut params = Vec::new();
+                for (k, vt) in kv_pairs(toks, i + 1, line_no)? {
+                    params.push((k, self.parse_expr_tokens(&vt, line_no)?));
+                }
+                Ok((
+                    Stmt::FilterChannel {
+                        channel,
+                        kind,
+                        params,
                     },
                     1,
                 ))
@@ -2194,7 +2253,11 @@ impl Parser {
     ) -> Result<(Stmt, usize), ParseError> {
         // play music <expr> [fade <s>]
         // play sfx <expr> [volume <v>]
-        let kind = expect_ident(&toks[1], line_no, "play kind (music/sfx)")?;
+        // play channel <name> <expr> [volume=<e>] [fade=<e>] [loop]
+        let kind = expect_ident(&toks[1], line_no, "play kind (music/sfx/channel)")?;
+        if kind == "channel" {
+            return self.parse_channel_track_stmt(toks, line_no, false);
+        }
         let (track, i) = self.parse_asset_expr(toks, 2, line_no)?;
         match kind.as_str() {
             "music" => {
@@ -2234,6 +2297,8 @@ impl Parser {
     ) -> Result<(Stmt, usize), ParseError> {
         // stop music [fade <s>]
         // stop voice
+        // stop channel <name> [fade=<e>]
+        // stop all [fade=<e>]
         let kind = match &toks[1].token {
             Token::Ident(s) => s.clone(),
             Token::Voice => "voice".to_string(),
@@ -2241,10 +2306,32 @@ impl Parser {
                 return Err(ParseError::Unexpected {
                     line: line_no,
                     got: format!("{other:?}"),
-                    expected: "stop kind (music/voice)".to_string(),
+                    expected: "stop kind (music/voice/channel/all)".to_string(),
                 });
             }
         };
+        match kind.as_str() {
+            "channel" => {
+                let (channel, i) = self.parse_channel_name(toks, 2, line_no)?;
+                let mut fade = None;
+                for (k, vt) in kv_pairs(toks, i, line_no)? {
+                    if k == "fade" {
+                        fade = Some(self.parse_expr_tokens(&vt, line_no)?);
+                    }
+                }
+                return Ok((Stmt::StopChannel { channel, fade }, 1));
+            }
+            "all" => {
+                let mut fade = None;
+                for (k, vt) in kv_pairs(toks, 2, line_no)? {
+                    if k == "fade" {
+                        fade = Some(self.parse_expr_tokens(&vt, line_no)?);
+                    }
+                }
+                return Ok((Stmt::StopAll { fade }, 1));
+            }
+            _ => {}
+        }
         match kind.as_str() {
             "music" => {
                 let mut fade = 0.0;
@@ -2261,6 +2348,80 @@ impl Parser {
             }
             "voice" => Ok((Stmt::StopVoice, 1)),
             _ => Err(err(line_no, format!("unknown stop kind `{kind}`"))),
+        }
+    }
+
+    /// Channel name operand: bare ident or string literal stays literal
+    /// (like label names); `[expr]` is dynamic. Returns (expr, next index).
+    fn parse_channel_name(
+        &self,
+        toks: &[Spanned],
+        start: usize,
+        line_no: usize,
+    ) -> Result<(Expr, usize), ParseError> {
+        // Channel names: bare ident or string literal stay literal
+        // (like label names); `[expr]` is dynamic.
+        match toks.get(start).map(|t| &t.token) {
+            Some(Token::Ident(n)) | Some(Token::StringLit(n)) => {
+                Ok((Expr::Str(n.clone()), start + 1))
+            }
+            Some(Token::LBracket) => {
+                let (e, used) = self.parse_bracket_expr(&toks[start..], line_no)?;
+                Ok((e, start + used))
+            }
+            _ => Err(err(line_no, "expected channel name")),
+        }
+    }
+
+    /// `play|queue channel <name> <track> [volume=<e>] [fade=<e>] [loop]`
+    fn parse_channel_track_stmt(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+        queued: bool,
+    ) -> Result<(Stmt, usize), ParseError> {
+        let (channel, i) = self.parse_channel_name(toks, 2, line_no)?;
+        let (track, i) = self.parse_asset_expr(toks, i, line_no)?;
+        // `loop` is a bare trailing flag — strip it before kv_pairs.
+        let mut end = toks.len();
+        let mut loop_ = false;
+        if matches!(toks.last().map(|t| &t.token), Some(Token::Ident(l)) if l == "loop")
+            && end > i
+        {
+            loop_ = true;
+            end -= 1;
+        }
+        let mut volume = None;
+        let mut fade = None;
+        for (k, vt) in kv_pairs(&toks[..end], i, line_no)? {
+            match k.as_str() {
+                "volume" => volume = Some(self.parse_expr_tokens(&vt, line_no)?),
+                "fade" => fade = Some(self.parse_expr_tokens(&vt, line_no)?),
+                _ => {}
+            }
+        }
+        if queued {
+            Ok((
+                Stmt::QueueChannel {
+                    channel,
+                    track,
+                    volume,
+                    fade,
+                    loop_,
+                },
+                1,
+            ))
+        } else {
+            Ok((
+                Stmt::PlayChannel {
+                    channel,
+                    track,
+                    volume,
+                    fade,
+                    loop_,
+                },
+                1,
+            ))
         }
     }
 

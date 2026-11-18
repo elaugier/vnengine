@@ -2665,3 +2665,117 @@ label start:
     assert_eq!(inst.nodes[1].text.as_deref(), Some("a"));
     assert_eq!(inst.nodes[2].text.as_deref(), Some("b"));
 }
+
+// ---------- Phase 4: named audio channels ----------
+
+#[test]
+fn parse_channel_commands() {
+    let src = r##"
+label start:
+    play channel "amb" "wind.ogg" volume=0.5 fade=1.0 loop
+    queue channel amb "rain.ogg"
+    stop channel amb fade=0.5
+    stop all fade=0.2
+    volume channel amb 0.7 fade=0.3
+    filter channel amb lowpass cutoff=800 mix=0.9
+    filter channel amb reverb feedback=0.6
+    filter channel amb off
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let b = &script.labels[0].body;
+    match &b[0] {
+        Stmt::PlayChannel { channel, volume, fade, loop_, .. } => {
+            assert!(matches!(channel, Expr::Str(n) if n == "amb"));
+            assert!(volume.is_some() && fade.is_some() && *loop_);
+        }
+        other => panic!("expected PlayChannel, got {other:?}"),
+    }
+    match &b[1] {
+        Stmt::QueueChannel { channel, track, loop_, .. } => {
+            assert!(matches!(channel, Expr::Str(n) if n == "amb"));
+            assert!(matches!(track, Expr::Str(t) if t == "rain.ogg"));
+            assert!(!*loop_);
+        }
+        other => panic!("expected QueueChannel, got {other:?}"),
+    }
+    assert!(matches!(&b[2], Stmt::StopChannel { fade: Some(_), .. }));
+    assert!(matches!(&b[3], Stmt::StopAll { fade: Some(_) }));
+    assert!(matches!(&b[4], Stmt::VolumeChannel { .. }));
+    match &b[5] {
+        Stmt::FilterChannel { kind, params, .. } => {
+            assert_eq!(kind, "lowpass");
+            assert_eq!(params.len(), 2);
+        }
+        other => panic!("expected FilterChannel, got {other:?}"),
+    }
+    assert!(matches!(&b[6], Stmt::FilterChannel { kind, .. } if kind == "reverb"));
+    assert!(matches!(&b[7], Stmt::FilterChannel { kind, .. } if kind == "off"));
+}
+
+#[test]
+fn channel_keywords_still_allow_character_names() {
+    // `queue`/`volume`/`filter` without a `channel` second token fall
+    // through to say parsing — a character may be named e.g. `volume`.
+    let src = r##"
+define volume = Character("Vol", color = "#ffffff")
+
+label start:
+    volume "I speak"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    assert!(matches!(&script.labels[0].body[0], Stmt::Say { .. }));
+}
+
+#[test]
+fn vm_channel_commands() {
+    let src = r##"
+label start:
+    play channel amb "wind.ogg" volume=0.5 fade=1.0 loop
+    queue channel amb "rain.ogg"
+    volume channel amb 0.7
+    filter channel amb lowpass cutoff=800 mix=0.9
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    match step_until_command(&mut vm) {
+        Command::PlayChannel { channel, track, volume, fade, loop_ } => {
+            assert_eq!(channel, "amb");
+            assert_eq!(track, "wind.ogg");
+            assert!((volume - 0.5).abs() < 1e-6);
+            assert!((fade - 1.0).abs() < 1e-6);
+            assert!(loop_);
+        }
+        other => panic!("expected PlayChannel, got {other:?}"),
+    }
+    match step_until_command(&mut vm) {
+        Command::QueueChannel { channel, track, .. } => {
+            assert_eq!(channel, "amb");
+            assert_eq!(track, "rain.ogg");
+        }
+        other => panic!("expected QueueChannel, got {other:?}"),
+    }
+    match step_until_command(&mut vm) {
+        Command::VolumeChannel { channel, volume, .. } => {
+            assert_eq!(channel, "amb");
+            assert!((volume - 0.7).abs() < 1e-6);
+        }
+        other => panic!("expected VolumeChannel, got {other:?}"),
+    }
+    match step_until_command(&mut vm) {
+        Command::FilterChannel { channel, filter } => {
+            assert_eq!(channel, "amb");
+            match filter {
+                vnengine_core::command::ChannelFilter::Filter { mode, cutoff, mix, .. } => {
+                    assert_eq!(mode, "lowpass");
+                    assert!((cutoff - 800.0).abs() < 1e-6);
+                    assert!((mix - 0.9).abs() < 1e-6);
+                }
+                other => panic!("expected Filter, got {other:?}"),
+            }
+        }
+        other => panic!("expected FilterChannel, got {other:?}"),
+    }
+}

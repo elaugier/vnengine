@@ -10,7 +10,7 @@ use vnengine_core::command::Command;
 use vnengine_core::model::{CameraAnim, Scene};
 use vnengine_core::save::GalleryState;
 use vnengine_core::screen::ScreenInst;
-pub use vnengine_core::save::{JournalEntry, MusicLayerState};
+pub use vnengine_core::save::{ChannelState, ChannelTrack, JournalEntry, MusicLayerState};
 use vnengine_script::vm::{MenuResponse, StepResult, Vm, VmState};
 
 /// Maximum number of rollback snapshots kept.
@@ -65,6 +65,7 @@ struct RollbackSnapshot {
     screens: Vec<ScreenInst>,
     nvl_start: usize,
     window_mode: String,
+    channels: std::collections::BTreeMap<String, ChannelState>,
 }
 
 /// Everything needed to resume a game, as stored in a save file.
@@ -86,6 +87,8 @@ pub struct RuntimeSnapshot {
     pub nvl_start: usize,
     /// `window` mode at save time: `show`, `hide` or `auto`.
     pub window_mode: String,
+    /// Named audio channels at save time (`play/queue channel`).
+    pub channels: std::collections::BTreeMap<String, ChannelState>,
 }
 
 /// The headless runtime.
@@ -126,6 +129,11 @@ pub struct Runtime {
     /// Dialogue window mode from `window show|hide|auto`. The host
     /// hides the textbox when this is `hide`.
     pub window_mode: String,
+    /// Named audio channels (`play/queue/stop/volume/filter channel`),
+    /// tracked through snapshots/rollback like `music`. The host diffs
+    /// this against its audio engine and calls `channel_advance` when a
+    /// channel's current track finishes.
+    pub channels: std::collections::BTreeMap<String, ChannelState>,
     rollback_stack: Vec<RollbackSnapshot>,
     rollforward_stack: Vec<RollbackSnapshot>,
     /// True while re-executing a restored snapshot. Suppresses clearing
@@ -154,6 +162,7 @@ impl Runtime {
             screens: Vec::new(),
             nvl_start: 0,
             window_mode: "auto".to_string(),
+            channels: std::collections::BTreeMap::new(),
             rollback_stack: Vec::new(),
             rollforward_stack: Vec::new(),
             replaying: false,
@@ -172,6 +181,7 @@ impl Runtime {
         rt.screens = snap.screens;
         rt.nvl_start = snap.nvl_start;
         rt.window_mode = snap.window_mode;
+        rt.channels = snap.channels;
         rt
     }
 
@@ -187,6 +197,7 @@ impl Runtime {
             screens: self.screens.clone(),
             nvl_start: self.nvl_start,
             window_mode: self.window_mode.clone(),
+            channels: self.channels.clone(),
         }
     }
 
@@ -511,10 +522,34 @@ impl Runtime {
         self.screens = snap.screens;
         self.nvl_start = snap.nvl_start;
         self.window_mode = snap.window_mode;
+        self.channels = snap.channels;
         self.replaying = true;
         let event = self.step();
         self.replaying = false;
         event
+    }
+
+    /// Advance a named channel's queue: called by the host when the
+    /// channel's current track finishes playing. Returns the track that
+    /// should start now, or `None` if the channel went idle (its state
+    /// is then dropped, unless a gain/effect was explicitly configured).
+    pub fn channel_advance(&mut self, channel: &str) -> Option<ChannelTrack> {
+        let st = self.channels.get_mut(channel)?;
+        let next = st.queue.first().cloned();
+        match next {
+            Some(t) => {
+                st.queue.remove(0);
+                st.current = Some(t.clone());
+                Some(t)
+            }
+            None => {
+                st.current = None;
+                if st.queue.is_empty() && st.filter.is_none() && st.volume == 1.0 {
+                    self.channels.remove(channel);
+                }
+                None
+            }
+        }
     }
 
     /// Record a rollback snapshot for a blocking point. `vm_state` must
@@ -531,6 +566,7 @@ impl Runtime {
             screens: self.screens.clone(),
             nvl_start: self.nvl_start,
             window_mode: self.window_mode.clone(),
+            channels: self.channels.clone(),
         });
         if self.rollback_stack.len() > MAX_ROLLBACK {
             self.rollback_stack.remove(0);
@@ -701,6 +737,77 @@ impl Runtime {
                     Command::MusicLayerOff { ref name, fade } => {
                         self.music_layers.remove(name);
                         self.music_layer_fade = fade;
+                        return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::PlayChannel {
+                        ref channel,
+                        ref track,
+                        volume,
+                        fade,
+                        loop_,
+                    } => {
+                        self.channels.insert(
+                            channel.clone(),
+                            ChannelState {
+                                current: Some(ChannelTrack {
+                                    track: track.clone(),
+                                    volume,
+                                    fade,
+                                    loop_,
+                                }),
+                                queue: Vec::new(),
+                                ..self
+                                    .channels
+                                    .get(channel.as_str())
+                                    .cloned()
+                                    .unwrap_or_default()
+                            },
+                        );
+                        return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::QueueChannel {
+                        ref channel,
+                        ref track,
+                        volume,
+                        fade,
+                        loop_,
+                    } => {
+                        let ct = ChannelTrack {
+                            track: track.clone(),
+                            volume,
+                            fade,
+                            loop_,
+                        };
+                        let st = self.channels.entry(channel.clone()).or_default();
+                        if st.current.is_none() {
+                            st.current = Some(ct);
+                        } else {
+                            st.queue.push(ct);
+                        }
+                        return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::StopChannel { ref channel, .. } => {
+                        self.channels.remove(channel);
+                        return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::VolumeChannel {
+                        ref channel, volume, ..
+                    } => {
+                        self.channels.entry(channel.clone()).or_default().volume = volume;
+                        return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::FilterChannel {
+                        ref channel,
+                        ref filter,
+                    } => {
+                        self.channels.entry(channel.clone()).or_default().filter =
+                            Some(filter.clone());
+                        return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::StopAll { .. } => {
+                        self.channels.clear();
+                        self.music = None;
+                        self.music_layers.clear();
                         return RuntimeEvent::Effect(cmd);
                     }
                     Command::LightSet(light) => {

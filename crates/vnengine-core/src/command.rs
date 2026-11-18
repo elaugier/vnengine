@@ -127,6 +127,39 @@ pub enum Command {
     },
     /// Remove an adaptive-music stem layer.
     MusicLayerOff { name: String, fade: f32 },
+    /// Play a track on a named channel (`play channel <n>`). Replaces
+    /// the channel's current track and clears its queue.
+    PlayChannel {
+        channel: String,
+        track: String,
+        volume: f32,
+        fade: f32,
+        loop_: bool,
+    },
+    /// Enqueue a track on a named channel (`queue channel <n>`). If the
+    /// channel is idle it starts immediately.
+    QueueChannel {
+        channel: String,
+        track: String,
+        volume: f32,
+        fade: f32,
+        loop_: bool,
+    },
+    /// Stop a named channel and clear its queue (`stop channel <n>`).
+    StopChannel { channel: String, fade: f32 },
+    /// Set a named channel's gain (`volume channel <n> <e>`).
+    VolumeChannel {
+        channel: String,
+        volume: f32,
+        fade: f32,
+    },
+    /// Set/replace a channel's audio effect (`filter channel <n>`).
+    FilterChannel {
+        channel: String,
+        filter: ChannelFilter,
+    },
+    /// Stop every named channel plus music and voice (`stop all`).
+    StopAll { fade: f32 },
     /// Play a one-shot sound effect.
     PlaySfx { track: String, volume: f32 },
     /// Play a voice line.
@@ -185,6 +218,26 @@ pub enum Command {
     },
     /// The script reached the end of the game.
     End,
+}
+
+/// Audio effect attached to a named channel (`filter channel <n>`).
+/// `Off` removes processing (filter/reverb mix back to 0).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ChannelFilter {
+    Off,
+    Filter {
+        /// `lowpass`, `highpass`, `bandpass` or `notch`.
+        mode: String,
+        cutoff: f64,
+        resonance: f64,
+        mix: f64,
+    },
+    Reverb {
+        feedback: f64,
+        damping: f64,
+        stereo_width: f64,
+        mix: f64,
+    },
 }
 
 impl Command {

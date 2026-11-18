@@ -878,6 +878,34 @@ impl Vm {
         }
     }
 
+    /// Evaluate `play|queue channel` operands: channel name, track path,
+    /// optional volume (default 1.0) and fade (default 0).
+    fn eval_channel_track(
+        &mut self,
+        channel: &Expr,
+        track: &Expr,
+        volume: &Option<Expr>,
+        fade: &Option<Expr>,
+    ) -> Result<(String, String, f32, f32), String> {
+        let channel = self.eval_str(channel)?;
+        let track = self.eval_str(track)?;
+        let volume = match volume {
+            Some(e) => self
+                .eval(e)
+                .and_then(|v| v.as_float().ok_or("expected number".into()))?
+                as f32,
+            None => 1.0,
+        };
+        let fade = match fade {
+            Some(e) => self
+                .eval(e)
+                .and_then(|v| v.as_float().ok_or("expected number".into()))?
+                as f32,
+            None => 0.0,
+        };
+        Ok((channel, track, volume, fade))
+    }
+
     /// Resolve a button's action block into serializable actions.
     fn resolve_button_actions(
         &mut self,
@@ -1999,6 +2027,122 @@ impl Vm {
                     volume: f(&volume)?,
                     fade,
                 }))
+            }
+            Stmt::PlayChannel {
+                channel,
+                track,
+                volume,
+                fade,
+                loop_,
+            } => {
+                let (channel, track, volume, fade) =
+                    self.eval_channel_track(&channel, &track, &volume, &fade)?;
+                Ok(ExecOutcome::Command(Command::PlayChannel {
+                    channel,
+                    track,
+                    volume,
+                    fade,
+                    loop_,
+                }))
+            }
+            Stmt::QueueChannel {
+                channel,
+                track,
+                volume,
+                fade,
+                loop_,
+            } => {
+                let (channel, track, volume, fade) =
+                    self.eval_channel_track(&channel, &track, &volume, &fade)?;
+                Ok(ExecOutcome::Command(Command::QueueChannel {
+                    channel,
+                    track,
+                    volume,
+                    fade,
+                    loop_,
+                }))
+            }
+            Stmt::StopChannel { channel, fade } => {
+                let channel = self.eval_str(&channel)?;
+                let fade = match &fade {
+                    Some(e) => self
+                        .eval(e)
+                        .and_then(|v| v.as_float().ok_or("expected number".into()))?
+                        as f32,
+                    None => 0.0,
+                };
+                Ok(ExecOutcome::Command(Command::StopChannel { channel, fade }))
+            }
+            Stmt::StopAll { fade } => {
+                let fade = match &fade {
+                    Some(e) => self
+                        .eval(e)
+                        .and_then(|v| v.as_float().ok_or("expected number".into()))?
+                        as f32,
+                    None => 0.0,
+                };
+                Ok(ExecOutcome::Command(Command::StopAll { fade }))
+            }
+            Stmt::VolumeChannel {
+                channel,
+                volume,
+                fade,
+            } => {
+                let channel = self.eval_str(&channel)?;
+                let volume = self
+                    .eval(&volume)
+                    .and_then(|v| v.as_float().ok_or("expected number".into()))?
+                    as f32;
+                let fade = match &fade {
+                    Some(e) => self
+                        .eval(e)
+                        .and_then(|v| v.as_float().ok_or("expected number".into()))?
+                        as f32,
+                    None => 0.0,
+                };
+                Ok(ExecOutcome::Command(Command::VolumeChannel {
+                    channel,
+                    volume,
+                    fade,
+                }))
+            }
+            Stmt::FilterChannel {
+                channel,
+                kind,
+                params,
+            } => {
+                let channel = self.eval_str(&channel)?;
+                let get = |name: &str, default: f64, vm: &mut Self| -> Result<f64, String> {
+                    match params.iter().find(|(k, _)| k == name) {
+                        Some((_, e)) => vm
+                            .eval(e)
+                            .and_then(|v| v.as_float().ok_or("expected number".into())),
+                        None => Ok(default),
+                    }
+                };
+                let filter = match kind.as_str() {
+                    "off" | "none" => vnengine_core::command::ChannelFilter::Off,
+                    "reverb" => vnengine_core::command::ChannelFilter::Reverb {
+                        feedback: get("feedback", 0.5, self)?,
+                        damping: get("damping", 0.5, self)?,
+                        stereo_width: get("width", 1.0, self)?,
+                        mix: get("mix", 0.5, self)?,
+                    },
+                    m @ ("lowpass" | "highpass" | "bandpass" | "notch") => {
+                        vnengine_core::command::ChannelFilter::Filter {
+                            mode: m.to_string(),
+                            cutoff: get("cutoff", 800.0, self)?,
+                            resonance: get("resonance", 0.0, self)?,
+                            mix: get("mix", 1.0, self)?,
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "unknown filter kind `{other}` (lowpass|highpass|bandpass|notch|reverb|off)"
+                        ))
+                    }
+                };
+                Ok(ExecOutcome::Command(Command::FilterChannel { channel, filter }))
             }
             Stmt::ShowScreen { screen } => {
                 let name = self.eval_screen_name(&screen)?;

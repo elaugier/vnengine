@@ -236,6 +236,13 @@ label sunset:
     light "city" x=0.2 y=0.95 radius=0.5 intensity=0.4 color="#4466ff"
     camera y=0.02 zoom=1.06 over=2.0
     music layer "wind" "sfx_wind.ogg" volume=0.25 fade=2.0
+    # Phase 4: named channels — a looping filtered ambience channel and
+    # a queued one-shot sequence channel.
+    play channel amb "sfx_wind.ogg" volume=0.3 fade=2.0 loop
+    filter channel amb lowpass cutoff=600 mix=0.4
+    play channel seq "sfx_footstep.ogg" volume=0.7
+    queue channel seq "sfx_footstep.ogg" volume=0.6
+    queue channel seq "sfx_door.ogg" volume=0.5
     n "We climbed the stairs to the rooftop, the city spreading out beneath us."
     n "The sky was a canvas of {color=#ff8800}orange{/color}, {color=#ff4080}pink{/color}, and {color=#4040ff}deep purple{/color}."
     show eileen happy at center with slideright 0.6
@@ -260,6 +267,8 @@ label sunset:
         "The view is nice, but it's kind of windy.":
             show eileen thinking at center
             music layer "wind" volume=0.6 fade=1.0
+            volume channel amb 0.65 fade=1.0
+            filter channel amb off
             e "You're always so practical."
             e "Can't you just enjoy the moment?"
             $ eileen_affection = 0
@@ -316,7 +325,7 @@ label home:
             jump ending_sad
 
 label ending:
-    stop music fade 2.0
+    stop all fade=2.0
     unlight "sun"
     unlight "city"
     ambient 1.0 1.0 1.0
@@ -352,6 +361,8 @@ label ending:
     end
 
 label ending_sad:
+    stop channel amb fade=1.0
+    stop channel seq fade=0.5
     stop music fade 2.0
     scene bg black with fade 2.0
     play music "bgm_ending.ogg" fade 3.0

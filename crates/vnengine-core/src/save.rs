@@ -43,6 +43,51 @@ pub struct MusicLayerState {
     pub volume: f32,
 }
 
+/// A track queued or playing on a named audio channel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelTrack {
+    pub track: String,
+    pub volume: f32,
+    pub fade: f32,
+    #[serde(default)]
+    pub loop_: bool,
+}
+
+/// Script-visible state of a named audio channel
+/// (`play/queue/stop/volume/filter channel`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelState {
+    /// Currently playing track, if any.
+    #[serde(default)]
+    pub current: Option<ChannelTrack>,
+    /// Pending queue — consumed by `Runtime::channel_advance` when the
+    /// host reports the current track ended.
+    #[serde(default)]
+    pub queue: Vec<ChannelTrack>,
+    /// Channel gain (0..1), set by `volume channel`.
+    #[serde(default = "one_f32")]
+    pub volume: f32,
+    /// Audio effect configured on the channel (`filter channel`), so it
+    /// is re-applied after a load/rollback.
+    #[serde(default)]
+    pub filter: Option<crate::command::ChannelFilter>,
+}
+
+fn one_f32() -> f32 {
+    1.0
+}
+
+impl Default for ChannelState {
+    fn default() -> Self {
+        Self {
+            current: None,
+            queue: Vec::new(),
+            volume: 1.0,
+            filter: None,
+        }
+    }
+}
+
 /// A single save slot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveState {
@@ -85,6 +130,9 @@ pub struct SaveState {
     /// `window` mode at save time: `show`, `hide` or `auto`.
     #[serde(default = "default_window_mode")]
     pub window_mode: String,
+    /// Named audio channels at save time.
+    #[serde(default)]
+    pub channels: std::collections::BTreeMap<String, ChannelState>,
     /// Thumbnail image path (PNG bytes) of the scene.
     pub thumbnail: Option<Vec<u8>>,
     /// Real-world save time (Unix timestamp).
