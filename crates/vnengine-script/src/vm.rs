@@ -7,9 +7,11 @@
 //! calling `step` again.
 
 use crate::ast::*;
+use crate::funcs::call_user_function;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use vnengine_core::command::{Anchor, Command, MenuChoice, SpriteSpec};
+use vnengine_core::model::Layer;
 use vnengine_core::transition::Transition;
 use vnengine_core::Value;
 
@@ -122,6 +124,9 @@ fn default_rng_seed() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingMenu {
     pub prompt: Option<String>,
+    /// `menu ... set <var>:` — receives the chosen index on resume.
+    #[serde(default)]
+    pub set_var: Option<String>,
     pub choices: Vec<MenuChoiceAst>,
 }
 
@@ -187,6 +192,24 @@ pub struct Vm {
     pub constants: HashMap<String, Value>,
     /// User-defined functions, keyed by name.
     pub functions: HashMap<String, FunctionDef>,
+    /// Output queued to be emitted before the next statement executes
+    /// (e.g. `say ... with <trans>` plays the transition first, `menu
+    /// ... with <trans>` delays the menu prompt). Not part of `VmState`:
+    /// entries are drained within a step or two, before any blocking
+    /// point a save could capture.
+    deferred: VecDeque<Deferred>,
+}
+
+/// A deferred VM output: either a plain command (the say that follows
+/// its `with` transition) or a whole menu presentation.
+enum Deferred {
+    Command(Command),
+    Menu {
+        prompt: Option<String>,
+        set_var: Option<String>,
+        choices: Vec<MenuChoice>,
+        ast_choices: Vec<MenuChoiceAst>,
+    },
 }
 
 impl Vm {
@@ -203,6 +226,7 @@ impl Vm {
             character_colors: HashMap::new(),
             constants: HashMap::new(),
             functions,
+            deferred: VecDeque::new(),
         };
         vm.process_definitions();
         vm
@@ -225,7 +249,10 @@ impl Vm {
                     }
                 }
                 Definition::Constant { id, value } => {
-                    if let Ok(v) = eval_expr(value, &self.constants) {
+                    let mut rng = default_rng_seed();
+                    if let Ok(v) =
+                        eval_expr_ctx(value, &self.constants, Some(&self.functions), &mut rng)
+                    {
                         self.constants.insert(id.clone(), v);
                     }
                 }
@@ -235,9 +262,12 @@ impl Vm {
         // doesn't already exist (important for save/load restoration).
         for d in &self.script.defaults.clone() {
             if !self.state.variables.contains_key(&d.name) {
-                if let Ok(v) =
-                    eval_expr_rng(&d.value, &self.state.variables, &mut self.state.rng_seed)
-                {
+                if let Ok(v) = eval_expr_ctx(
+                    &d.value,
+                    &self.state.variables,
+                    Some(&self.functions),
+                    &mut self.state.rng_seed,
+                ) {
                     self.state.variables.insert(d.name.clone(), v);
                 }
             }
@@ -273,6 +303,34 @@ impl Vm {
                 return StepResult::Finished;
             }
 
+            // Deferred output (e.g. a `with` transition preceding a
+            // say/menu) is emitted before executing the next statement.
+            if let Some(d) = self.deferred.pop_front() {
+                match d {
+                    Deferred::Command(cmd) => return StepResult::Command(cmd),
+                    Deferred::Menu {
+                        prompt,
+                        set_var,
+                        choices,
+                        ast_choices,
+                    } => {
+                        // The menu statement was already consumed when the
+                        // transition command advanced the frame; rewind so
+                        // the choice body completes onto the statement
+                        // after the menu, like a normal menu.
+                        if let Some(f) = self.state.stack.last_mut() {
+                            f.stmt = f.stmt.saturating_sub(1);
+                        }
+                        self.state.pending_menu = Some(PendingMenu {
+                            prompt: prompt.clone(),
+                            set_var,
+                            choices: ast_choices,
+                        });
+                        return StepResult::Menu { prompt, choices };
+                    }
+                }
+            }
+
             // Resolve the current frame's statement list.
             let body_len = {
                 let Some(frame) = self.state.stack.last() else {
@@ -304,9 +362,14 @@ impl Vm {
                         continue;
                     }
                 } else if let Some(cond) = &frame.while_loop {
-                    if eval_expr_rng(cond, &self.state.variables, &mut self.state.rng_seed)
-                        .map(|v| v.is_truthy())
-                        .unwrap_or(false)
+                    if eval_expr_ctx(
+                        cond,
+                        &self.state.variables,
+                        Some(&self.functions),
+                        &mut self.state.rng_seed,
+                    )
+                    .map(|v| v.is_truthy())
+                    .unwrap_or(false)
                     {
                         frame.stmt = 0;
                         continue;
@@ -411,6 +474,56 @@ impl Vm {
                     }
                     continue;
                 }
+                Ok(ExecOutcome::Break) => {
+                    // Unwind frames through the innermost loop frame
+                    // (inclusive), then continue after the loop.
+                    let mut broke = false;
+                    while let Some(f) = self.state.stack.pop() {
+                        if f.for_loop.is_some() || f.while_loop.is_some() {
+                            broke = true;
+                            break;
+                        }
+                    }
+                    if !broke {
+                        log::error!("script error: `break` outside a loop");
+                        self.state.finished = true;
+                        return StepResult::Finished;
+                    }
+                    match self.state.stack.last_mut() {
+                        Some(parent) => {
+                            parent.stmt += 1;
+                            continue;
+                        }
+                        None => {
+                            self.state.finished = true;
+                            return StepResult::Finished;
+                        }
+                    }
+                }
+                Ok(ExecOutcome::ContinueLoop) => {
+                    // Unwind non-loop frames, then force the innermost
+                    // loop frame to its end-of-body path: `for` advances
+                    // the iteration, `while` re-evaluates its condition.
+                    while self
+                        .state
+                        .stack
+                        .last()
+                        .map(|f| f.for_loop.is_none() && f.while_loop.is_none())
+                        .unwrap_or(false)
+                    {
+                        self.state.stack.pop();
+                    }
+                    let Some(frame) = self.state.stack.last_mut() else {
+                        self.state.finished = true;
+                        return StepResult::Finished;
+                    };
+                    let body_len = frame
+                        .body_stmts(&self.script)
+                        .map(|s| s.len())
+                        .unwrap_or(0);
+                    frame.stmt = body_len;
+                    continue;
+                }
                 Err(e) => {
                     log::error!("script error: {e}");
                     self.state.finished = true;
@@ -437,6 +550,12 @@ impl Vm {
     pub fn resume(&mut self, response: Option<MenuResponse>) {
         if let Some(menu) = self.state.pending_menu.take() {
             if let Some(MenuResponse::Selected(idx)) = response {
+                // `menu ... set <var>:` stores the chosen index.
+                if let Some(var) = menu.set_var {
+                    self.state
+                        .variables
+                        .insert(var, Value::Int(idx as i64));
+                }
                 if let Some(choice) = menu.choices.get(idx) {
                     // Push the choice body as an inline frame. The parent
                     // frame still points at the menu statement and advances
@@ -466,12 +585,108 @@ enum ExecOutcome {
     Push(Frame),
     Return,
     Continue,
+    /// `break` — unwind through the innermost loop frame.
+    Break,
+    /// `continue` — restart the innermost loop's next iteration.
+    ContinueLoop,
 }
 
 impl Vm {
+    /// Evaluate an expression with access to user functions.
+    fn eval(&mut self, expr: &Expr) -> Result<Value, String> {
+        eval_expr_ctx(
+            expr,
+            &self.state.variables,
+            Some(&self.functions),
+            &mut self.state.rng_seed,
+        )
+    }
+
+    /// Evaluate an expression and coerce the result to a string (used
+    /// for asset names, labels, layer names...).
+    fn eval_str(&mut self, expr: &Expr) -> Result<String, String> {
+        let v = self.eval(expr)?;
+        v.as_str()
+            .ok_or_else(|| format!("expected a string, got {v}"))
+    }
+
+    /// Interpolate `[expr]` references in dialogue text. Falls back to
+    /// the literal `[name]` when the content is not a valid expression
+    /// or references an undefined variable (backward compatible with
+    /// the old `[var]`-only syntax).
+    fn interpolate(&mut self, text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '[' {
+                if i + 1 < chars.len() && chars[i + 1] == '[' {
+                    out.push('[');
+                    i += 2;
+                    continue;
+                }
+                // Find the matching `]`, honoring nested brackets so
+                // expressions like `[player["level"]]` resolve fully.
+                let mut depth = 0i32;
+                let mut close = None;
+                for (j, &c) in chars[i + 1..].iter().enumerate() {
+                    match c {
+                        '[' => depth += 1,
+                        ']' => {
+                            if depth == 0 {
+                                close = Some(j);
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(close) = close {
+                    let inner: String = chars[i + 1..i + 1 + close].iter().collect();
+                    let inner = inner.trim();
+                    let mut resolved = None;
+                    if let Ok(expr) = crate::parser::Parser::try_parse_expr(inner) {
+                        if let Ok(v) = self.eval(&expr) {
+                            resolved = Some(v.to_string());
+                        }
+                    }
+                    match resolved {
+                        Some(s) => out.push_str(&s),
+                        None => {
+                            out.push('[');
+                            out.push_str(inner);
+                            out.push(']');
+                        }
+                    }
+                    i += 1 + close + 1;
+                    continue;
+                }
+                out.push('[');
+                i += 1;
+            } else if chars[i] == ']' {
+                if i + 1 < chars.len() && chars[i + 1] == ']' {
+                    out.push(']');
+                    i += 2;
+                    continue;
+                }
+                out.push(']');
+                i += 1;
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
     fn exec_stmt(&mut self, stmt: Stmt) -> Result<ExecOutcome, String> {
         match stmt {
             Stmt::Scene { image, transition } => {
+                let image = match &image {
+                    Some(e) => Some(self.eval_str(e)?),
+                    None => None,
+                };
                 let trans = transition
                     .and_then(|t| Transition::parse(&t.name, t.duration))
                     .unwrap_or(Transition::Cut);
@@ -487,36 +702,37 @@ impl Vm {
                 position,
                 scale,
                 z,
+                layer,
                 transition,
             } => {
                 let transition = transition.and_then(|t| Transition::parse(&t.name, t.duration));
                 let anchor = anchor_to_anchor(&anchor);
-                let pos = position.and_then(|(x, y)| {
-                    let xv =
-                        eval_expr_rng(&x, &self.state.variables, &mut self.state.rng_seed).ok()?;
-                    let yv =
-                        eval_expr_rng(&y, &self.state.variables, &mut self.state.rng_seed).ok()?;
-                    Some((xv.as_float()?, yv.as_float()?))
-                });
-                let scale = scale
-                    .and_then(|e| {
-                        eval_expr_rng(&e, &self.state.variables, &mut self.state.rng_seed).ok()
+                let pos = position
+                    .map(|(x, y)| {
+                        let xv = self.eval(&x)?.as_float();
+                        let yv = self.eval(&y)?.as_float();
+                        Ok::<_, String>((xv, yv))
                     })
-                    .and_then(|v| v.as_float())
+                    .transpose()?
+                    .and_then(|(xv, yv)| Some((xv? as f32, yv? as f32)));
+                let scale = scale
+                    .map(|e| self.eval(&e).and_then(|v| v.as_float().ok_or("expected number".into())))
+                    .transpose()?
                     .map(|f| f as f32);
                 let z = z
-                    .and_then(|e| {
-                        eval_expr_rng(&e, &self.state.variables, &mut self.state.rng_seed).ok()
-                    })
-                    .and_then(|v| v.as_int())
+                    .map(|e| self.eval(&e).and_then(|v| v.as_int().ok_or("expected number".into())))
+                    .transpose()?
                     .map(|i| i as i32);
+                let layer = layer.map(|l| parse_layer(&l));
+                let image = self.eval_str(&image)?;
                 Ok(ExecOutcome::Command(Command::Show(SpriteSpec {
                     character,
                     image,
                     anchor,
-                    position: pos.map(|(x, y)| (x as f32, y as f32)),
+                    position: pos,
                     scale,
                     z,
+                    layer,
                     transition,
                 })))
             }
@@ -527,86 +743,214 @@ impl Vm {
                 let trans = transition
                     .and_then(|t| Transition::parse(&t.name, t.duration))
                     .unwrap_or(Transition::Cut);
-                Ok(ExecOutcome::Command(Command::Hide {
-                    character,
-                    transition: trans,
-                }))
+                match character {
+                    Some(character) => Ok(ExecOutcome::Command(Command::Hide {
+                        character,
+                        transition: trans,
+                    })),
+                    None => Ok(ExecOutcome::Command(Command::HideAll { transition: trans })),
+                }
             }
             Stmt::Say {
                 speaker,
                 text,
                 voice,
                 side_image,
+                transition,
             } => {
-                let text = interpolate_text(&text, &self.state.variables);
-                if let Some(id) = &speaker {
+                let text = self.interpolate(&text);
+                let voice = match &voice {
+                    Some(e) => Some(self.eval_str(e)?),
+                    None => None,
+                };
+                let side_image = match &side_image {
+                    Some(e) => Some(self.eval_str(e)?),
+                    None => None,
+                };
+                let cmd = if let Some(id) = &speaker {
                     let speaker_name = self.character_names.get(id).cloned();
-                    Ok(ExecOutcome::Command(Command::Say {
+                    Command::Say {
                         speaker: speaker_name.or(Some(id.clone())),
                         text,
                         voice,
                         side_image,
-                    }))
+                    }
                 } else {
-                    Ok(ExecOutcome::Command(Command::Narrate { text }))
+                    Command::Narrate { text }
+                };
+                if let Some(t) = transition {
+                    if let Some(tr) = Transition::parse(&t.name, t.duration) {
+                        if tr.default_duration() > 0.0 {
+                            // Emit the transition now; the say itself is
+                            // drained from `deferred` on the next step.
+                            self.deferred.push_back(Deferred::Command(cmd));
+                            return Ok(ExecOutcome::Command(Command::PlayTransition(tr)));
+                        }
+                    }
                 }
+                Ok(ExecOutcome::Command(cmd))
             }
-            Stmt::Menu { prompt, choices } => {
-                let prompt = prompt.map(|p| interpolate_text(&p, &self.state.variables));
+            Stmt::Menu {
+                prompt,
+                transition,
+                set_var,
+                choices,
+            } => {
+                let prompt = match &prompt {
+                    Some(e) => {
+                        let s = self.eval_str(e)?;
+                        Some(self.interpolate(&s))
+                    }
+                    None => None,
+                };
                 let mut filtered = Vec::new();
                 let mut ast_choices = Vec::new();
                 for c in choices {
                     let selectable = match &c.condition {
-                        Some(expr) => {
-                            eval_expr_rng(expr, &self.state.variables, &mut self.state.rng_seed)
-                                .map(|v| v.is_truthy())
-                                .unwrap_or(true)
-                        }
+                        Some(expr) => self
+                            .eval(expr)
+                            .map(|v| v.is_truthy())
+                            .unwrap_or(true),
                         None => true,
                     };
                     if selectable {
-                        let interp_text = interpolate_text(&c.text, &self.state.variables);
-                        ast_choices.push(MenuChoiceAst {
-                            text: interp_text.clone(),
-                            condition: None,
-                            body: c.body.clone(),
+                    let interp_text = self.interpolate(&c.text);
+                    ast_choices.push(MenuChoiceAst {
+                        text: interp_text.clone(),
+                        condition: None,
+                        body: c.body.clone(),
+                    });
+                    filtered.push(MenuChoice {
+                        text: interp_text,
+                        condition: None,
+                    });
+                }
+            }
+            if filtered.is_empty() {
+                return Ok(ExecOutcome::Continue);
+            }
+            // `menu ... with <trans>`: play the transition first and
+            // present the menu on the next step.
+            if let Some(t) = transition {
+                if let Some(tr) = Transition::parse(&t.name, t.duration) {
+                    if tr.default_duration() > 0.0 {
+                        self.deferred.push_back(Deferred::Menu {
+                            prompt: prompt.clone(),
+                            set_var: set_var.clone(),
+                            choices: filtered,
+                            ast_choices,
                         });
-                        filtered.push(MenuChoice {
-                            text: interp_text,
-                            condition: None,
-                        });
+                        return Ok(ExecOutcome::Command(Command::PlayTransition(tr)));
                     }
                 }
-                if filtered.is_empty() {
-                    return Ok(ExecOutcome::Continue);
-                }
-                // Stash the AST choices for resume.
-                self.state.pending_menu = Some(PendingMenu {
-                    prompt: prompt.clone(),
-                    choices: ast_choices,
-                });
-                Ok(ExecOutcome::Menu {
-                    prompt,
-                    choices: filtered,
-                })
             }
-            Stmt::Jump { label } => Ok(ExecOutcome::Jump(label)),
-            Stmt::Call { label } => {
-                // Check if this is a user-defined function.
-                if let Some(func) = self.functions.get(&label).cloned() {
-                    let mut frame = Frame::block(func.body);
-                    frame.is_call = true;
-                    return Ok(ExecOutcome::Push(frame));
+            // Stash the AST choices for resume.
+            self.state.pending_menu = Some(PendingMenu {
+                prompt: prompt.clone(),
+                set_var,
+                choices: ast_choices,
+            });
+            Ok(ExecOutcome::Menu {
+                prompt,
+                choices: filtered,
+            })
+        }
+        Stmt::Jump { label } => {
+            // A bare identifier is a literal label name (backward
+            // compatible); any other expression is evaluated to one.
+            let name = match &label {
+                Expr::Var(n) => n.clone(),
+                other => self.eval_str(other)?,
+            };
+            Ok(ExecOutcome::Jump(name))
+        }
+        Stmt::Call { label } => {
+            match &label {
+                // `call f(args)` — bind parameters as variables, then run
+                // the body as a call frame so blocking statements (`say`,
+                // `menu`...) work. Parameters persist as regular
+                // variables after the call, like Ren'Py's store.
+                Expr::Call { name, args } => {
+                    if let Some(func) = self.functions.get(name).cloned() {
+                        if args.len() != func.params.len() {
+                            return Err(format!(
+                                "function `{name}` expects {} argument(s), got {}",
+                                func.params.len(),
+                                args.len()
+                            ));
+                        }
+                        for (param, arg) in func.params.iter().zip(args.iter()) {
+                            let v = self.eval(arg)?;
+                            self.state.variables.insert(param.clone(), v);
+                        }
+                        let mut frame = Frame::block(func.body);
+                        frame.is_call = true;
+                        return Ok(ExecOutcome::Push(frame));
+                    }
+                    // `call label(arg, ...)` — bind the label's declared
+                    // parameters, then jump to it as a call frame.
+                    let label_params = self
+                        .script
+                        .find_label(name)
+                        .map(|l| l.params.clone());
+                    if let Some(params) = label_params {
+                        if args.len() != params.len() {
+                            return Err(format!(
+                                "label `{name}` expects {} argument(s), got {}",
+                                params.len(),
+                                args.len()
+                            ));
+                        }
+                        for (param, arg) in params.iter().zip(args.iter()) {
+                            let v = self.eval(arg)?;
+                            self.state.variables.insert(param.clone(), v);
+                        }
+                        return Ok(ExecOutcome::Call(name.clone()));
+                    }
+                    return Err(format!("unknown function or label `{name}`"));
                 }
-                Ok(ExecOutcome::Call(label))
+                // `call name` — zero-arg user function (frame-based, so
+                // the body may contain blocking statements like `say`)
+                // or a plain label.
+                Expr::Var(name) => {
+                    if let Some(func) = self.functions.get(name).cloned() {
+                        let mut frame = Frame::block(func.body);
+                        frame.is_call = true;
+                        return Ok(ExecOutcome::Push(frame));
+                    }
+                    Ok(ExecOutcome::Call(name.clone()))
+                }
+                // Dynamic target: evaluate to a label name.
+                other => {
+                    let name = self.eval_str(other)?;
+                    Ok(ExecOutcome::Call(name))
+                }
             }
+        }
+        Stmt::Return => Ok(ExecOutcome::Return),
+        Stmt::ReturnValue { value } => {
+            // Inside a label `call` the value is discarded; inside a
+            // function body this statement never reaches exec_stmt
+            // (funcs::exec_stmt handles it). Evaluate for RNG parity.
+            let _ = self.eval(&value)?;
+            Ok(ExecOutcome::Return)
+        }
+        Stmt::With { transition } => {
+            let trans = Transition::parse(&transition.name, transition.duration)
+                .unwrap_or(Transition::Cut);
+            Ok(ExecOutcome::Command(Command::PlayTransition(trans)))
+        }
+        Stmt::Break => Ok(ExecOutcome::Break),
+        Stmt::Continue => Ok(ExecOutcome::ContinueLoop),
             Stmt::Shake {
                 intensity,
                 duration,
             } => {
-                let i = eval_expr_rng(&intensity, &self.state.variables, &mut self.state.rng_seed)
+                let i = self
+                    .eval(&intensity)
                     .map_err(|e| format!("shake error: {e}"))?;
-                let d = eval_expr_rng(&duration, &self.state.variables, &mut self.state.rng_seed)
+                let d = self
+                    .eval(&duration)
                     .map_err(|e| format!("shake error: {e}"))?;
                 let intensity = i.as_float().unwrap_or(0.5) as f32;
                 let duration = d.as_float().unwrap_or(0.5) as f32;
@@ -619,13 +963,13 @@ impl Vm {
                 // Function definitions are processed at load time, not executed.
                 Ok(ExecOutcome::Continue)
             }
-            Stmt::Return => Ok(ExecOutcome::Return),
             Stmt::If {
                 branches,
                 else_branch,
             } => {
                 for (cond, body) in &branches {
-                    if eval_expr_rng(cond, &self.state.variables, &mut self.state.rng_seed)
+                    if self
+                        .eval(cond)
                         .map(|v| v.is_truthy())
                         .unwrap_or(false)
                     {
@@ -637,24 +981,34 @@ impl Vm {
                 }
                 Ok(ExecOutcome::Continue)
             }
-            Stmt::Pause { seconds } => {
-                let s = eval_expr_rng(&seconds, &self.state.variables, &mut self.state.rng_seed)
-                    .ok()
-                    .and_then(|v| v.as_float())
-                    .unwrap_or(1.0) as f32;
-                Ok(ExecOutcome::Command(Command::Pause { seconds: s }))
-            }
+            Stmt::Pause { seconds } => match seconds {
+                Some(e) => {
+                    let s = self
+                        .eval(&e)
+                        .ok()
+                        .and_then(|v| v.as_float())
+                        .unwrap_or(1.0) as f32;
+                    Ok(ExecOutcome::Command(Command::Pause { seconds: s }))
+                }
+                None => Ok(ExecOutcome::Command(Command::WaitInput)),
+            },
             Stmt::PlayMusic { track, fade } => {
+                let track = self.eval_str(&track)?;
                 Ok(ExecOutcome::Command(Command::PlayMusic { track, fade }))
             }
             Stmt::StopMusic { fade } => Ok(ExecOutcome::Command(Command::StopMusic { fade })),
             Stmt::PlaySfx { track, volume } => {
+                let track = self.eval_str(&track)?;
                 Ok(ExecOutcome::Command(Command::PlaySfx { track, volume }))
             }
-            Stmt::PlayVoice { track } => Ok(ExecOutcome::Command(Command::PlayVoice { track })),
+            Stmt::PlayVoice { track } => {
+                let track = self.eval_str(&track)?;
+                Ok(ExecOutcome::Command(Command::PlayVoice { track }))
+            }
             Stmt::StopVoice => Ok(ExecOutcome::Command(Command::StopVoice)),
             Stmt::Assign { name, value } => {
-                let v = eval_expr_rng(&value, &self.state.variables, &mut self.state.rng_seed)
+                let v = self
+                    .eval(&value)
                     .map_err(|e| format!("assignment error: {e}"))?;
                 self.state.variables.insert(name, v);
                 Ok(ExecOutcome::Continue)
@@ -663,16 +1017,18 @@ impl Vm {
                 let current = self.state.variables.get(&name).cloned().ok_or_else(|| {
                     format!("undefined variable `{name}` for compound assignment")
                 })?;
-                let rhs = eval_expr_rng(&value, &self.state.variables, &mut self.state.rng_seed)
+                let rhs = self
+                    .eval(&value)
                     .map_err(|e| format!("assignment error: {e}"))?;
-                let result = eval_binop(op, current, rhs)?;
+                let result = eval_binop_pub(op, current, rhs)?;
                 self.state.variables.insert(name, result);
                 Ok(ExecOutcome::Continue)
             }
             Stmt::Default { name, value } => {
                 // Only assign if the variable doesn't already exist.
                 if !self.state.variables.contains_key(&name) {
-                    let v = eval_expr_rng(&value, &self.state.variables, &mut self.state.rng_seed)
+                    let v = self
+                        .eval(&value)
                         .map_err(|e| format!("default error: {e}"))?;
                     self.state.variables.insert(name, v);
                 }
@@ -686,143 +1042,39 @@ impl Vm {
                 opacity,
                 layer,
             } => {
-                let mut cmd = Command::Transform {
-                    character: character.clone(),
-                    rotation: None,
-                    scale: None,
-                    offset: None,
-                    opacity: None,
-                    layer: None,
+                let mut num = |e: &Option<Expr>| -> Result<Option<f32>, String> {
+                    match e {
+                        Some(e) => self
+                            .eval(e)
+                            .and_then(|v| v.as_float().ok_or("expected number".into()))
+                            .map(|f| Some(f as f32)),
+                        None => Ok(None),
+                    }
                 };
-                if let Some(r) = rotation {
-                    let v = eval_expr_rng(&r, &self.state.variables, &mut self.state.rng_seed)
-                        .map_err(|e| format!("transform error: {e}"))?;
-                    if let Some(f) = v.as_float() {
-                        cmd = match cmd {
-                            Command::Transform {
-                                character,
-                                scale,
-                                offset,
-                                opacity,
-                                layer,
-                                ..
-                            } => Command::Transform {
-                                character,
-                                rotation: Some(f as f32),
-                                scale,
-                                offset,
-                                opacity,
-                                layer,
-                            },
-                            _ => unreachable!(),
-                        };
+                let rotation = num(&rotation)?;
+                let scale = num(&scale)?;
+                let opacity = num(&opacity)?;
+                let offset = match &offset {
+                    Some((x, y)) => {
+                        let xv = self.eval(x)?.as_float().ok_or("expected number")?;
+                        let yv = self.eval(y)?.as_float().ok_or("expected number")?;
+                        Some((xv as f32, yv as f32))
                     }
-                }
-                if let Some(s) = scale {
-                    let v = eval_expr_rng(&s, &self.state.variables, &mut self.state.rng_seed)
-                        .map_err(|e| format!("transform error: {e}"))?;
-                    if let Some(f) = v.as_float() {
-                        cmd = match cmd {
-                            Command::Transform {
-                                character,
-                                rotation,
-                                offset,
-                                opacity,
-                                layer,
-                                ..
-                            } => Command::Transform {
-                                character,
-                                rotation,
-                                scale: Some(f as f32),
-                                offset,
-                                opacity,
-                                layer,
-                            },
-                            _ => unreachable!(),
-                        };
-                    }
-                }
-                if let Some(o) = opacity {
-                    let v = eval_expr_rng(&o, &self.state.variables, &mut self.state.rng_seed)
-                        .map_err(|e| format!("transform error: {e}"))?;
-                    if let Some(f) = v.as_float() {
-                        cmd = match cmd {
-                            Command::Transform {
-                                character,
-                                rotation,
-                                scale,
-                                offset,
-                                layer,
-                                ..
-                            } => Command::Transform {
-                                character,
-                                rotation,
-                                scale,
-                                offset,
-                                opacity: Some(f as f32),
-                                layer,
-                            },
-                            _ => unreachable!(),
-                        };
-                    }
-                }
-                if let Some((x, y)) = offset {
-                    let xv = eval_expr_rng(&x, &self.state.variables, &mut self.state.rng_seed)
-                        .map_err(|e| format!("transform error: {e}"))?;
-                    let yv = eval_expr_rng(&y, &self.state.variables, &mut self.state.rng_seed)
-                        .map_err(|e| format!("transform error: {e}"))?;
-                    if let (Some(xf), Some(yf)) = (xv.as_float(), yv.as_float()) {
-                        cmd = match cmd {
-                            Command::Transform {
-                                character,
-                                rotation,
-                                scale,
-                                opacity,
-                                layer,
-                                ..
-                            } => Command::Transform {
-                                character,
-                                rotation,
-                                scale,
-                                offset: Some((xf as f32, yf as f32)),
-                                opacity,
-                                layer,
-                            },
-                            _ => unreachable!(),
-                        };
-                    }
-                }
-                if let Some(l) = layer {
-                    let layer_val = match l.as_str() {
-                        "background" => vnengine_core::Layer::Background,
-                        "midground" => vnengine_core::Layer::Midground,
-                        "foreground" => vnengine_core::Layer::Foreground,
-                        "overlay" => vnengine_core::Layer::Overlay,
-                        _ => vnengine_core::Layer::Foreground,
-                    };
-                    cmd = match cmd {
-                        Command::Transform {
-                            character,
-                            rotation,
-                            scale,
-                            offset,
-                            opacity,
-                            ..
-                        } => Command::Transform {
-                            character,
-                            rotation,
-                            scale,
-                            offset,
-                            opacity,
-                            layer: Some(layer_val),
-                        },
-                        _ => unreachable!(),
-                    };
-                }
-                Ok(ExecOutcome::Command(cmd))
+                    None => None,
+                };
+                let layer = layer.map(|l| parse_layer(&l));
+                Ok(ExecOutcome::Command(Command::Transform {
+                    character,
+                    rotation,
+                    scale,
+                    offset,
+                    opacity,
+                    layer,
+                }))
             }
             Stmt::While { cond, body } => {
-                if eval_expr(&cond, &self.state.variables)
+                if self
+                    .eval(&cond)
                     .map(|v| v.is_truthy())
                     .unwrap_or(false)
                 {
@@ -837,12 +1089,17 @@ impl Vm {
                 iterable,
                 body,
             } => {
-                let iter_val =
-                    eval_expr_rng(&iterable, &self.state.variables, &mut self.state.rng_seed)
-                        .map_err(|e| format!("for loop error: {e}"))?;
+                let iter_val = self
+                    .eval(&iterable)
+                    .map_err(|e| format!("for loop error: {e}"))?;
                 let items: Vec<Value> = match &iter_val {
                     Value::List(items) => items.clone(),
-                    _ => return Err("for loop iterable must be a list".into()),
+                    Value::Dict(map) => map.keys().cloned().map(Value::Str).collect(),
+                    Value::Str(s) => s
+                        .chars()
+                        .map(|c| Value::Str(c.to_string()))
+                        .collect(),
+                    _ => return Err("for loop iterable must be a list, dict or string".into()),
                 };
                 if items.is_empty() {
                     return Ok(ExecOutcome::Continue);
@@ -863,7 +1120,7 @@ impl Vm {
                 let mut values = Vec::with_capacity(args.len());
                 for arg in &args {
                     values.push(
-                        eval_expr_rng(arg, &self.state.variables, &mut self.state.rng_seed)
+                        self.eval(arg)
                             .map_err(|e| format!("plugin `{name}` argument error: {e}"))?,
                     );
                 }
@@ -886,7 +1143,7 @@ impl Vm {
                 color,
             } => {
                 let mut f = |e: &Expr| -> Result<f32, String> {
-                    eval_expr_rng(e, &self.state.variables, &mut self.state.rng_seed)
+                    self.eval(e)
                         .and_then(|v| v.as_float().ok_or("expected number".into()))
                         .map(|f| f as f32)
                 };
@@ -904,7 +1161,7 @@ impl Vm {
             Stmt::Unlight { name } => Ok(ExecOutcome::Command(Command::LightRemove { name })),
             Stmt::Ambient { r, g, b } => {
                 let mut f = |e: &Expr| -> Result<f32, String> {
-                    eval_expr_rng(e, &self.state.variables, &mut self.state.rng_seed)
+                    self.eval(e)
                         .and_then(|v| v.as_float().ok_or("expected number".into()))
                         .map(|f| f as f32)
                 };
@@ -915,11 +1172,10 @@ impl Vm {
             Stmt::Camera { x, y, zoom, over } => {
                 let mut f = |e: &Option<Expr>| -> Result<Option<f32>, String> {
                     match e {
-                        Some(e) => {
-                            eval_expr_rng(e, &self.state.variables, &mut self.state.rng_seed)
-                                .and_then(|v| v.as_float().ok_or("expected number".into()))
-                                .map(|f| Some(f as f32))
-                        }
+                        Some(e) => self
+                            .eval(e)
+                            .and_then(|v| v.as_float().ok_or("expected number".into()))
+                            .map(|f| Some(f as f32)),
                         None => Ok(None),
                     }
                 };
@@ -937,13 +1193,16 @@ impl Vm {
                 fade,
                 off,
             } => {
+                let track = match &track {
+                    Some(e) => Some(self.eval_str(e)?),
+                    None => None,
+                };
                 let mut f = |e: &Option<Expr>| -> Result<Option<f32>, String> {
                     match e {
-                        Some(e) => {
-                            eval_expr_rng(e, &self.state.variables, &mut self.state.rng_seed)
-                                .and_then(|v| v.as_float().ok_or("expected number".into()))
-                                .map(|f| Some(f as f32))
-                        }
+                        Some(e) => self
+                            .eval(e)
+                            .and_then(|v| v.as_float().ok_or("expected number".into()))
+                            .map(|f| Some(f as f32)),
                         None => Ok(None),
                     }
                 };
@@ -992,9 +1251,22 @@ pub fn eval_expr(expr: &Expr, vars: &HashMap<String, Value>) -> Result<Value, St
 }
 
 /// Evaluate an expression to a [`Value`], drawing randomness from `rng`.
+/// User-defined functions are unavailable in this context — use
+/// [`eval_expr_ctx`] with `fns` for full evaluation.
 pub fn eval_expr_rng(
     expr: &Expr,
     vars: &HashMap<String, Value>,
+    rng: &mut u64,
+) -> Result<Value, String> {
+    eval_expr_ctx(expr, vars, None, rng)
+}
+
+/// Full expression evaluation. `fns` optionally provides user-defined
+/// functions for `Expr::Call` resolution (builtins take precedence).
+pub(crate) fn eval_expr_ctx(
+    expr: &Expr,
+    vars: &HashMap<String, Value>,
+    fns: Option<&HashMap<String, FunctionDef>>,
     rng: &mut u64,
 ) -> Result<Value, String> {
     Ok(match expr {
@@ -1008,34 +1280,85 @@ pub fn eval_expr_rng(
         Expr::Bool(b) => Value::Bool(*b),
         Expr::None => Value::None,
         Expr::List(items) => {
-            let mut vals = Vec::new();
+            let mut vals = Vec::with_capacity(items.len());
             for item in items {
-                vals.push(eval_expr_rng(item, vars, rng)?);
+                vals.push(eval_expr_ctx(item, vars, fns, rng)?);
             }
             Value::List(vals)
         }
-        Expr::Index { collection, index } => {
-            let coll = eval_expr_rng(collection, vars, rng)?;
-            let idx = eval_expr_rng(index, vars, rng)?;
-            match (&coll, &idx) {
-                (Value::List(items), Value::Int(i)) => {
-                    if *i < 0 || *i as usize >= items.len() {
-                        return Err(format!("list index out of range: {i}"));
-                    }
-                    items[*i as usize].clone()
-                }
-                (Value::Str(s), Value::Int(i)) => {
-                    if *i < 0 || *i as usize >= s.len() {
-                        return Err(format!("string index out of range: {i}"));
-                    }
-                    Value::Str(s.chars().nth(*i as usize).unwrap_or_default().to_string())
-                }
-                _ => return Err("cannot index non-collection".into()),
+        Expr::Dict(entries) => {
+            let mut map = std::collections::BTreeMap::new();
+            for (k, v) in entries {
+                map.insert(k.clone(), eval_expr_ctx(v, vars, fns, rng)?);
             }
+            Value::Dict(map)
         }
-        Expr::Call { name, args } => eval_builtin(name, args, vars, rng)?,
+        Expr::Index { collection, index } => {
+            let coll = eval_expr_ctx(collection, vars, fns, rng)?;
+            let idx = eval_expr_ctx(index, vars, fns, rng)?;
+            index_value(&coll, &idx)?
+        }
+        Expr::Slice {
+            collection,
+            start,
+            end,
+        } => {
+            let coll = eval_expr_ctx(collection, vars, fns, rng)?;
+            let start = match start {
+                Some(e) => Some(
+                    eval_expr_ctx(e, vars, fns, rng)?
+                        .as_int()
+                        .ok_or("slice bound must be an integer")?,
+                ),
+                None => None,
+            };
+            let end = match end {
+                Some(e) => Some(
+                    eval_expr_ctx(e, vars, fns, rng)?
+                        .as_int()
+                        .ok_or("slice bound must be an integer")?,
+                ),
+                None => None,
+            };
+            slice_value(&coll, start, end)?
+        }
+        Expr::Attr { object, name } => {
+            let obj = eval_expr_ctx(object, vars, fns, rng)?;
+            match &obj {
+                Value::Dict(map) => map
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("dict has no key `{name}`")),
+                _ => Err("`.` attribute access only works on dicts".into()),
+            }?
+        }
+        Expr::MethodCall {
+            object,
+            name,
+            args,
+        } => {
+            let obj = eval_expr_ctx(object, vars, fns, rng)?;
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(eval_expr_ctx(a, vars, fns, rng)?);
+            }
+            eval_method(&obj, name, &vals)?
+        }
+        Expr::Call { name, args } => match eval_builtin(name, args, vars, fns, rng) {
+            Ok(v) => v,
+            Err(e) => {
+                if e.starts_with("unknown function") {
+                    if let Some(fns) = fns {
+                        if let Some(func) = fns.get(name) {
+                            return call_user_function(func, args, vars, fns, rng);
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        },
         Expr::UnaryOp { op, operand } => {
-            let v = eval_expr_rng(operand, vars, rng)?;
+            let v = eval_expr_ctx(operand, vars, fns, rng)?;
             match op {
                 UnaryOp::Neg => match v {
                     Value::Int(i) => Value::Int(-i),
@@ -1046,39 +1369,263 @@ pub fn eval_expr_rng(
             }
         }
         Expr::BinaryOp { op, lhs, rhs } => {
-            let l = eval_expr_rng(lhs, vars, rng)?;
-            let r = eval_expr_rng(rhs, vars, rng)?;
-            eval_binop(*op, l, r)?
+            let l = eval_expr_ctx(lhs, vars, fns, rng)?;
+            let r = eval_expr_ctx(rhs, vars, fns, rng)?;
+            eval_binop_pub(*op, l, r)?
         }
     })
 }
 
-/// Builtin expression functions. `random()` returns a float in [0, 1),
-/// `randint(lo, hi)` returns an integer in [lo, hi], and `srand(seed)`
-/// reseeds the PRNG and returns the seed.
+/// `collection[index]` — lists/strings by integer (negative counts
+/// from the end), dicts by string key.
+fn index_value(coll: &Value, idx: &Value) -> Result<Value, String> {
+    match (coll, idx) {
+        (Value::List(items), Value::Int(i)) => {
+            let len = items.len() as i64;
+            let i = if *i < 0 { len + i } else { *i };
+            if i < 0 || i >= len {
+                return Err(format!("list index out of range: {i}"));
+            }
+            Ok(items[i as usize].clone())
+        }
+        (Value::Str(s), Value::Int(i)) => {
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i64;
+            let i = if *i < 0 { len + i } else { *i };
+            if i < 0 || i >= len {
+                return Err(format!("string index out of range: {i}"));
+            }
+            Ok(Value::Str(chars[i as usize].to_string()))
+        }
+        (Value::Dict(map), Value::Str(k)) => map
+            .get(k)
+            .cloned()
+            .ok_or_else(|| format!("dict has no key `{k}`")),
+        (Value::Dict(_), _) => Err("dict keys are strings".into()),
+        _ => Err("cannot index non-collection".into()),
+    }
+}
+
+/// `collection[start:end]` — Python-style bounds (negative counts
+/// from the end, clamped to the collection).
+fn slice_value(coll: &Value, start: Option<i64>, end: Option<i64>) -> Result<Value, String> {
+    fn bounds(len: i64, start: Option<i64>, end: Option<i64>) -> (usize, usize) {
+        let norm = |v: Option<i64>, default: i64| -> i64 {
+            let v = v.unwrap_or(default);
+            if v < 0 {
+                (len + v).max(0)
+            } else {
+                v.min(len)
+            }
+        };
+        let s = norm(start, 0);
+        let e = norm(end, len);
+        (s.max(0) as usize, e.max(s).max(0) as usize)
+    }
+    match coll {
+        Value::List(items) => {
+            let (s, e) = bounds(items.len() as i64, start, end);
+            Ok(Value::List(items[s.min(e)..e.min(items.len())].to_vec()))
+        }
+        Value::Str(s) => {
+            let chars: Vec<char> = s.chars().collect();
+            let (s, e) = bounds(chars.len() as i64, start, end);
+            Ok(Value::Str(chars[s.min(e)..e.min(chars.len())].iter().collect()))
+        }
+        _ => Err("cannot slice non-collection".into()),
+    }
+}
+
+/// `expr.name(args...)` — read-only methods on strings, lists and
+/// dicts. Mutating methods are intentionally unsupported: values are
+/// immutable, use `x + [item]` or reassignment instead.
+fn eval_method(obj: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // String methods.
+    if let Value::Str(s) = obj {
+        return match name {
+            "upper" => no_args(name, args).map(|_| Value::Str(s.to_uppercase())),
+            "lower" => no_args(name, args).map(|_| Value::Str(s.to_lowercase())),
+            "strip" => no_args(name, args).map(|_| Value::Str(s.trim().to_string())),
+            "lstrip" => no_args(name, args).map(|_| Value::Str(s.trim_start().to_string())),
+            "rstrip" => no_args(name, args).map(|_| Value::Str(s.trim_end().to_string())),
+            "split" => {
+                if args.is_empty() {
+                    Ok(Value::List(
+                        s.split_whitespace()
+                            .map(|p| Value::Str(p.to_string()))
+                            .collect(),
+                    ))
+                } else if args.len() == 1 {
+                    let sep = args[0].as_str().unwrap_or_default();
+                    Ok(Value::List(
+                        s.split(sep.as_str())
+                            .map(|p| Value::Str(p.to_string()))
+                            .collect(),
+                    ))
+                } else {
+                    Err(format!("str.{name}() takes at most 1 argument"))
+                }
+            }
+            "replace" => {
+                if args.len() != 2 {
+                    return Err(format!("str.{name}() takes 2 arguments"));
+                }
+                let (old, new) = (args[0].as_str().unwrap_or_default(), args[1].as_str().unwrap_or_default());
+                Ok(Value::Str(s.replace(old.as_str(), new.as_str())))
+            }
+            "startswith" | "endswith" => {
+                if args.len() != 1 {
+                    return Err(format!("str.{name}() takes 1 argument"));
+                }
+                let p = args[0].as_str().unwrap_or_default();
+                Ok(Value::Bool(if name == "startswith" {
+                    s.starts_with(p.as_str())
+                } else {
+                    s.ends_with(p.as_str())
+                }))
+            }
+            "count" | "find" | "index" => {
+                if args.len() != 1 {
+                    return Err(format!("str.{name}() takes 1 argument"));
+                }
+                let sub = args[0].as_str().unwrap_or_default();
+                match name {
+                    "count" => Ok(Value::Int(s.matches(sub.as_str()).count() as i64)),
+                    "find" => Ok(Value::Int(
+                        s.find(sub.as_str()).map(|i| i as i64).unwrap_or(-1),
+                    )),
+                    _ => Ok(Value::Int(
+                        s.find(sub.as_str()).map(|i| i as i64).unwrap_or(-1),
+                    )),
+                }
+            }
+            _ => Err(format!("unknown string method `{name}`")),
+        };
+    }
+    // List methods.
+    if let Value::List(items) = obj {
+        return match name {
+            "count" => {
+                if args.len() != 1 {
+                    return Err("list.count() takes 1 argument".into());
+                }
+                Ok(Value::Int(
+                    items.iter().filter(|v| values_eq_pub(v, &args[0])).count() as i64,
+                ))
+            }
+            "index" => {
+                if args.len() != 1 {
+                    return Err("list.index() takes 1 argument".into());
+                }
+                Ok(Value::Int(
+                    items
+                        .iter()
+                        .position(|v| values_eq_pub(v, &args[0]))
+                        .map(|i| i as i64)
+                        .unwrap_or(-1),
+                ))
+            }
+            "join" => {
+                if args.len() != 1 {
+                    return Err("list.join() takes 1 argument (separator)".into());
+                }
+                let sep = args[0].as_str().unwrap_or_default();
+                let parts: Vec<String> = items.iter().map(|v| v.to_string()).collect();
+                Ok(Value::Str(parts.join(sep.as_str())))
+            }
+            "sorted" => no_args(name, args).and_then(|_| {
+                let mut sorted = items.clone();
+                sorted.sort_by(|a, b| value_cmp(a, b).unwrap_or(std::cmp::Ordering::Equal));
+                Ok(Value::List(sorted))
+            }),
+            "reversed" => no_args(name, args).map(|_| {
+                let mut r = items.clone();
+                r.reverse();
+                Value::List(r)
+            }),
+            _ => Err(format!("unknown list method `{name}`")),
+        };
+    }
+    // Dict methods.
+    if let Value::Dict(map) = obj {
+        return match name {
+            "keys" => no_args(name, args).map(|_| {
+                Value::List(map.keys().cloned().map(Value::Str).collect())
+            }),
+            "values" => no_args(name, args).map(|_| Value::List(map.values().cloned().collect())),
+            "items" => no_args(name, args).map(|_| {
+                Value::List(
+                    map.iter()
+                        .map(|(k, v)| Value::List(vec![Value::Str(k.clone()), v.clone()]))
+                        .collect(),
+                )
+            }),
+            "get" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err("dict.get() takes 1 or 2 arguments".into());
+                }
+                let key = args[0].as_str().unwrap_or_default();
+                Ok(map
+                    .get(key.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| args.get(1).cloned().unwrap_or(Value::None)))
+            }
+            _ => Err(format!("unknown dict method `{name}`")),
+        };
+    }
+    Err(format!("method `{name}` not supported on {obj}"))
+}
+
+fn no_args(name: &str, args: &[Value]) -> Result<(), String> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("method `{name}` takes no arguments"))
+    }
+}
+
+/// Builtin expression functions. In addition to the PRNG helpers
+/// (`random`, `randint`, `srand`), this covers conversions, collection
+/// utilities and string helpers. User functions are resolved by the
+/// caller when the builtin lookup fails.
 fn eval_builtin(
     name: &str,
     args: &[Expr],
     vars: &HashMap<String, Value>,
+    fns: Option<&HashMap<String, FunctionDef>>,
     rng: &mut u64,
 ) -> Result<Value, String> {
+    // Evaluate all argument expressions up front for the builtins that
+    // need values rather than syntax.
+    fn eval_args(
+        args: &[Expr],
+        vars: &HashMap<String, Value>,
+        fns: Option<&HashMap<String, FunctionDef>>,
+        rng: &mut u64,
+    ) -> Result<Vec<Value>, String> {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(eval_expr_ctx(a, vars, fns, rng)?);
+        }
+        Ok(vals)
+    }
+    let arity = |n: usize| -> Result<(), String> {
+        if args.len() == n {
+            Ok(())
+        } else {
+            Err(format!("{name}() takes {n} argument(s), got {}", args.len()))
+        }
+    };
     match name {
         "random" => {
-            if !args.is_empty() {
-                return Err("random() takes no arguments".into());
-            }
+            arity(0)?;
             Ok(Value::Float(next_f64(rng)))
         }
         "randint" => {
-            if args.len() != 2 {
-                return Err("randint() takes two arguments".into());
-            }
-            let lo = eval_expr_rng(&args[0], vars, rng)?
-                .as_int()
-                .ok_or("randint() bounds must be integers")?;
-            let hi = eval_expr_rng(&args[1], vars, rng)?
-                .as_int()
-                .ok_or("randint() bounds must be integers")?;
+            arity(2)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            let lo = vals[0].as_int().ok_or("randint() bounds must be integers")?;
+            let hi = vals[1].as_int().ok_or("randint() bounds must be integers")?;
             if lo > hi {
                 return Err(format!("randint() invalid range {lo}..{hi}"));
             }
@@ -1086,16 +1633,303 @@ fn eval_builtin(
             Ok(Value::Int(lo + (next_u64(rng) % span) as i64))
         }
         "srand" => {
-            if args.len() != 1 {
-                return Err("srand() takes one argument".into());
-            }
-            let seed = eval_expr_rng(&args[0], vars, rng)?
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            let seed = vals[0]
                 .as_int()
                 .ok_or("srand() seed must be an integer")?;
             *rng = (seed as u64) | 1;
             Ok(Value::Int(seed))
         }
+        "len" => {
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            match &vals[0] {
+                Value::List(l) => Ok(Value::Int(l.len() as i64)),
+                Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
+                Value::Dict(d) => Ok(Value::Int(d.len() as i64)),
+                _ => Err("len() argument must be a list, string or dict".into()),
+            }
+        }
+        "str" => {
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            Ok(Value::Str(vals[0].to_string()))
+        }
+        "int" => {
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            match &vals[0] {
+                Value::Int(i) => Ok(Value::Int(*i)),
+                Value::Float(f) => Ok(Value::Int(*f as i64)),
+                Value::Bool(b) => Ok(Value::Int(*b as i64)),
+                Value::Str(s) => s
+                    .trim()
+                    .parse::<i64>()
+                    .map(Value::Int)
+                    .map_err(|_| format!("cannot convert `{s}` to int")),
+                _ => Err("cannot convert to int".into()),
+            }
+        }
+        "float" => {
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            match &vals[0] {
+                Value::Int(i) => Ok(Value::Float(*i as f64)),
+                Value::Float(f) => Ok(Value::Float(*f)),
+                Value::Bool(b) => Ok(Value::Float(*b as i64 as f64)),
+                Value::Str(s) => s
+                    .trim()
+                    .parse::<f64>()
+                    .map(Value::Float)
+                    .map_err(|_| format!("cannot convert `{s}` to float")),
+                _ => Err("cannot convert to float".into()),
+            }
+        }
+        "bool" => {
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            Ok(Value::Bool(vals[0].is_truthy()))
+        }
+        "abs" => {
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            match &vals[0] {
+                Value::Int(i) => Ok(Value::Int(i.abs())),
+                Value::Float(f) => Ok(Value::Float(f.abs())),
+                _ => Err("abs() argument must be a number".into()),
+            }
+        }
+        "min" | "max" => {
+            if args.is_empty() {
+                return Err(format!("{name}() takes at least 1 argument"));
+            }
+            let vals = eval_args(args, vars, fns, rng)?;
+            // `min(list)` / `max(list)` fold a single list argument.
+            let items: &[Value] = if vals.len() == 1 {
+                match &vals[0] {
+                    Value::List(l) => l,
+                    v => std::slice::from_ref(v),
+                }
+            } else {
+                &vals
+            };
+            if items.is_empty() {
+                return Err(format!("{name}() on empty sequence"));
+            }
+            let mut best = &items[0];
+            for v in &items[1..] {
+                let ord = value_cmp(v, best)?;
+                if (name == "min" && ord == std::cmp::Ordering::Less)
+                    || (name == "max" && ord == std::cmp::Ordering::Greater)
+                {
+                    best = v;
+                }
+            }
+            Ok(best.clone())
+        }
+        "round" => {
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            match &vals[0] {
+                Value::Int(i) => Ok(Value::Int(*i)),
+                Value::Float(f) => Ok(Value::Int(f.round() as i64)),
+                _ => Err("round() argument must be a number".into()),
+            }
+        }
+        "choice" => {
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            match &vals[0] {
+                Value::List(items) if !items.is_empty() => {
+                    let i = (next_u64(rng) % items.len() as u64) as usize;
+                    Ok(items[i].clone())
+                }
+                Value::List(_) => Err("choice() on empty list".into()),
+                _ => Err("choice() argument must be a list".into()),
+            }
+        }
+        "sample" => {
+            arity(2)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            let (Value::List(items), Some(n)) = (&vals[0], vals[1].as_int()) else {
+                return Err("sample() takes (list, n)".into());
+            };
+            let mut pool = items.clone();
+            let n = (n.max(0) as usize).min(pool.len());
+            for i in 0..n {
+                let j = i + (next_u64(rng) % (pool.len() - i) as u64) as usize;
+                pool.swap(i, j);
+            }
+            pool.truncate(n);
+            Ok(Value::List(pool))
+        }
+        "shuffle" => {
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            match &vals[0] {
+                Value::List(items) => {
+                    let mut out = items.clone();
+                    for i in (1..out.len()).rev() {
+                        let j = (next_u64(rng) % (i as u64 + 1)) as usize;
+                        out.swap(i, j);
+                    }
+                    Ok(Value::List(out))
+                }
+                _ => Err("shuffle() argument must be a list".into()),
+            }
+        }
+        "range" => {
+            if args.is_empty() || args.len() > 3 {
+                return Err("range() takes 1 to 3 arguments".into());
+            }
+            let vals = eval_args(args, vars, fns, rng)?;
+            let ints: Vec<i64> = vals
+                .iter()
+                .map(|v| v.as_int().ok_or("range() bounds must be integers"))
+                .collect::<Result<_, _>>()?;
+            let (start, end, step) = match ints.as_slice() {
+                [n] => (0, *n, 1),
+                [a, b] => (*a, *b, 1),
+                [a, b, s] => (*a, *b, *s),
+                _ => unreachable!(),
+            };
+            if step == 0 {
+                return Err("range() step cannot be 0".into());
+            }
+            let mut out = Vec::new();
+            let mut cur = start;
+            while (step > 0 && cur < end) || (step < 0 && cur > end) {
+                out.push(Value::Int(cur));
+                cur += step;
+                if out.len() > 1_000_000 {
+                    return Err("range() result too large".into());
+                }
+            }
+            Ok(Value::List(out))
+        }
+        "sorted" => {
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            match &vals[0] {
+                Value::List(items) => {
+                    let mut sorted = items.clone();
+                    sorted.sort_by(|a, b| {
+                        value_cmp(a, b).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    Ok(Value::List(sorted))
+                }
+                _ => Err("sorted() argument must be a list".into()),
+            }
+        }
+        "reversed" => {
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            match &vals[0] {
+                Value::List(items) => {
+                    let mut r = items.clone();
+                    r.reverse();
+                    Ok(Value::List(r))
+                }
+                Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
+                _ => Err("reversed() argument must be a list or string".into()),
+            }
+        }
+        "keys" | "values" | "items" => {
+            arity(1)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            match &vals[0] {
+                Value::Dict(map) => Ok(match name {
+                    "keys" => Value::List(
+                        map.keys().cloned().map(Value::Str).collect(),
+                    ),
+                    "values" => Value::List(map.values().cloned().collect()),
+                    _ => Value::List(
+                        map.iter()
+                            .map(|(k, v)| Value::List(vec![Value::Str(k.clone()), v.clone()]))
+                            .collect(),
+                    ),
+                }),
+                _ => Err(format!("{name}() argument must be a dict")),
+            }
+        }
+        "has" => {
+            arity(2)?;
+            let vals = eval_args(args, vars, fns, rng)?;
+            match (&vals[0], &vals[1]) {
+                (Value::Dict(map), Value::Str(k)) => Ok(Value::Bool(map.contains_key(k))),
+                (Value::List(items), v) => Ok(Value::Bool(items.iter().any(|i| values_eq_pub(i, v)))),
+                (Value::Str(s), Value::Str(sub)) => Ok(Value::Bool(s.contains(sub.as_str()))),
+                _ => Err("has() unsupported operand types".into()),
+            }
+        }
+        "get" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err("get() takes 2 or 3 arguments (dict, key[, default])".into());
+            }
+            let vals = eval_args(args, vars, fns, rng)?;
+            match &vals[0] {
+                Value::Dict(map) => {
+                    let key = vals[1].as_str().unwrap_or_default();
+                    Ok(map
+                        .get(key.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| vals.get(2).cloned().unwrap_or(Value::None)))
+                }
+                _ => Err("get() first argument must be a dict".into()),
+            }
+        }
+        // String helpers (also available as methods): first argument is
+        // the receiver, the rest are method arguments.
+        "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "split" | "replace"
+        | "startswith" | "endswith" | "count" | "find" | "index" | "join" => {
+            let vals = eval_args(args, vars, fns, rng)?;
+            let Some((obj, rest)) = vals.split_first() else {
+                return Err(format!("{name}() takes at least 1 argument"));
+            };
+            eval_method(obj, name, rest)
+        }
         _ => Err(format!("unknown function `{name}()`")),
+    }
+}
+
+/// Shared equality for builtins/methods (mirrors `values_eq`).
+#[allow(dead_code)]
+fn values_eq_pub(a: &Value, b: &Value) -> bool {
+    values_eq(a, b)
+}
+
+/// Ordering for `sorted`/`min`/`max`: numbers compare numerically,
+/// strings lexicographically, bools false<true, lists lexicographically.
+fn value_cmp(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
+        (Value::Float(x), Value::Float(y)) => Ok(x.partial_cmp(y).unwrap_or(Ordering::Equal)),
+        (Value::Int(x), Value::Float(y)) => Ok((*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)),
+        (Value::Float(x), Value::Int(y)) => Ok(x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)),
+        (Value::Str(x), Value::Str(y)) => Ok(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
+        (Value::List(x), Value::List(y)) => {
+            for (xi, yi) in x.iter().zip(y.iter()) {
+                let ord = value_cmp(xi, yi)?;
+                if ord != Ordering::Equal {
+                    return Ok(ord);
+                }
+            }
+            Ok(x.len().cmp(&y.len()))
+        }
+        _ => Err(format!("cannot compare {a} and {b}")),
+    }
+}
+
+/// Map a layer name from script text to a [`Layer`].
+fn parse_layer(name: &str) -> Layer {
+    match name {
+        "background" => Layer::Background,
+        "midground" => Layer::Midground,
+        "overlay" => Layer::Overlay,
+        _ => Layer::Foreground,
     }
 }
 
@@ -1108,6 +1942,11 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Bool(b) => serde_json::json!(*b),
         Value::None => serde_json::Value::Null,
         Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
+        Value::Dict(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -1125,7 +1964,9 @@ fn next_f64(rng: &mut u64) -> f64 {
     (next_u64(rng) >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
 }
 
-fn eval_binop(op: BinaryOp, l: Value, r: Value) -> Result<Value, String> {
+/// Binary operator evaluation, shared with the function interpreter
+/// (`funcs.rs`).
+pub(crate) fn eval_binop_pub(op: BinaryOp, l: Value, r: Value) -> Result<Value, String> {
     use BinaryOp::*;
     Ok(match op {
         Add => match (l, r) {
@@ -1141,21 +1982,70 @@ fn eval_binop(op: BinaryOp, l: Value, r: Value) -> Result<Value, String> {
                 combined.extend(b);
                 Value::List(combined)
             }
+            (Value::Dict(mut a), Value::Dict(b)) => {
+                a.extend(b);
+                Value::Dict(a)
+            }
             _ => return Err("invalid operands for `+`".into()),
         },
         Sub => num_op(l, r, |a, b| a - b, |a, b| a - b)?,
-        Mul => num_op(l, r, |a, b| a * b, |a, b| a * b)?,
-        Div => num_op(l, r, |a, b| a / b, |a, b| a / b)?,
-        Mod => num_op(l, r, |a, b| a % b, |a, b| a % b)?,
+        Mul => match (&l, &r) {
+            // `"ab" * 3` → "ababab" (string repetition).
+            (Value::Str(s), Value::Int(n)) | (Value::Int(n), Value::Str(s)) => {
+                if *n <= 0 {
+                    Value::Str(String::new())
+                } else {
+                    Value::Str(s.repeat(*n as usize))
+                }
+            }
+            _ => num_op(l, r, |a, b| a * b, |a, b| a * b)?,
+        },
+        Div => {
+            if is_zero(&r) {
+                return Err("division by zero".into());
+            }
+            num_op(l, r, |a, b| a.wrapping_div(b), |a, b| a / b)?
+        }
+        Mod => {
+            if is_zero(&r) {
+                return Err("division by zero".into());
+            }
+            num_op(l, r, |a, b| a.wrapping_rem(b), |a, b| a % b)?
+        }
         Eq => Value::Bool(values_eq(&l, &r)),
         Neq => Value::Bool(!values_eq(&l, &r)),
         Lt => Value::Bool(cmp(&l, &r)? == std::cmp::Ordering::Less),
         Gt => Value::Bool(cmp(&l, &r)? == std::cmp::Ordering::Greater),
         Le => Value::Bool(cmp(&l, &r)? != std::cmp::Ordering::Greater),
         Ge => Value::Bool(cmp(&l, &r)? != std::cmp::Ordering::Less),
+        In => Value::Bool(contains(&l, &r)?),
+        NotIn => Value::Bool(!contains(&l, &r)?),
+        Is => Value::Bool(values_eq(&l, &r)),
+        IsNot => Value::Bool(!values_eq(&l, &r)),
         And => Value::Bool(l.is_truthy() && r.is_truthy()),
         Or => Value::Bool(l.is_truthy() || r.is_truthy()),
     })
+}
+
+fn is_zero(v: &Value) -> bool {
+    matches!(v, Value::Int(0)) || matches!(v, Value::Float(f) if *f == 0.0)
+}
+
+/// `a in b` membership: list items (by equality), string substring,
+/// dict keys.
+fn contains(item: &Value, container: &Value) -> Result<bool, String> {
+    match container {
+        Value::List(items) => Ok(items.iter().any(|v| values_eq(v, item))),
+        Value::Str(s) => match item {
+            Value::Str(sub) => Ok(s.contains(sub.as_str())),
+            _ => Err("`in` on a string requires a string operand".into()),
+        },
+        Value::Dict(map) => match item {
+            Value::Str(k) => Ok(map.contains_key(k)),
+            _ => Err("`in` on a dict requires a string key".into()),
+        },
+        _ => Err("`in` requires a list, string or dict".into()),
+    }
 }
 
 fn num_op(
@@ -1180,6 +2070,8 @@ fn values_eq(l: &Value, r: &Value) -> bool {
         (Value::Int(a), Value::Int(b)) => a == b,
         (Value::Float(a), Value::Float(b)) => a == b,
         (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::List(a), Value::List(b)) => a == b,
+        (Value::Dict(a), Value::Dict(b)) => a == b,
         (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
         (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
         _ => false,

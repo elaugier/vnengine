@@ -404,7 +404,7 @@ impl App {
                     scene.fade_overlay = [0.0; 4];
                     return;
                 }
-                Command::Show(_) | Command::Hide { .. } => {
+                Command::Show(_) | Command::Hide { .. } | Command::HideAll { .. } => {
                     for s in &mut scene.sprites {
                         s.entering = None;
                     }

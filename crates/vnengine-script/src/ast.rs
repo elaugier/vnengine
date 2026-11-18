@@ -57,65 +57,92 @@ pub enum Definition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Label {
     pub name: String,
+    /// Optional parameters: `label name(a, b):` — bound as variables
+    /// when the label is invoked via `call name(arg, ...)`.
+    #[serde(default)]
+    pub params: Vec<String>,
     pub body: Vec<Stmt>,
 }
 
 /// A statement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Stmt {
-    /// `scene <image> [with <transition>]`
+    /// `scene <image> [with <transition>]` — `image` is an expression
+    /// evaluating to a string (or `None` to clear).
     Scene {
-        image: Option<String>,
+        image: Option<Expr>,
         transition: Option<TransitionSpec>,
     },
-    /// `show <character> <image> [at <anchor>] [with <transition>]`
+    /// `show <character> <image> [at <anchor>] [layer=<layer>] [with <transition>]`
+    /// `image` is an expression evaluating to a string; `show e [expr]`
+    /// appends the evaluated suffix to the character name.
     Show {
         character: String,
-        image: String,
+        image: Expr,
         anchor: Option<AnchorExpr>,
         position: Option<(Expr, Expr)>,
         scale: Option<Expr>,
         z: Option<Expr>,
+        layer: Option<String>,
         transition: Option<TransitionSpec>,
     },
-    /// `hide <character> [with <transition>]`
+    /// `hide <character> [with <transition>]` or bare `hide [with <transition>]`
+    /// (equivalent to `hide all`).
     Hide {
-        character: String,
+        character: Option<String>,
         transition: Option<TransitionSpec>,
     },
     /// `<speaker> "<text>"` or `"<text>"` (narration)
     Say {
         speaker: Option<String>,
         text: String,
-        voice: Option<String>,
-        side_image: Option<String>,
+        voice: Option<Expr>,
+        side_image: Option<Expr>,
+        transition: Option<TransitionSpec>,
     },
-    /// `menu [prompt]: <choices>`
+    /// `menu [prompt] [with <trans>] [set <var>]: <choices>` — `set`
+    /// stores the chosen index (0-based) into `<var>` on selection.
     Menu {
-        prompt: Option<String>,
+        prompt: Option<Expr>,
+        #[serde(default)]
+        transition: Option<TransitionSpec>,
+        #[serde(default)]
+        set_var: Option<String>,
         choices: Vec<MenuChoice>,
     },
-    /// `jump <label>`
-    Jump { label: String },
-    /// `call <label>`
-    Call { label: String },
-    /// `return`
+    /// `jump <expr>` — the expression must evaluate to a label name.
+    Jump { label: Expr },
+    /// `call <expr>` — `call name` invokes a zero-arg user function or
+    /// jumps to the label; `call f(args)` (parsed as a call expression)
+    /// invokes a function with arguments; any other expression is
+    /// evaluated to a label name.
+    Call { label: Expr },
+    /// `return` — exits the innermost `call` frame.
     Return,
+    /// `return <expr>` — exits a user function with a value. Inside a
+    /// label `call` the value is discarded.
+    ReturnValue { value: Expr },
+    /// `with <transition>` — standalone transition over the current scene.
+    With { transition: TransitionSpec },
+    /// `break` — exit the innermost loop.
+    Break,
+    /// `continue` — skip to the next loop iteration.
+    Continue,
     /// `if <cond>: ... [elif <cond>: ...] [else: ...]`
     If {
         branches: Vec<(Expr, Vec<Stmt>)>,
         else_branch: Option<Vec<Stmt>>,
     },
-    /// `pause <seconds>`
-    Pause { seconds: Expr },
-    /// `play music "<track>" [fade <s>]`
-    PlayMusic { track: String, fade: f32 },
+    /// `pause [<seconds>]` — without a duration, waits for player input.
+    Pause { seconds: Option<Expr> },
+    /// `play music <expr> [fade <s>]`
+    PlayMusic { track: Expr, fade: f32 },
     /// `stop music [fade <s>]`
     StopMusic { fade: f32 },
-    /// `play sfx "<track>" [volume <v>]`
-    PlaySfx { track: String, volume: f32 },
-    /// `voice "<track>"`
-    PlayVoice { track: String },
+    /// `play sfx <expr> [volume <v>]`
+    PlaySfx { track: Expr, volume: f32 },
+    /// `voice <expr>`
+    PlayVoice { track: Expr },
     /// `stop voice`
     StopVoice,
     /// `$ <name> = <expr>` or `set <name> = <expr>`
@@ -162,7 +189,7 @@ pub enum Stmt {
     /// to remove the layer.
     MusicLayer {
         name: String,
-        track: Option<String>,
+        track: Option<Expr>,
         volume: Option<Expr>,
         fade: Option<Expr>,
         off: bool,
@@ -228,12 +255,32 @@ pub enum Expr {
     None,
     /// List literal: `[expr, expr, ...]`
     List(Vec<Expr>),
-    /// Index access: `expr[expr]`
+    /// Dict literal: `{ "key": expr, ... }` (keys may be idents or strings).
+    Dict(Vec<(String, Expr)>),
+    /// Index access: `expr[expr]` — lists/strings by int, dicts by string.
     Index {
         collection: Box<Expr>,
         index: Box<Expr>,
     },
-    /// Builtin function call: `random()`, `randint(a, b)`, `srand(seed)`.
+    /// Slice access: `expr[start:end]` — bounds optional (`a[:]`).
+    Slice {
+        collection: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+    },
+    /// Attribute access: `expr.name` — dict key lookup sugar.
+    Attr {
+        object: Box<Expr>,
+        name: String,
+    },
+    /// Method call: `expr.name(args...)` — read-only methods on
+    /// lists/strings/dicts (e.g. `name.upper()`, `items.count(x)`).
+    MethodCall {
+        object: Box<Expr>,
+        name: String,
+        args: Vec<Expr>,
+    },
+    /// Builtin or user-function call: `random()`, `len(x)`, `f(y)`.
     Call {
         name: String,
         args: Vec<Expr>,
@@ -268,6 +315,14 @@ pub enum BinaryOp {
     Gt,
     Le,
     Ge,
+    /// `a in b` — membership (list items, string substring, dict keys).
+    In,
+    /// `a not in b`.
+    NotIn,
+    /// `a is b` — identity-ish comparison (mainly `x is None`).
+    Is,
+    /// `a is not b`.
+    IsNot,
     And,
     Or,
 }

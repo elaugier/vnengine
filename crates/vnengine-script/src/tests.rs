@@ -32,7 +32,9 @@ label start:
     let script = Parser::parse(src).unwrap();
     let label = &script.labels[0];
     match &label.body[0] {
-        Stmt::Menu { prompt, choices } => {
+        Stmt::Menu {
+            prompt, choices, ..
+        } => {
             assert!(prompt.is_none());
             assert_eq!(choices.len(), 2);
             assert_eq!(choices[0].text, "Go left");
@@ -1521,4 +1523,451 @@ fn light_statement_parses() {
 fn light_requires_named_params() {
     let src = "label start:\n    light \"torch\" x=0.5\n    end\n";
     assert!(Parser::parse(src).is_err());
+}
+
+// ---- Phase 1: dicts, slicing, operators, builtins, functions, dynamics ----
+
+#[test]
+fn expr_dict_literal_and_access() {
+    use crate::vm::eval_expr;
+    use std::collections::HashMap;
+    use vnengine_core::Value;
+    let vars = HashMap::new();
+
+    let val = eval_expr(&Parser::parse_expr(r#"{name: "Ana", age: 30}"#), &vars).unwrap();
+    match &val {
+        Value::Dict(m) => {
+            assert_eq!(m["name"], Value::Str("Ana".into()));
+            assert_eq!(m["age"], Value::Int(30));
+        }
+        other => panic!("expected Dict, got {other:?}"),
+    }
+    // d["key"] form.
+    let mut vars1 = HashMap::new();
+    vars1.insert("d".to_string(), val.clone());
+    assert_eq!(
+        eval_expr(&Parser::parse_expr(r#"d["name"]"#), &vars1).unwrap(),
+        Value::Str("Ana".into())
+    );
+    // d.key form.
+    let mut vars2 = HashMap::new();
+    vars2.insert("d".to_string(), val);
+    assert_eq!(
+        eval_expr(&Parser::parse_expr("d.age"), &vars2).unwrap(),
+        Value::Int(30)
+    );
+    assert!(eval_expr(&Parser::parse_expr("d.missing"), &vars2).is_err());
+}
+
+#[test]
+fn expr_slicing() {
+    use crate::vm::eval_expr;
+    use std::collections::HashMap;
+    use vnengine_core::Value;
+    let vars = HashMap::new();
+
+    assert_eq!(
+        eval_expr(&Parser::parse_expr("[1,2,3,4][1:3]"), &vars).unwrap(),
+        Value::List(vec![Value::Int(2), Value::Int(3)])
+    );
+    assert_eq!(
+        eval_expr(&Parser::parse_expr("[1,2,3,4][-2:]"), &vars).unwrap(),
+        Value::List(vec![Value::Int(3), Value::Int(4)])
+    );
+    assert_eq!(
+        eval_expr(&Parser::parse_expr("\"hello\"[1:4]"), &vars).unwrap(),
+        Value::Str("ell".into())
+    );
+    assert_eq!(
+        eval_expr(&Parser::parse_expr("[1,2,3][:]"), &vars).unwrap(),
+        Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+}
+
+#[test]
+fn expr_in_is_operators() {
+    use crate::vm::eval_expr;
+    use std::collections::HashMap;
+    use vnengine_core::Value;
+    let vars = HashMap::new();
+
+    assert_eq!(
+        eval_expr(&Parser::parse_expr("3 in [1,2,3]"), &vars).unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&Parser::parse_expr("5 not in [1,2,3]"), &vars).unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&Parser::parse_expr("\"ell\" in \"hello\""), &vars).unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&Parser::parse_expr("\"k\" in {k: 1}"), &vars).unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&Parser::parse_expr("None is None"), &vars).unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&Parser::parse_expr("1 is not None"), &vars).unwrap(),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn expr_builtins() {
+    use crate::vm::eval_expr;
+    use std::collections::HashMap;
+    use vnengine_core::Value;
+    let vars = HashMap::new();
+    let ev = |s: &str| eval_expr(&Parser::parse_expr(s), &vars).unwrap();
+
+    assert_eq!(ev("len([1,2,3])"), Value::Int(3));
+    assert_eq!(ev("len(\"hello\")"), Value::Int(5));
+    assert_eq!(ev("str(42)"), Value::Str("42".into()));
+    assert_eq!(ev("int(\"7\")"), Value::Int(7));
+    assert_eq!(ev("float(2)"), Value::Float(2.0));
+    assert_eq!(ev("abs(-3)"), Value::Int(3));
+    assert_eq!(ev("min(3,1,2)"), Value::Int(1));
+    assert_eq!(ev("max([4,9,2])"), Value::Int(9));
+    assert_eq!(ev("round(2.6)"), Value::Int(3));
+    assert_eq!(
+        ev("range(3)"),
+        Value::List(vec![Value::Int(0), Value::Int(1), Value::Int(2)])
+    );
+    assert_eq!(
+        ev("sorted([3,1,2])"),
+        Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+    assert_eq!(
+        ev("keys({b:1,a:2})"),
+        Value::List(vec![Value::Str("a".into()), Value::Str("b".into())])
+    );
+    assert_eq!(ev("has([1,2], 2)"), Value::Bool(true));
+    assert_eq!(ev("get({a: 5}, \"a\", 0)"), Value::Int(5));
+    // choice draws from the deterministic stream.
+    let c = ev("choice([\"x\",\"y\",\"z\"])");
+    assert!(matches!(c, Value::Str(_)));
+}
+
+#[test]
+fn expr_methods_and_string_ops() {
+    use crate::vm::eval_expr;
+    use std::collections::HashMap;
+    use vnengine_core::Value;
+    let vars = HashMap::new();
+    let ev = |s: &str| eval_expr(&Parser::parse_expr(s), &vars).unwrap();
+
+    assert_eq!(ev("\"AbC\".lower()"), Value::Str("abc".into()));
+    assert_eq!(ev("\"a,b,c\".split(\",\")").as_list().unwrap().len(), 3);
+    assert_eq!(ev("\"hello\".count(\"l\")"), Value::Int(2));
+    assert_eq!(
+        ev("[3,1,2].sorted()"),
+        Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+    assert_eq!(ev("[\"a\",\"b\"].join(\"-\")"), Value::Str("a-b".into()));
+    assert_eq!(ev("\"ab\" * 3"), Value::Str("ababab".into()));
+}
+
+#[test]
+fn vm_function_in_expression() {
+    let src = r##"
+def double(x):
+    return x * 2
+
+def greet(name):
+    $ msg = "Hi " + name
+    return msg
+
+label start:
+    $ a = double(21)
+    $ b = greet("Ana")
+    e "a=[a] b=[b]"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let cmd = step_until_command(&mut vm);
+    match cmd {
+        Command::Say { text, .. } => assert_eq!(text, "a=42 b=Hi Ana"),
+        other => panic!("expected Say, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_function_blocks_and_loops() {
+    let src = r##"
+def sum_to(n):
+    $ total = 0
+    $ i = 0
+    while i < n:
+        $ total += i
+        $ i += 1
+    for x in [1, 2, 3]:
+        $ total += x
+    return total
+
+label start:
+    $ v = sum_to(4)
+    e "sum=[v]"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let cmd = step_until_command(&mut vm);
+    match cmd {
+        Command::Say { text, .. } => assert_eq!(text, "sum=12"), // 0+1+2+3 + 1+2+3
+        other => panic!("expected Say, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_call_function_with_args_statement() {
+    let src = r##"
+def announce(msg):
+    e "[msg]!"
+    return
+
+label start:
+    call announce("hey")
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    // `call f(args)` runs the function body as a frame: `e "..."` blocks.
+    let cmd = step_until_command(&mut vm);
+    match cmd {
+        Command::Say { text, .. } => assert_eq!(text, "hey!"),
+        other => panic!("expected Say, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_function_rejects_blocking_statements() {
+    let src = r##"
+def bad():
+    e "nope"
+    return 1
+
+label start:
+    $ x = bad()
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    while !matches!(vm.step(), StepResult::Finished) {}
+    assert!(vm.state.finished);
+}
+
+#[test]
+fn vm_dynamic_assets_and_jump() {
+    let src = r##"
+define e = Character("Eileen")
+
+label start:
+    $ mood = "happy"
+    $ bg = "school"
+    $ sfx = "click"
+    scene [bg]
+    show e [mood] at center
+    play sfx [sfx]
+    jump ["end" + "ing"]
+label ending:
+    e "done"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    assert!(matches!(
+        step_until_command(&mut vm),
+        Command::Scene { image: Some(ref i), .. } if i == "school"
+    ));
+    assert!(matches!(
+        step_until_command(&mut vm),
+        Command::Show(ref s) if s.image == "e happy"
+    ));
+    assert!(matches!(
+        step_until_command(&mut vm),
+        Command::PlaySfx { ref track, .. } if track == "click"
+    ));
+    match step_until_command(&mut vm) {
+        Command::Say { text, .. } => assert_eq!(text, "done"),
+        other => panic!("expected Say, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_pause_without_duration_waits_for_input() {
+    let src = "label start:\n    pause\n    end\n";
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    assert!(matches!(step_until_command(&mut vm), Command::WaitInput));
+}
+
+#[test]
+fn vm_with_transitions() {
+    // Standalone `with`.
+    let src = "label start:\n    with dissolve 0.5\n    end\n";
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    assert!(matches!(
+        step_until_command(&mut vm),
+        Command::PlayTransition(_)
+    ));
+
+    // `say ... with` → transition first, then the say.
+    let src = "label start:\n    e \"hi\" with fade 0.3\n    end\n";
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    assert!(matches!(
+        step_until_command(&mut vm),
+        Command::PlayTransition(_)
+    ));
+    match step_until_command(&mut vm) {
+        Command::Say { text, .. } => assert_eq!(text, "hi"),
+        other => panic!("expected Say, got {other:?}"),
+    }
+
+    // `menu ... with` → transition first, then the menu.
+    let src = "label start:\n    menu \"pick\" with fade 0.3:\n        \"a\":\n            end\n    end\n";
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    assert!(matches!(
+        step_until_command(&mut vm),
+        Command::PlayTransition(_)
+    ));
+    match vm.step() {
+        StepResult::Menu { prompt, choices } => {
+            assert_eq!(prompt.as_deref(), Some("pick"));
+            assert_eq!(choices.len(), 1);
+        }
+        other => panic!("expected Menu, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_hide_all_and_show_layer() {
+    let src = "label start:\n    hide all\n    show e happy layer=midground\n    end\n";
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    assert!(matches!(
+        step_until_command(&mut vm),
+        Command::HideAll { .. }
+    ));
+    match step_until_command(&mut vm) {
+        Command::Show(ref s) => {
+            assert_eq!(s.layer, Some(vnengine_core::model::Layer::Midground));
+        }
+        other => panic!("expected Show, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_break_continue() {
+    let src = r##"
+label start:
+    $ total = 0
+    for x in [1, 2, 3, 4]:
+        if x == 2:
+            continue
+        if x == 4:
+            break
+        $ total += x
+    e "total=[total]"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let cmd = step_until_command(&mut vm);
+    match cmd {
+        Command::Say { text, .. } => assert_eq!(text, "total=4"), // 1 + 3
+        other => panic!("expected Say, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_interpolate_expr() {
+    let src = "label start:\n    $ items = [1, 2, 3]\n    $ player = {name: \"Ana\", level: 7}\n    e \"n=[len(items)] name=[player.name] lvl=[player[\\\"level\\\"] + 1] missing=[nope]\"\n    end\n";
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let cmd = step_until_command(&mut vm);
+    match cmd {
+        Command::Say { text, .. } => {
+            assert_eq!(text, "n=3 name=Ana lvl=8 missing=[nope]");
+        }
+        other => panic!("expected Say, got {other:?}"),
+    }
+}
+
+#[test]
+fn expr_function_via_ctx() {
+    // eval_expr_ctx is crate-visible: user functions resolve in Call.
+    use crate::vm::eval_expr_ctx;
+    use std::collections::HashMap;
+    use vnengine_core::Value;
+    let src = "def inc(x):\n    return x + 1\n";
+    let script = Parser::parse(src).unwrap();
+    let fns: HashMap<String, FunctionDef> = script
+        .functions
+        .iter()
+        .map(|f| (f.name.clone(), f.clone()))
+        .collect();
+    let vars = HashMap::new();
+    let mut rng = 1u64;
+    let v = eval_expr_ctx(&Parser::parse_expr("inc(41)"), &vars, Some(&fns), &mut rng).unwrap();
+    assert_eq!(v, Value::Int(42));
+}
+
+#[test]
+fn vm_label_with_params() {
+    let src = r##"
+label greet(name, punct):
+    e "Hello [name][punct]"
+    return
+
+label start:
+    call greet("Ana", "!")
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let cmd = step_until_command(&mut vm);
+    match cmd {
+        Command::Say { text, .. } => assert_eq!(text, "Hello Ana!"),
+        other => panic!("expected Say, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_menu_set_var() {
+    let src = r##"
+label start:
+    menu set mood:
+        "happy":
+            e "yay"
+        "sad":
+            e "aww"
+    e "mood index=[mood]"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    match vm.step() {
+        StepResult::Menu { choices, .. } => assert_eq!(choices.len(), 2),
+        other => panic!("expected Menu, got {other:?}"),
+    }
+    vm.resume(Some(MenuResponse::Selected(1)));
+    // Choice body says "aww", then the follow-up line.
+    match step_until_command(&mut vm) {
+        Command::Say { text, .. } => assert_eq!(text, "aww"),
+        other => panic!("expected Say, got {other:?}"),
+    }
+    vm.resume(None);
+    match step_until_command(&mut vm) {
+        Command::Say { text, .. } => assert_eq!(text, "mood index=1"),
+        other => panic!("expected Say, got {other:?}"),
+    }
 }

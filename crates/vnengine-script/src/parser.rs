@@ -122,6 +122,35 @@ impl Parser {
         parse_expr_with_len(slice, 1).expect("parse error").0
     }
 
+    /// Parse a single expression string, returning an error instead of
+    /// panicking (used by text interpolation `[expr]`).
+    pub fn try_parse_expr(src: &str) -> Result<Expr, String> {
+        let tokens = Lexer::new(src).tokenize().map_err(|e| e.to_string())?;
+        let start = tokens
+            .iter()
+            .position(|t| !matches!(t.token, Token::Indent(_)))
+            .unwrap_or(0);
+        let end = tokens
+            .iter()
+            .rposition(|t| !matches!(t.token, Token::Newline))
+            .unwrap_or(tokens.len().saturating_sub(1))
+            + 1;
+        if start >= end {
+            return Err("empty expression".into());
+        }
+        let slice = &tokens[start..end];
+        let mut p = ExprParser {
+            tokens: slice,
+            pos: 0,
+            line_no: 1,
+        };
+        let e = p.parse_expr().map_err(|e| e.to_string())?;
+        if p.pos != slice.len() {
+            return Err("trailing tokens in expression".into());
+        }
+        Ok(e)
+    }
+
     fn peek(&self) -> Option<&Spanned> {
         self.tokens.get(self.pos)
     }
@@ -317,9 +346,28 @@ impl Parser {
     /// of logical lines consumed.
     fn parse_label(&self, lines: &[Line]) -> Result<(Label, usize), ParseError> {
         let first = &lines[0];
-        // label <name>:
+        // label <name> [(<params>)] :
         let name = expect_ident(&first.tokens[1], first.line_no, "label name")?;
-        expect_token(&first.tokens[2], Token::Colon, first.line_no, ":")?;
+        let mut params = Vec::new();
+        let mut colon_idx = 2;
+        if matches!(first.tokens.get(2).map(|t| &t.token), Some(Token::LParen)) {
+            let mut i = 3;
+            while i < first.tokens.len() && !matches!(first.tokens[i].token, Token::RParen) {
+                if matches!(first.tokens[i].token, Token::Comma) {
+                    i += 1;
+                    continue;
+                }
+                params.push(expect_ident(&first.tokens[i], first.line_no, "parameter name")?);
+                i += 1;
+            }
+            colon_idx = i + 1; // skip RParen
+        }
+        expect_token(
+            &first.tokens[colon_idx],
+            Token::Colon,
+            first.line_no,
+            ":",
+        )?;
         let base_indent = first.indent;
         let mut consumed = 1;
         let mut body = Vec::new();
@@ -336,7 +384,14 @@ impl Parser {
             body.push(stmt);
             consumed += extra;
         }
-        Ok((Label { name, body }, consumed))
+        Ok((
+            Label {
+                name,
+                params,
+                body,
+            },
+            consumed,
+        ))
     }
 
     /// Parse a single statement starting at `lines[0]`, which has indent
@@ -355,27 +410,54 @@ impl Parser {
             Token::Hide => self.parse_hide_stmt(toks, line_no),
             Token::Menu => self.parse_menu_stmt(lines, indent, line_no),
             Token::Jump => {
-                let label = expect_ident(&toks[1], line_no, "label name")?;
+                let (label, _) = self.parse_jump_target(&toks[1..], line_no)?;
                 Ok((Stmt::Jump { label }, 1))
             }
             Token::Call => {
-                let label = expect_ident(&toks[1], line_no, "label name")?;
+                let (label, _) = self.parse_jump_target(&toks[1..], line_no)?;
                 Ok((Stmt::Call { label }, 1))
             }
-            Token::Return => Ok((Stmt::Return, 1)),
+            Token::Return => {
+                if toks.len() > 1 {
+                    let value = self.parse_expr_tokens(&toks[1..], line_no)?;
+                    Ok((Stmt::ReturnValue { value }, 1))
+                } else {
+                    Ok((Stmt::Return, 1))
+                }
+            }
+            Token::With => {
+                // `with <transition> [<duration>]` — standalone transition.
+                let (name, dur) = self.parse_transition(&toks[1..], line_no)?;
+                Ok((
+                    Stmt::With {
+                        transition: TransitionSpec {
+                            name,
+                            duration: dur,
+                        },
+                    },
+                    1,
+                ))
+            }
+            Token::Break => Ok((Stmt::Break, 1)),
+            Token::Continue => Ok((Stmt::Continue, 1)),
             Token::If => self.parse_if_stmt(lines, indent, line_no),
             Token::While => self.parse_while_stmt(lines, indent, line_no),
             Token::For => self.parse_for_stmt(lines, indent, line_no),
             Token::Transform => self.parse_transform_stmt(lines, indent, line_no),
             Token::Shake => self.parse_shake_stmt(toks, line_no),
             Token::Pause => {
-                let expr = self.parse_expr_tokens(&toks[1..], line_no)?;
-                Ok((Stmt::Pause { seconds: expr }, 1))
+                if toks.len() > 1 {
+                    let expr = self.parse_expr_tokens(&toks[1..], line_no)?;
+                    Ok((Stmt::Pause { seconds: Some(expr) }, 1))
+                } else {
+                    Ok((Stmt::Pause { seconds: None }, 1))
+                }
             }
             Token::Play => self.parse_play_stmt(toks, line_no),
             Token::Stop => self.parse_stop_stmt(toks, line_no),
             Token::Voice => {
-                let track = expect_string(&toks[1], line_no, "voice track")?;
+                // `voice <expr>` — play a voice line (asset expr).
+                let (track, _) = self.parse_asset_expr(toks, 1, line_no)?;
                 Ok((Stmt::PlayVoice { track }, 1))
             }
             Token::End => Ok((Stmt::End, 1)),
@@ -479,15 +561,19 @@ impl Parser {
                 let mut i = 3;
                 let mut track = None;
                 let mut off = false;
-                // Optional positional track (string) or `off` keyword.
+                // Optional positional track (asset expr) or `off` keyword.
+                // An `ident =` pair here is a kv property, not a track.
+                let is_kv = matches!(toks.get(i).map(|t| &t.token), Some(Token::Ident(_)))
+                    && matches!(toks.get(i + 1).map(|t| &t.token), Some(Token::Assign));
                 match toks.get(i).map(|t| &t.token) {
-                    Some(Token::StringLit(t)) => {
-                        track = Some(t.clone());
-                        i += 1;
-                    }
                     Some(Token::Ident(t)) if t == "off" => {
                         off = true;
                         i += 1;
+                    }
+                    Some(_) if !is_kv => {
+                        let (e, next) = self.parse_asset_expr(toks, i, line_no)?;
+                        track = Some(e);
+                        i = next;
                     }
                     _ => {}
                 }
@@ -559,13 +645,15 @@ impl Parser {
                 self.parse_say_stmt(toks, line_no)
             }
             Token::StringLit(text) => {
-                // Narration: "text"
+                // Narration: "text" [voice <e>] [side <e>] [with <trans>]
+                let (voice, side_image, transition) = self.parse_say_tail(toks, 1, line_no)?;
                 Ok((
                     Stmt::Say {
                         speaker: None,
                         text: text.clone(),
-                        voice: None,
-                        side_image: None,
+                        voice,
+                        side_image,
+                        transition,
                     },
                     1,
                 ))
@@ -585,6 +673,7 @@ impl Parser {
     ) -> Result<(Stmt, usize), ParseError> {
         // scene <image...> [with <transition>]
         // or `scene` alone (clear)
+        // `scene [expr]` evaluates the image name dynamically.
         let mut image_parts = Vec::new();
         let mut transition = None;
         let mut i = 1;
@@ -603,11 +692,31 @@ impl Parser {
                 _ => break,
             }
         }
-        let image = if image_parts.is_empty() {
+        let mut image = if image_parts.is_empty() {
             None
         } else {
-            Some(image_parts.join(" "))
+            Some(Expr::Str(image_parts.join(" ")))
         };
+        // Optional dynamic suffix: `scene bg [expr]` → "bg " + eval(expr).
+        if let Some(t) = toks.get(i) {
+            if matches!(t.token, Token::LBracket) {
+                let (suffix, used) = self.parse_bracket_expr(&toks[i..], line_no)?;
+                i += used;
+                image = Some(match image {
+                    Some(Expr::Str(prefix)) => Expr::BinaryOp {
+                        op: BinaryOp::Add,
+                        lhs: Box::new(Expr::Str(format!("{prefix} "))),
+                        rhs: Box::new(suffix),
+                    },
+                    Some(other) => Expr::BinaryOp {
+                        op: BinaryOp::Add,
+                        lhs: Box::new(other),
+                        rhs: Box::new(suffix),
+                    },
+                    None => suffix,
+                });
+            }
+        }
         if let Some(t) = toks.get(i) {
             if matches!(t.token, Token::With) {
                 i += 1;
@@ -626,18 +735,18 @@ impl Parser {
         toks: &[Spanned],
         line_no: usize,
     ) -> Result<(Stmt, usize), ParseError> {
-        // show <character> <image> [at <anchor>] [with <transition>]
-        // image may be a single ident or "char expr" (we join idents with space).
+        // show <character> <image> [at <anchor>] [layer=<layer>] [with <transition>]
+        // image may be static words or carry a dynamic `[expr]` suffix.
         let character = expect_ident(&toks[1], line_no, "character id")?;
         let mut i = 2;
-        // Collect image tokens until a keyword (at/with) or end.
+        // Collect image tokens until a keyword (at/with/layer) or end.
         let mut image_parts = Vec::new();
         // Prepend the character name so the full path is "character expression".
         image_parts.push(character.clone());
         while i < toks.len() {
             match &toks[i].token {
                 Token::At | Token::With => break,
-                Token::Ident(s) if s == "as" => break,
+                Token::Ident(s) if s == "as" || s == "layer" => break,
                 Token::StringLit(s) => {
                     image_parts.push(s.clone());
                     i += 1;
@@ -649,11 +758,28 @@ impl Parser {
                 _ => break,
             }
         }
-        let image = image_parts.join(" ");
+        let mut image = Expr::Str(image_parts.join(" "));
+        // Optional dynamic suffix: `show e happy [expr]` → "e happy " + eval.
+        if let Some(t) = toks.get(i) {
+            if matches!(t.token, Token::LBracket) {
+                let (suffix, used) = self.parse_bracket_expr(&toks[i..], line_no)?;
+                i += used;
+                image = Expr::BinaryOp {
+                    op: BinaryOp::Add,
+                    lhs: Box::new(Expr::BinaryOp {
+                        op: BinaryOp::Add,
+                        lhs: Box::new(image),
+                        rhs: Box::new(Expr::Str(" ".to_string())),
+                    }),
+                    rhs: Box::new(suffix),
+                };
+            }
+        }
         let mut anchor = None;
         let mut position = None;
         let mut scale = None;
         let mut z = None;
+        let mut layer = None;
         let mut transition = None;
         while i < toks.len() {
             match &toks[i].token {
@@ -699,15 +825,29 @@ impl Parser {
                 }
                 Token::Ident(s) if s == "scale" => {
                     i += 1;
-                    let e = self.parse_expr_tokens(&toks[i..], line_no)?;
+                    let (e, next) = self.parse_asset_expr(toks, i, line_no)?;
                     scale = Some(e);
-                    i = toks.len();
+                    i = next;
                 }
                 Token::Ident(s) if s == "z" => {
                     i += 1;
-                    let e = self.parse_expr_tokens(&toks[i..], line_no)?;
+                    let (e, next) = self.parse_asset_expr(toks, i, line_no)?;
                     z = Some(e);
-                    i = toks.len();
+                    i = next;
+                }
+                Token::Ident(s) if s == "layer" => {
+                    i += 1;
+                    // Accept both `layer name` and `layer=name`.
+                    if matches!(toks.get(i).map(|t| &t.token), Some(Token::Assign)) {
+                        i += 1;
+                    }
+                    match toks.get(i).map(|t| &t.token) {
+                        Some(Token::Ident(n)) | Some(Token::StringLit(n)) => {
+                            layer = Some(n.clone());
+                            i += 1;
+                        }
+                        _ => return Err(err(line_no, "expected layer name after `layer`")),
+                    }
                 }
                 _ => break,
             }
@@ -720,6 +860,7 @@ impl Parser {
                 position,
                 scale,
                 z,
+                layer,
                 transition,
             },
             1,
@@ -731,24 +872,28 @@ impl Parser {
         toks: &[Spanned],
         line_no: usize,
     ) -> Result<(Stmt, usize), ParseError> {
-        let character = expect_ident(&toks[1], line_no, "character id")?;
+        // `hide`, `hide all` or `hide with <trans>` hides every sprite.
+        let mut character = None;
+        let mut i = 1;
+        if let Some(t) = toks.get(i) {
+            if let Token::Ident(s) = &t.token {
+                if s != "all" {
+                    character = Some(expect_ident(t, line_no, "character id")?);
+                }
+                i += 1;
+            }
+        }
         let mut transition = None;
-        if let Some(t) = toks.get(2) {
+        if let Some(t) = toks.get(i) {
             if matches!(t.token, Token::With) {
-                let (name, dur) = self.parse_transition(&toks[3..], line_no)?;
+                let (name, dur) = self.parse_transition(&toks[i + 1..], line_no)?;
                 transition = Some(TransitionSpec {
                     name,
                     duration: dur,
                 });
             }
         }
-        Ok((
-            Stmt::Hide {
-                character,
-                transition,
-            },
-            1,
-        ))
+        Ok((Stmt::Hide { character, transition }, 1))
     }
 
     fn parse_transition(
@@ -775,6 +920,79 @@ impl Parser {
         Ok((name, duration))
     }
 
+    /// Parse a `jump`/`call` target. `[expr]` is a dynamic target
+    /// evaluated to a name; anything else is a normal expression (a bare
+    /// identifier stays a literal name at runtime for backward
+    /// compatibility, `f(args)` parses as a call expression).
+    fn parse_jump_target(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+    ) -> Result<(Expr, usize), ParseError> {
+        if toks.is_empty() {
+            return Err(err(line_no, "expected jump/call target"));
+        }
+        if matches!(toks[0].token, Token::LBracket) {
+            return self.parse_bracket_expr(toks, line_no);
+        }
+        parse_expr_with_len(toks, line_no)
+    }
+
+    /// Parse `[<expr>]` where `toks[0]` is `[` — the dynamic-asset /
+    /// dynamic-target form. Returns the inner expression and the number
+    /// of tokens consumed including both brackets.
+    fn parse_bracket_expr(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+    ) -> Result<(Expr, usize), ParseError> {
+        debug_assert!(matches!(toks[0].token, Token::LBracket));
+        let mut depth = 0i32;
+        let mut close = None;
+        for (i, t) in toks.iter().enumerate() {
+            match t.token {
+                Token::LParen | Token::LBracket | Token::LBrace => depth += 1,
+                Token::RParen | Token::RBracket | Token::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close.ok_or_else(|| err(line_no, "unclosed `[`"))?;
+        if close == 1 {
+            return Err(err(line_no, "empty `[]` expression"));
+        }
+        let (inner, used) = parse_expr_with_len(&toks[1..close], line_no)?;
+        if used != close - 1 {
+            return Err(err(line_no, "unexpected tokens inside `[]`"));
+        }
+        Ok((inner, close + 1))
+    }
+
+    /// Parse an asset-position expression starting at `toks[start]`:
+    /// a string literal, `[<expr>]`, or a bare expression (identifier,
+    /// call, ...). Returns the expression and the next token index.
+    fn parse_asset_expr(
+        &self,
+        toks: &[Spanned],
+        start: usize,
+        line_no: usize,
+    ) -> Result<(Expr, usize), ParseError> {
+        let Some(t) = toks.get(start) else {
+            return Err(err(line_no, "expected asset expression"));
+        };
+        if matches!(t.token, Token::LBracket) {
+            let (e, used) = self.parse_bracket_expr(&toks[start..], line_no)?;
+            return Ok((e, start + used));
+        }
+        let (e, used) = parse_expr_with_len(&toks[start..], line_no)?;
+        Ok((e, start + used))
+    }
+
     fn parse_menu_stmt(
         &self,
         lines: &[Line],
@@ -789,11 +1007,45 @@ impl Parser {
         let mut prompt = None;
         if toks.len() >= 2 {
             if let Token::StringLit(ref s) = toks[1].token {
-                prompt = Some(s.clone());
+                prompt = Some(Expr::Str(s.clone()));
+            }
+        }
+        // Optional header clauses before the colon (which is the last
+        // token): `with <trans>` and `set <var>` in any order —
+        // `menu "prompt" with fade set mood:`.
+        let mut transition = None;
+        let mut set_var = None;
+        let colon_idx = toks.len() - 1;
+        let mut i = if prompt.is_some() { 2 } else { 1 };
+        while i < colon_idx {
+            match &toks[i].token {
+                Token::With => {
+                    let (name, dur) = self.parse_transition(&toks[i + 1..], line_no)?;
+                    transition = Some(TransitionSpec {
+                        name,
+                        duration: dur,
+                    });
+                    // Skip transition name and optional numeric duration.
+                    i += 2;
+                    if i < colon_idx
+                        && matches!(
+                            toks[i].token,
+                            Token::FloatLit(_) | Token::IntLit(_)
+                        )
+                    {
+                        i += 1;
+                    }
+                }
+                Token::Set => {
+                    if let Some(Token::Ident(v)) = toks.get(i + 1).map(|t| &t.token) {
+                        set_var = Some(v.clone());
+                    }
+                    i += 2;
+                }
+                _ => i += 1,
             }
         }
         // expect colon
-        let colon_idx = if prompt.is_some() { 2 } else { 1 };
         if let Some(t) = toks.get(colon_idx) {
             expect_token(t, Token::Colon, line_no, ":")?;
         } else {
@@ -855,7 +1107,15 @@ impl Parser {
                 body,
             });
         }
-        Ok((Stmt::Menu { prompt, choices }, consumed))
+        Ok((
+            Stmt::Menu {
+                prompt,
+                transition,
+                set_var,
+                choices,
+            },
+            consumed,
+        ))
     }
 
     fn parse_if_stmt(
@@ -1208,17 +1468,17 @@ impl Parser {
         toks: &[Spanned],
         line_no: usize,
     ) -> Result<(Stmt, usize), ParseError> {
-        // play music "track" [fade <s>]
-        // play sfx "track" [volume <v>]
+        // play music <expr> [fade <s>]
+        // play sfx <expr> [volume <v>]
         let kind = expect_ident(&toks[1], line_no, "play kind (music/sfx)")?;
-        let track = expect_string(&toks[2], line_no, "track path")?;
+        let (track, i) = self.parse_asset_expr(toks, 2, line_no)?;
         match kind.as_str() {
             "music" => {
                 let mut fade = 0.0;
-                if let Some(t) = toks.get(3) {
+                if let Some(t) = toks.get(i) {
                     if let Token::Ident(ref s) = t.token {
                         if s == "fade" {
-                            if let Some(d) = toks.get(4) {
+                            if let Some(d) = toks.get(i + 1) {
                                 fade = number_token(d, line_no)? as f32;
                             }
                         }
@@ -1228,10 +1488,10 @@ impl Parser {
             }
             "sfx" => {
                 let mut volume = 1.0;
-                if let Some(t) = toks.get(3) {
+                if let Some(t) = toks.get(i) {
                     if let Token::Ident(ref s) = t.token {
                         if s == "volume" {
-                            if let Some(v) = toks.get(4) {
+                            if let Some(v) = toks.get(i + 1) {
                                 volume = number_token(v, line_no)? as f32;
                             }
                         }
@@ -1280,36 +1540,61 @@ impl Parser {
         }
     }
 
+    /// Parse the optional tail of a say/narration line starting at
+    /// `toks[start]`: `[voice <expr>] [side <expr>] [with <transition>]`.
+    /// Returns `(voice, side_image, transition)`.
+    fn parse_say_tail(
+        &self,
+        toks: &[Spanned],
+        start: usize,
+        line_no: usize,
+    ) -> Result<(Option<Expr>, Option<Expr>, Option<TransitionSpec>), ParseError> {
+        let mut voice = None;
+        let mut side_image = None;
+        let mut transition = None;
+        let mut i = start;
+        while i < toks.len() {
+            match &toks[i].token {
+                Token::Voice => {
+                    let (e, next) = self.parse_asset_expr(toks, i + 1, line_no)?;
+                    voice = Some(e);
+                    i = next;
+                }
+                Token::Ident(s) if s == "side" => {
+                    let (e, next) = self.parse_asset_expr(toks, i + 1, line_no)?;
+                    side_image = Some(e);
+                    i = next;
+                }
+                Token::With => {
+                    let (name, dur) = self.parse_transition(&toks[i + 1..], line_no)?;
+                    transition = Some(TransitionSpec {
+                        name,
+                        duration: dur,
+                    });
+                    i = toks.len();
+                }
+                _ => break,
+            }
+        }
+        Ok((voice, side_image, transition))
+    }
+
     fn parse_say_stmt(
         &self,
         toks: &[Spanned],
         line_no: usize,
     ) -> Result<(Stmt, usize), ParseError> {
-        // <speaker> "text" [voice "track"] [side "image"]
+        // <speaker> "text" [voice <expr>] [side <expr>] [with <trans>]
         let speaker = expect_ident(&toks[0], line_no, "speaker id")?;
         let text = expect_string(&toks[1], line_no, "dialogue text")?;
-        let mut voice = None;
-        let mut side_image = None;
-        let mut i = 2;
-        while i < toks.len() {
-            match &toks[i].token {
-                Token::Voice => {
-                    voice = Some(expect_string(&toks[i + 1], line_no, "voice track")?);
-                    i += 2;
-                }
-                Token::Ident(s) if s == "side" => {
-                    side_image = Some(expect_string(&toks[i + 1], line_no, "side image")?);
-                    i += 2;
-                }
-                _ => break,
-            }
-        }
+        let (voice, side_image, transition) = self.parse_say_tail(toks, 2, line_no)?;
         Ok((
             Stmt::Say {
                 speaker: Some(speaker),
                 text,
                 voice,
                 side_image,
+                transition,
             },
             1,
         ))
@@ -1409,26 +1694,71 @@ impl<'a> ExprParser<'a> {
     }
 
     fn parse_cmp(&mut self) -> Result<Expr, ParseError> {
-        let lhs = self.parse_add()?;
-        if let Some(t) = self.peek() {
-            let op = match &t.token {
-                Token::Eq => Some(BinaryOp::Eq),
-                Token::Neq => Some(BinaryOp::Neq),
-                Token::Lt => Some(BinaryOp::Lt),
-                Token::Gt => Some(BinaryOp::Gt),
-                Token::Le => Some(BinaryOp::Le),
-                Token::Ge => Some(BinaryOp::Ge),
-                _ => None,
+        let mut lhs = self.parse_add()?;
+        loop {
+            // `not in` / `is not` are two-token operators.
+            let (negated_in, negated_is) = match self.peek().map(|t| &t.token) {
+                Some(Token::Not) => match self.tokens.get(self.pos + 1).map(|t| &t.token) {
+                    Some(Token::In) => (true, false),
+                    Some(Token::Is) => (false, true),
+                    _ => (false, false),
+                },
+                _ => (false, false),
             };
-            if let Some(op) = op {
-                self.next();
+            if negated_in || negated_is {
+                self.next(); // `not`
+                self.next(); // `in` / `is`
                 let rhs = self.parse_add()?;
-                return Ok(Expr::BinaryOp {
-                    op,
+                lhs = Expr::BinaryOp {
+                    op: if negated_in {
+                        BinaryOp::NotIn
+                    } else {
+                        BinaryOp::IsNot
+                    },
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
-                });
+                };
+                continue;
             }
+            let op = match self.peek().map(|t| &t.token) {
+                Some(Token::Eq) => Some(BinaryOp::Eq),
+                Some(Token::Neq) => Some(BinaryOp::Neq),
+                Some(Token::Lt) => Some(BinaryOp::Lt),
+                Some(Token::Gt) => Some(BinaryOp::Gt),
+                Some(Token::Le) => Some(BinaryOp::Le),
+                Some(Token::Ge) => Some(BinaryOp::Ge),
+                Some(Token::In) => Some(BinaryOp::In),
+                Some(Token::Is) => {
+                    // `is not` — the `not` follows `is`.
+                    self.next(); // consume `is`
+                    if matches!(self.peek().map(|t| &t.token), Some(Token::Not)) {
+                        self.next(); // consume `not`
+                        let rhs = self.parse_add()?;
+                        lhs = Expr::BinaryOp {
+                            op: BinaryOp::IsNot,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        };
+                        continue;
+                    }
+                    let rhs = self.parse_add()?;
+                    lhs = Expr::BinaryOp {
+                        op: BinaryOp::Is,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    };
+                    continue;
+                }
+                _ => None,
+            };
+            let Some(op) = op else { break };
+            self.next();
+            let rhs = self.parse_add()?;
+            lhs = Expr::BinaryOp {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -1570,6 +1900,43 @@ impl<'a> ExprParser<'a> {
                 expect_token(close, Token::RBracket, line_no, "]")?;
                 Expr::List(items)
             }
+            Token::LBrace => {
+                // Dict literal: { "key": expr, ... } — keys may be
+                // string literals or bare identifiers.
+                let mut entries = Vec::new();
+                if !matches!(self.peek().map(|t| &t.token), Some(Token::RBrace)) {
+                    loop {
+                        let key = match self.next().map(|t| &t.token) {
+                            Some(Token::StringLit(s)) => s.clone(),
+                            Some(Token::Ident(s)) => s.clone(),
+                            _ => {
+                                return Err(err(line_no, "expected dict key (ident or string)"))
+                            }
+                        };
+                        expect_token(
+                            self.next().ok_or_else(|| err(line_no, "expected `:`"))?,
+                            Token::Colon,
+                            line_no,
+                            ":",
+                        )?;
+                        let value = self.parse_expr()?;
+                        entries.push((key, value));
+                        match self.peek().map(|t| &t.token) {
+                            Some(Token::Comma) => {
+                                self.next();
+                                if matches!(self.peek().map(|t| &t.token), Some(Token::RBrace)) {
+                                    break;
+                                }
+                            }
+                            Some(Token::RBrace) => break,
+                            _ => return Err(err(line_no, "expected `,` or `}` in dict")),
+                        }
+                    }
+                }
+                let close = self.next().ok_or_else(|| err(line_no, "expected `}`"))?;
+                expect_token(close, Token::RBrace, line_no, "}")?;
+                Expr::Dict(entries)
+            }
             other => {
                 return Err(err(
                     line_no,
@@ -1580,26 +1947,105 @@ impl<'a> ExprParser<'a> {
         Ok(expr)
     }
 
-    /// Parse postfix index access: expr[expr]
+    /// Parse postfix access: `expr[expr]`, `expr[start:end]`,
+    /// `expr.name` and `expr.name(args...)`.
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary()?;
         loop {
-            let is_lbracket = self
-                .peek()
-                .map(|t| t.token == Token::LBracket)
-                .unwrap_or(false);
-            if !is_lbracket {
-                break;
+            match self.peek().map(|t| &t.token) {
+                Some(Token::LBracket) => {
+                    self.next(); // consume [
+                    let line_no = self.line_no;
+                    // Slice form: `expr[:]` / `expr[a:]` / `expr[:b]` / `expr[a:b]`
+                    if matches!(self.peek().map(|t| &t.token), Some(Token::Colon)) {
+                        self.next(); // consume :
+                        let end = if matches!(
+                            self.peek().map(|t| &t.token),
+                            Some(Token::RBracket)
+                        ) {
+                            None
+                        } else {
+                            Some(Box::new(self.parse_expr()?))
+                        };
+                        let close =
+                            self.next().ok_or_else(|| err(line_no, "expected `]`"))?;
+                        expect_token(close, Token::RBracket, line_no, "]")?;
+                        expr = Expr::Slice {
+                            collection: Box::new(expr),
+                            start: None,
+                            end,
+                        };
+                        continue;
+                    }
+                    let first = self.parse_expr()?;
+                    if matches!(self.peek().map(|t| &t.token), Some(Token::Colon)) {
+                        // `expr[a:b]` or `expr[a:]`
+                        self.next(); // consume :
+                        let end = if matches!(
+                            self.peek().map(|t| &t.token),
+                            Some(Token::RBracket)
+                        ) {
+                            None
+                        } else {
+                            Some(Box::new(self.parse_expr()?))
+                        };
+                        let close =
+                            self.next().ok_or_else(|| err(line_no, "expected `]`"))?;
+                        expect_token(close, Token::RBracket, line_no, "]")?;
+                        expr = Expr::Slice {
+                            collection: Box::new(expr),
+                            start: Some(Box::new(first)),
+                            end,
+                        };
+                    } else {
+                        let close =
+                            self.next().ok_or_else(|| err(line_no, "expected `]`"))?;
+                        expect_token(close, Token::RBracket, line_no, "]")?;
+                        expr = Expr::Index {
+                            collection: Box::new(expr),
+                            index: Box::new(first),
+                        };
+                    }
+                }
+                Some(Token::Dot) => {
+                    self.next(); // consume .
+                    let line_no = self.line_no;
+                    let name = match self.next().map(|t| &t.token) {
+                        Some(Token::Ident(s)) => s.clone(),
+                        _ => return Err(err(line_no, "expected member name after `.`")),
+                    };
+                    // Method call: `expr.name(args...)`
+                    if matches!(self.peek().map(|t| &t.token), Some(Token::LParen)) {
+                        self.next(); // consume (
+                        let mut args = Vec::new();
+                        if !matches!(self.peek().map(|t| &t.token), Some(Token::RParen)) {
+                            loop {
+                                args.push(self.parse_expr()?);
+                                match self.next().map(|t| &t.token) {
+                                    Some(Token::Comma) => continue,
+                                    Some(Token::RParen) => break,
+                                    _ => {
+                                        return Err(err(line_no, "expected `,` or `)`"));
+                                    }
+                                }
+                            }
+                        } else {
+                            self.next(); // consume )
+                        }
+                        expr = Expr::MethodCall {
+                            object: Box::new(expr),
+                            name,
+                            args,
+                        };
+                    } else {
+                        expr = Expr::Attr {
+                            object: Box::new(expr),
+                            name,
+                        };
+                    }
+                }
+                _ => break,
             }
-            self.next(); // consume [
-            let index = self.parse_expr()?;
-            let line_no = self.line_no;
-            let close = self.next().ok_or_else(|| err(line_no, "expected `]`"))?;
-            expect_token(close, Token::RBracket, line_no, "]")?;
-            expr = Expr::Index {
-                collection: Box::new(expr),
-                index: Box::new(index),
-            };
         }
         Ok(expr)
     }

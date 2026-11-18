@@ -56,7 +56,7 @@ impl From<&SpriteSpec> for ActiveSprite {
             opacity: 1.0,
             offset: [0.0, 0.0],
             rotation: 0.0,
-            layer: Layer::Foreground,
+            layer: s.layer.unwrap_or(Layer::Foreground),
             entering: s.transition.as_ref().and_then(|t| {
                 let duration = t.default_duration();
                 (duration > 0.0).then(|| EnterAnim {
@@ -227,6 +227,23 @@ impl Scene {
             true
         } else {
             false
+        }
+    }
+
+    /// Hide every sprite (`hide` with no character). Timed transitions
+    /// move each sprite to `exiting` like [`Scene::hide_sprite`].
+    pub fn hide_all_sprites(&mut self, transition: Transition) {
+        let duration = transition.default_duration();
+        let sprites = std::mem::take(&mut self.sprites);
+        if duration > 0.0 {
+            for sprite in sprites {
+                self.exiting.push(ExitingSprite {
+                    sprite,
+                    transition: transition.clone(),
+                    elapsed: 0.0,
+                    duration,
+                });
+            }
         }
     }
 

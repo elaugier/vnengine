@@ -1,6 +1,7 @@
 //! Dynamic values used by the script VM for variables and expressions.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// A dynamically typed value used in script expressions and variables.
@@ -12,6 +13,9 @@ pub enum Value {
     Float(f64),
     Str(String),
     List(Vec<Value>),
+    /// String-keyed map. `BTreeMap` keeps iteration order stable for
+    /// serialization, rollback snapshots and deterministic replay.
+    Dict(BTreeMap<String, Value>),
 }
 
 impl Value {
@@ -23,6 +27,7 @@ impl Value {
             Value::Float(f) => *f != 0.0,
             Value::Str(s) => !s.is_empty(),
             Value::List(items) => !items.is_empty(),
+            Value::Dict(map) => !map.is_empty(),
         }
     }
 
@@ -58,6 +63,7 @@ impl Value {
                     .collect::<Vec<_>>()
                     .join(", ")
             )),
+            Value::Dict(map) => Some(format_dict(map)),
         }
     }
 
@@ -66,6 +72,19 @@ impl Value {
             Value::List(items) => Some(items),
             _ => None,
         }
+    }
+
+    pub fn as_dict(&self) -> Option<&BTreeMap<String, Value>> {
+        match self {
+            Value::Dict(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    /// Look up a key: dicts accept string keys, lists accept integer
+    /// indices (as a string form is not supported — use `Expr::Index`).
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.as_dict().and_then(|m| m.get(key))
     }
 }
 
@@ -87,8 +106,18 @@ impl fmt::Display for Value {
                 }
                 write!(f, "]")
             }
+            Value::Dict(map) => write!(f, "{}", format_dict(map)),
         }
     }
+}
+
+fn format_dict(map: &BTreeMap<String, Value>) -> String {
+    let inner = map
+        .iter()
+        .map(|(k, v)| format!("\"{k}\": {v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{inner}}}")
 }
 
 impl From<bool> for Value {

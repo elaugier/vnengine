@@ -4,6 +4,7 @@
 //! they require the engine to wait for user input or for an animation to
 //! finish before the VM can resume execution.
 
+use crate::model::Layer;
 use crate::{transition::Transition, Value};
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,9 @@ pub struct SpriteSpec {
     pub scale: Option<f32>,
     /// Optional z-order (higher = drawn on top).
     pub z: Option<i32>,
+    /// Optional render layer override (`show ... layer=midground`).
+    #[serde(default)]
+    pub layer: Option<Layer>,
     /// Entry transition (`show ... with dissolve`). `None`/`Cut` is instant.
     #[serde(default)]
     pub transition: Option<Transition>,
@@ -64,6 +68,8 @@ pub enum Command {
         character: String,
         transition: Transition,
     },
+    /// Hide every sprite on screen (`hide` with no character).
+    HideAll { transition: Transition },
     /// A line of dialogue spoken by a character.
     Say {
         speaker: Option<String>,
@@ -103,6 +109,8 @@ pub enum Command {
     StopVoice,
     /// Pause script execution for a number of seconds.
     Pause { seconds: f32 },
+    /// Block until the player advances (`pause` with no duration).
+    WaitInput,
     /// Play a transition effect over the current scene.
     PlayTransition(Transition),
     /// Shake the screen for dramatic effect.
@@ -151,6 +159,7 @@ impl Command {
                 | Command::Narrate { .. }
                 | Command::Menu { .. }
                 | Command::Pause { .. }
+                | Command::WaitInput
                 | Command::PlayTransition(_)
                 | Command::Shake { .. }
                 | Command::End

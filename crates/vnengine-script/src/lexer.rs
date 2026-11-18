@@ -54,6 +54,9 @@ pub enum Token {
     Def,       // `def` keyword (user functions)
     Transform, // `transform` keyword
     Shake,     // `shake` keyword
+    Break,     // `break` keyword
+    Continue,  // `continue` keyword
+    Is,        // `is` keyword (identity comparison)
     End,
     // Literals
     Ident(String),
@@ -85,6 +88,8 @@ pub enum Token {
     RParen,
     LBracket,
     RBracket,
+    LBrace,
+    RBrace,
     Comma,
     Dot,
     Colon,
@@ -328,6 +333,9 @@ impl Lexer {
                     "def" => Token::Def,
                     "transform" => Token::Transform,
                     "shake" => Token::Shake,
+                    "break" => Token::Break,
+                    "continue" => Token::Continue,
+                    "is" => Token::Is,
                     "end" => Token::End,
                     "and" => Token::And,
                     "or" => Token::Or,
@@ -388,6 +396,8 @@ impl Lexer {
                 ')' => Token::RParen,
                 '[' => Token::LBracket,
                 ']' => Token::RBracket,
+                '{' => Token::LBrace,
+                '}' => Token::RBrace,
                 ',' => Token::Comma,
                 '.' => Token::Dot,
                 ':' => Token::Colon,

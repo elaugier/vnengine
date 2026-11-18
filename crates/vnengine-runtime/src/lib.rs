@@ -373,6 +373,9 @@ impl Runtime {
                     } => {
                         self.scene.hide_sprite(&character, transition);
                     }
+                    Command::HideAll { transition } => {
+                        self.scene.hide_all_sprites(transition);
+                    }
                     Command::Say {
                         speaker,
                         text,
@@ -497,6 +500,12 @@ impl Runtime {
                     }
                     Command::Pause { seconds } => {
                         self.pause_remaining = Some(seconds);
+                        self.push_rollback(pre_state);
+                        return RuntimeEvent::Blocking(cmd);
+                    }
+                    Command::WaitInput => {
+                        // `pause` with no duration: block until the player
+                        // advances, like a dialogue line with no text.
                         self.push_rollback(pre_state);
                         return RuntimeEvent::Blocking(cmd);
                     }

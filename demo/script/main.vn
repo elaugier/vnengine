@@ -16,6 +16,17 @@ def thought:
     n "{i}A quiet thought crosses my mind...{/i}"
     return
 
+# Expression functions (callable in $ assignments, return a value)
+def double_it(x):
+    return x * 2
+
+def pick_one(options):
+    return choice(options)
+
+def describe_hero(h):
+    $ desc = h.name + " is level " + str(h.level)
+    return desc
+
 label start:
     scene bg school with dissolve 1.5
     play music "bgm_school.ogg" fade 2.0
@@ -79,7 +90,21 @@ label talk:
         n "Color: [color]"
     n "That's all the colors!"
 
-    menu:
+    # Dictionaries, slicing, membership, builtins and expression functions
+    $ hero = {"name": "You", "level": 1, "gold": 120}
+    n "[hero.name] — level [hero.level], [hero.gold] gold."
+    n "Stats check: [describe_hero(hero)]"
+    $ bag = ["potion", "key", "gem", "map"]
+    n "The bag holds [len(bag)] items, from [bag[0]] to [bag[-1]]."
+    n "Slice [1:3] gives [bag[1:3]]."
+    if "key" in bag and "rope" not in bag:
+        n "A small key glints at the bottom — but no rope."
+    $ lucky = pick_one(["heads", "tails"])
+    n "Flip a coin... [lucky]!"
+    $ doubled = double_it(21)
+    n "double_it(21) = [doubled]. Neat, right?"
+
+    menu set mood:
         "Let's go to the library.":
             $ went_library = True
             jump library

@@ -41,9 +41,15 @@
 - serde + serde_json for save files (bincode 3.0 is a joke release, avoid)
 
 ## Script DSL
-- Builtin calls: `random()` → float in [0,1), `randint(lo, hi)` → int in range, `srand(seed)` → reseed PRNG.
-- The PRNG seed lives in `VmState` — it is serialized, so saves and replays reproduce the same draws.
-- `pause <seconds>` is driven by the runtime's logical clock (`Runtime::update`), not wall time.
+- Values: `None`/`Bool`/`Int`/`Float`/`Str`/`List`/`Dict` (`BTreeMap`, stable order). Dict literals `{k: v}` (ident or string keys), `d["k"]`, `d.k`, slices `a[1:3]`/`s[:-1]` (Python-style bounds), `in`/`not in`/`is`/`is not`, `"ab" * 3` string repeat.
+- Builtin calls: `random()` → float in [0,1), `randint(lo, hi)`, `srand(seed)` reseed, plus `len str int float bool abs min max round choice sample shuffle range sorted reversed keys values items has get` and string helpers `upper lower strip lstrip rstrip split replace startswith endswith count find index join` (also usable as methods: `name.upper()`, `items.count(x)`). Read-only methods only — values are immutable.
+- User functions: `def name(params): body` with `return [expr]` (bare `return` → `None`). In expressions `f(args)` runs a pure interpreter (`funcs.rs`) — only side-effect-free statements (assign/if/while/for/break/continue/return/def) are allowed; `say`/`menu`/scene/etc. are rejected. `call f(args)` and `call name` run the body as a call frame (blocking statements allowed); args bind as regular variables and persist after the call. `call label(arg, ...)` binds a label's declared params (`label name(a, b):`) the same way. `call [expr]`/`jump [expr]` evaluate a dynamic target; a bare identifier stays a literal label for backward compatibility.
+- `menu [prompt] [with <trans>] [set <var>]:` — `set` stores the chosen 0-based index into `<var>` on selection (`PendingMenu.set_var`, serialized).
+- Dynamic assets: `scene [expr]`, `show e happy [expr]` (suffix appended), `play music|sfx [expr]`, `voice [expr]`, `music layer "n" [expr]` accept `[expr]` or plain expressions evaluated at runtime.
+- Transitions: `with <name> [dur]` standalone; also `say`/`narrate`/`menu ... with <trans>` (transition plays first, the line/menu is deferred one step). `pause` without a duration emits `Command::WaitInput` (blocks until advance). `hide`/`hide all` → `Command::HideAll`; `show ... layer=<layer>` sets the render layer.
+- Control flow: `break`/`continue` work in `while`/`for` (frame unwinding in `Vm::step`).
+- Interpolation `[expr]` in dialogue/menu text evaluates full expressions (nested brackets supported); unresolvable content stays literal `[like this]`.
+- The PRNG seed lives in `VmState` — it is serialized, so saves and replays reproduce the same draws. `choice`/`sample`/`shuffle`/`randint`/`random` all draw from it.
 - `Runtime.journal` records menu choices; `Runtime::replay(script, journal)` re-runs deterministically.
 - `Runtime.music` tracks the current BGM across commands/saves/rollback — hosts resync audio against it.
 - 2.5D lighting/camera: `light "<name>" x=<e> y=<e> radius=<e> intensity=<e> [color="#hex"]`, `unlight "<name>"`, `ambient <r> <g> <b>`, `camera [x=<e>] [y=<e>] [zoom=<e>] [over=<sec>]` (`over` = smoothstep animation on the logical clock).
@@ -54,5 +60,6 @@
 - i18n/a11y: `translations/<lang>.json` maps original text → localized text (demo ships `fr.json`); `settings.language` cycles shipped locales, `App::tr` translates Say/Narrate/speaker/menu strings at dispatch (identity when absent). `settings.text_scale` scales every `UiText.font_size` in `build_ui`; `settings.reduce_motion` flattens scene/sprite/camera animations to their end state and drops `shake`/`PlayTransition` in `apply_effect`. Translation dirs are packed via `asset_dirs` in vnengine-pack.
 
 ## Notes
+- Script-language breaking change (Phase 1): `Stmt`/`Expr`/`Value` shapes changed (dynamic asset/target expressions, dicts, `Menu.transition`, `SpriteSpec.layer`, `Command::HideAll`/`WaitInput`). Old `.vnpkg` files and old savegames do NOT deserialize — rebuild packages with `vnengine-pack` and start new games.
 - Windows builds may hit transient file lock errors (os error 32) on proc-macro crates. Retry the build if this happens.
 - The wgpu 30 API has breaking changes from earlier versions: `bind_group_layouts` takes `&[Some(...)]`, `PipelineLayoutDescriptor` needs `immediate_size`, `RenderPipelineDescriptor` needs `multiview_mask`, `SurfaceConfiguration` needs `color_space`, vertex buffers are `Option<VertexBufferLayout>`.

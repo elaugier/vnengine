@@ -232,6 +232,7 @@ fn scene_set_sprite_replaces_same_character() {
         scale: None,
         z: None,
         transition: None,
+        layer: None,
     };
     scene.set_sprite(&spec1);
     assert_eq!(scene.sprites.len(), 1);
@@ -245,6 +246,7 @@ fn scene_set_sprite_replaces_same_character() {
         scale: None,
         z: None,
         transition: None,
+        layer: None,
     };
     scene.set_sprite(&spec2);
     assert_eq!(scene.sprites.len(), 1);
@@ -263,6 +265,7 @@ fn scene_set_sprite_multiple_characters() {
         scale: None,
         z: None,
         transition: None,
+        layer: None,
     });
     scene.set_sprite(&SpriteSpec {
         character: "bob".into(),
@@ -272,6 +275,7 @@ fn scene_set_sprite_multiple_characters() {
         scale: None,
         z: None,
         transition: None,
+        layer: None,
     });
     assert_eq!(scene.sprites.len(), 2);
 }
@@ -287,6 +291,7 @@ fn scene_hide_sprite() {
         scale: None,
         z: None,
         transition: None,
+        layer: None,
     });
     assert!(scene.hide_sprite("alice", crate::transition::Transition::Cut));
     assert_eq!(scene.sprites.len(), 0);
@@ -304,6 +309,7 @@ fn scene_hide_sprite_with_transition_goes_to_exiting() {
         scale: None,
         z: None,
         transition: None,
+        layer: None,
     });
     assert!(scene.hide_sprite(
         "alice",
@@ -327,6 +333,7 @@ fn scene_sprite_lookup() {
         scale: None,
         z: None,
         transition: None,
+        layer: None,
     });
     assert!(scene.sprite("alice").is_some());
     assert!(scene.sprite("bob").is_none());
@@ -344,6 +351,7 @@ fn scene_z_sorting() {
         scale: None,
         z: Some(0),
         transition: None,
+        layer: None,
     });
     scene.set_sprite(&SpriteSpec {
         character: "front".into(),
@@ -353,6 +361,7 @@ fn scene_z_sorting() {
         scale: None,
         z: Some(10),
         transition: None,
+        layer: None,
     });
     assert_eq!(scene.sprites[0].character, "back");
     assert_eq!(scene.sprites[1].character, "front");
@@ -373,6 +382,7 @@ fn scene_serde_roundtrip() {
         scale: None,
         z: None,
         transition: None,
+        layer: None,
     });
     let json = serde_json::to_string(&scene).unwrap();
     let scene2: Scene = serde_json::from_str(&json).unwrap();
