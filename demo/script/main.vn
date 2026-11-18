@@ -27,6 +27,26 @@ def describe_hero(h):
     $ desc = h.name + " is level " + str(h.level)
     return desc
 
+# ATL transform blocks (Phase 2): the VM compiles them into tracks
+# that tick on the scene clock. `show ... at bob` attaches them.
+transform bob:
+    ease 0.8 yoffset -0.015
+    ease 0.8 yoffset 0.0
+    repeat
+
+# Event tracks: `on show`/`on hide` fire on attach/hide.
+transform fadein:
+    on show:
+        alpha 0.0
+        ease 0.4 alpha 1.0
+    on hide:
+        ease 0.4 alpha 0.0
+
+# Composite image: several asset layers drawn as one sprite.
+image duo:
+    "eileen happy" offset=(-0.18, 0.0) zoom=0.9
+    "ren smile" offset=(0.18, 0.0) zoom=0.9 alpha=0.95
+
 label start:
     scene bg school with dissolve 1.5
     play music "bgm_school.ogg" fade 2.0
@@ -39,7 +59,7 @@ label start:
     pause 1.0
     n "When I finally reached the school gate, she was already there."
 
-    show eileen happy at center with dissolve
+    show eileen happy at center, bob with dissolve
     e "Hey! You're finally here."
     e "I've been waiting for you, you know."
     play sfx "sfx_footstep.ogg" volume 0.8
@@ -118,12 +138,12 @@ label talk:
 
 label library:
     stop music fade 1.5
-    scene bg library with dissolve 1.0
+    scene bg library with blinds 1.0
     play music "bgm_library.ogg" fade 2.0
     n "The library was quiet, the air thick with the smell of old books."
     n "Dust motes floated in the golden light streaming through the windows."
     play sfx "sfx_door.ogg" volume 0.7
-    show eileen thinking at left
+    show eileen thinking at left, bob
     e "I love this place. It's so peaceful."
     e "Do you come here often?"
     n "She traced her finger along a row of book spines, lost in thought."
@@ -146,7 +166,7 @@ label library:
             $ eileen_affection = 1
 
     n "We found a quiet corner and sat down across from each other."
-    show eileen happy at left
+    show eileen happy at left, fadein
     e "You know, I don't usually invite people here."
     e "This is kind of my secret spot."
 
@@ -225,10 +245,13 @@ label sunset:
 
 label home:
     stop music fade 1.5
-    scene bg street with dissolve 1.0
+    scene bg street with pushleft 1.0
     play music "bgm_rooftop.ogg" fade 2.0
     n "I turned to leave, but something made me hesitate."
+    show duo at center
+    n "Ren had caught up with Eileen — they waved me over together."
     show eileen thinking at center
+    hide duo with dissolve 0.5
     e "Oh... you're leaving already?"
     e "I was hoping we could spend some time together."
     play sfx "sfx_phone.ogg" volume 0.8

@@ -225,7 +225,9 @@ label start:
     let mut vm = Vm::new(script);
     let cmd = step_until_command(&mut vm);
     match cmd {
-        Command::Scene { image, transition } => {
+        Command::Scene {
+            image, transition, ..
+        } => {
             assert_eq!(image.as_deref(), Some("bg school"));
             assert_eq!(transition.default_duration(), 1.0);
         }
@@ -1969,5 +1971,338 @@ label start:
     match step_until_command(&mut vm) {
         Command::Say { text, .. } => assert_eq!(text, "mood index=1"),
         other => panic!("expected Say, got {other:?}"),
+    }
+}
+
+// ---------- Phase 2: ATL ----------
+
+#[test]
+fn parse_transform_def_block() {
+    let src = r##"
+transform bob:
+    ease 0.5 xpos 0.5
+    pause 0.2
+    repeat 2
+
+label start:
+    "done"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    assert_eq!(script.transforms.len(), 1);
+    let t = &script.transforms[0];
+    assert_eq!(t.name, "bob");
+    assert_eq!(t.body.len(), 3);
+    assert!(matches!(t.body[0], AtlStmt::Warp { .. }));
+    assert!(matches!(t.body[1], AtlStmt::Pause { .. }));
+    assert!(matches!(t.body[2], AtlStmt::Repeat { .. }));
+}
+
+#[test]
+fn parse_atl_events_and_blocks() {
+    let src = r##"
+transform fancy:
+    on show:
+        alpha 0.0
+        ease 0.3 alpha 1.0
+    on hide:
+        ease 0.3 alpha 0.0
+    parallel:
+        linear 1.0 rotate 0.5
+    parallel:
+        linear 1.0 yzoom 2.0
+    choice:
+        xpos 0.2
+    choice 3.0:
+        xpos 0.8
+    time 1.5
+
+label start:
+    "done"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let t = &script.transforms[0];
+    // on show / on hide / parallel / parallel / choice / choice / time
+    assert_eq!(t.body.len(), 7);
+    match &t.body[0] {
+        AtlStmt::On { event, body } => {
+            assert_eq!(event, "show");
+            assert_eq!(body.len(), 2);
+        }
+        other => panic!("expected On, got {other:?}"),
+    }
+    match &t.body[1] {
+        AtlStmt::On { event, .. } => assert_eq!(event, "hide"),
+        other => panic!("expected On, got {other:?}"),
+    }
+    assert!(matches!(t.body[2], AtlStmt::Parallel { .. }));
+    assert!(matches!(t.body[4], AtlStmt::Choice { weight: None, .. }));
+    assert!(matches!(t.body[5], AtlStmt::Choice { weight: Some(_), .. }));
+}
+
+#[test]
+fn parse_show_at_transform() {
+    let src = r##"
+label start:
+    show eileen happy at left, bob
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    match &script.labels[0].body[0] {
+        Stmt::Show { anchor, at, .. } => {
+            // `left` resolves to a named anchor; `bob` stays in `at`
+            // as a transform name.
+            assert!(anchor.is_some());
+            assert_eq!(at, &vec!["bob".to_string()]);
+        }
+        other => panic!("expected Show, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_scene_onlayer() {
+    let src = r##"
+label start:
+    scene forest onlayer midground
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    match &script.labels[0].body[0] {
+        Stmt::Scene { layer, .. } => {
+            assert_eq!(layer.as_deref(), Some("midground"));
+        }
+        other => panic!("expected Scene, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_image_composite_def() {
+    let src = r##"
+image duo:
+    "char_a.png" offset=(0.2, 0.0)
+    "char_b.png" offset=(0.7, 0.0) alpha=0.9 when flag
+
+label start:
+    "done"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    assert_eq!(script.images.len(), 1);
+    let img = &script.images[0];
+    assert_eq!(img.name, "duo");
+    assert_eq!(img.layers.len(), 2);
+    assert!(img.layers[0].when.is_none());
+    assert!(img.layers[1].when.is_some());
+    assert!(img.layers[1].alpha.is_some());
+}
+
+#[test]
+fn vm_show_at_compiles_tracks() {
+    let src = r##"
+transform bob:
+    ease 1.0 ypos 0.6
+
+label start:
+    show eileen happy at center, bob
+    e "hi"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let cmd = step_until_command(&mut vm);
+    match cmd {
+        Command::Show(spec) => {
+            assert_eq!(spec.character, "eileen");
+            assert_eq!(spec.anims.len(), 1);
+            assert_eq!(spec.anims[0].steps.len(), 1);
+            assert!((spec.anims[0].steps[0].duration - 1.0).abs() < 1e-4);
+        }
+        other => panic!("expected Show, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_show_at_events_compiled() {
+    let src = r##"
+transform inout:
+    on show:
+        alpha 0.0
+        ease 0.5 alpha 1.0
+    on hide:
+        ease 0.5 alpha 0.0
+
+label start:
+    show eileen happy at center, inout
+    e "hi"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let cmd = step_until_command(&mut vm);
+    match cmd {
+        Command::Show(spec) => {
+            assert!(spec.anim_events.contains_key("show"));
+            assert!(spec.anim_events.contains_key("hide"));
+            assert_eq!(spec.anim_events["hide"].len(), 1);
+        }
+        other => panic!("expected Show, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_atl_choice_uses_seeded_rng() {
+    let src = r##"
+transform pick:
+    choice:
+        xpos 0.1
+    choice:
+        xpos 0.9
+
+label start:
+    show e happy at center, pick
+    "done"
+    end
+"##;
+    // Two identical VMs must pick the same branch.
+    let mut picks = Vec::new();
+    for _ in 0..2 {
+        let script = Parser::parse(src).unwrap();
+        let mut vm = Vm::new(script);
+        let cmd = step_until_command(&mut vm);
+        match cmd {
+            Command::Show(spec) => {
+                let step = &spec.anims[0].steps[0];
+                let (_, v) = step.targets[0];
+                picks.push(v);
+            }
+            other => panic!("expected Show, got {other:?}"),
+        }
+    }
+    assert_eq!(picks[0], picks[1]);
+}
+
+#[test]
+fn vm_scene_onlayer_command() {
+    let src = r##"
+label start:
+    scene forest onlayer midground
+    "done"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let cmd = step_until_command(&mut vm);
+    match cmd {
+        Command::Scene { image, layer, .. } => {
+            assert_eq!(image.as_deref(), Some("forest"));
+            assert_eq!(layer, Some(vnengine_core::model::Layer::Midground));
+        }
+        other => panic!("expected Scene, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_image_composite_layers_on_show() {
+    let src = r##"
+image duo:
+    "a.png" offset=(0.0, 0.0)
+    "b.png" offset=(0.5, 0.0) zoom=0.5
+
+label start:
+    show duo at center
+    "done"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let cmd = step_until_command(&mut vm);
+    match cmd {
+        Command::Show(spec) => {
+            assert_eq!(spec.layers.len(), 2);
+            assert_eq!(spec.layers[0].image, "a.png");
+            assert_eq!(spec.layers[1].image, "b.png");
+            assert!((spec.layers[1].zoom - 0.5).abs() < 1e-4);
+        }
+        other => panic!("expected Show, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_image_composite_when_filters() {
+    let src = r##"
+image duo:
+    "a.png"
+    "b.png" when show_b
+
+label start:
+    $ show_b = False
+    show duo at center
+    "done"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    let cmd = step_until_command(&mut vm);
+    match cmd {
+        Command::Show(spec) => assert_eq!(spec.layers.len(), 1),
+        other => panic!("expected Show, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_new_transition_names() {
+    let src = r##"
+label start:
+    scene bg with blinds
+    show e happy at center with pushleft
+    "done"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    match step_until_command(&mut vm) {
+        Command::Scene { transition, .. } => {
+            assert!(matches!(
+                transition,
+                vnengine_core::transition::Transition::Blinds { .. }
+            ));
+        }
+        other => panic!("expected Scene, got {other:?}"),
+    }
+    match step_until_command(&mut vm) {
+        Command::Show(spec) => {
+            assert!(matches!(
+                spec.transition,
+                Some(vnengine_core::transition::Transition::Push { .. })
+            ));
+        }
+        other => panic!("expected Show, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_repeat_tags_track() {
+    let src = r##"
+transform bob:
+    ease 0.5 yoffset -0.05
+    ease 0.5 yoffset 0.0
+    repeat
+
+label start:
+    show e happy at center, bob
+    "done"
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    match step_until_command(&mut vm) {
+        Command::Show(spec) => {
+            assert_eq!(spec.anims.len(), 1);
+            assert_eq!(spec.anims[0].steps.len(), 2);
+            assert_eq!(spec.anims[0].repeats, None); // infinite
+        }
+        other => panic!("expected Show, got {other:?}"),
+ 
     }
 }

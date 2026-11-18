@@ -671,3 +671,217 @@ fn jump_to_label_repositions_execution() {
     assert!(!rt.jump_to_label("nowhere"));
     assert!(matches!(rt.step(), RuntimeEvent::Finished));
 }
+
+// ---------- Phase 2: ATL ----------
+
+#[test]
+fn atl_track_ticks_on_update() {
+    let mut rt = runtime(
+        r##"
+transform slidein:
+    linear 1.0 xpos 0.9
+
+label start:
+    show e happy at center, slidein
+    "shown"
+    end
+"##,
+    );
+    next_block(&mut rt); // "shown"
+    let s = &rt.scene.sprites[0];
+    assert_eq!(s.anims.len(), 1);
+    rt.update(0.5);
+    let x = rt.scene.sprites[0].position.unwrap().0;
+    // Half-way between the start (center ~0.5) and 0.9.
+    assert!(x > 0.5 && x < 0.9, "x={x}");
+    rt.update(0.5);
+    assert!((rt.scene.sprites[0].position.unwrap().0 - 0.9).abs() < 1e-4);
+    assert!(rt.scene.sprites[0].anims.is_empty());
+}
+
+#[test]
+fn atl_repeat_runs_forever() {
+    let mut rt = runtime(
+        r##"
+transform bob:
+    linear 0.5 yoffset -0.1
+    linear 0.5 yoffset 0.0
+    repeat
+
+label start:
+    show e happy at center, bob
+    "shown"
+    end
+"##,
+    );
+    next_block(&mut rt);
+    for _ in 0..10 {
+        rt.update(0.5);
+    }
+    // Infinite repeat: the track never retires.
+    assert_eq!(rt.scene.sprites[0].anims.len(), 1);
+    assert!(rt.scene.sprites[0].anims[0].iteration >= 9);
+}
+
+#[test]
+fn atl_on_show_fires_on_attach() {
+    let mut rt = runtime(
+        r##"
+transform appear:
+    on show:
+        alpha 0.0
+        linear 1.0 alpha 1.0
+
+label start:
+    show e happy at center, appear
+    "shown"
+    end
+"##,
+    );
+    next_block(&mut rt);
+    // `on show` track is running; alpha starts at 0.
+    assert_eq!(rt.scene.sprites[0].anims.len(), 1);
+    rt.update(0.5);
+    let a = rt.scene.sprites[0].opacity;
+    assert!(a > 0.0 && a < 1.0, "alpha={a}");
+}
+
+#[test]
+fn atl_on_hide_moves_to_exiting() {
+    let mut rt = runtime(
+        r##"
+transform outro:
+    on hide:
+        linear 1.0 alpha 0.0
+
+label start:
+    show e happy at center, outro
+    hide e
+    "hidden"
+    end
+"##,
+    );
+    next_block(&mut rt);
+    assert_eq!(rt.scene.sprites.len(), 0);
+    assert_eq!(rt.scene.exiting.len(), 1);
+    assert_eq!(rt.scene.exiting[0].sprite.anims.len(), 1);
+    // The exit track animates alpha down while the sprite lingers.
+    rt.update(0.5);
+    assert!(!rt.scene.exiting.is_empty());
+    rt.update(0.6);
+    // Track finished → exiting entry is dropped.
+    assert!(rt.scene.exiting.is_empty());
+}
+
+#[test]
+fn scene_clears_foreground_sprites() {
+    let mut rt = runtime(
+        r##"
+label start:
+    show e happy at center
+    scene bg park
+    "new scene"
+    end
+"##,
+    );
+    next_block(&mut rt);
+    // Ren'Py semantics: `scene` clears the character layer.
+    assert_eq!(rt.scene.sprites.len(), 0);
+    assert_eq!(rt.scene.background.as_deref(), Some("bg park"));
+}
+
+#[test]
+fn scene_onlayer_sets_layer_bg_keeps_sprites() {
+    let mut rt = runtime(
+        r##"
+label start:
+    show e happy at center
+    scene forest onlayer midground
+    "new scene"
+    end
+"##,
+    );
+    next_block(&mut rt);
+    use vnengine_core::model::Layer;
+    let lb = rt
+        .scene
+        .layer_bgs
+        .get(&(Layer::Midground as u8))
+        .expect("midground layer bg");
+    assert_eq!(lb.image, "forest");
+    // Default background untouched, sprite kept (it's on Foreground).
+    assert!(rt.scene.background.is_none());
+    assert_eq!(rt.scene.sprites.len(), 1);
+}
+
+#[test]
+fn scene_onlayer_hides_that_layers_sprites() {
+    let mut rt = runtime(
+        r##"
+label start:
+    show e happy at center layer=midground
+    scene forest onlayer midground
+    "new scene"
+    end
+"##,
+    );
+    next_block(&mut rt);
+    // The sprite lives on midground — the layer scene clears it.
+    assert_eq!(rt.scene.sprites.len(), 0);
+}
+
+#[test]
+fn atl_state_survives_capture_restore() {
+    let mut rt = runtime(
+        r##"
+transform slidein:
+    linear 2.0 xpos 0.9
+
+label start:
+    show e happy at center, slidein
+    "shown"
+    end
+"##,
+    );
+    next_block(&mut rt);
+    rt.update(0.5);
+    let snap = rt.capture();
+    let mid = rt.scene.sprites[0].position.unwrap().0;
+    rt.update(0.5);
+    // Restore mid-animation: position and track resume identically.
+    let mut rt2 = Runtime::restore(Parser::parse(
+        r##"
+transform slidein:
+    linear 2.0 xpos 0.9
+
+label start:
+    show e happy at center, slidein
+    "shown"
+    end
+"##,
+    )
+    .unwrap(), snap);
+    assert_eq!(rt2.scene.sprites[0].position.unwrap().0, mid);
+    assert_eq!(rt2.scene.sprites[0].anims.len(), 1);
+    rt2.update(1.5);
+    assert!((rt2.scene.sprites[0].position.unwrap().0 - 0.9).abs() < 1e-4);
+}
+
+#[test]
+fn atl_composite_layers_reach_scene() {
+    let mut rt = runtime(
+        r##"
+image duo:
+    "a.png" offset=(0.0, 0.0)
+    "b.png" offset=(0.5, 0.0)
+
+label start:
+    show duo at center
+    "shown"
+    end
+"##,
+    );
+    next_block(&mut rt);
+    assert_eq!(rt.scene.sprites[0].layers.len(), 2);
+    assert_eq!(rt.scene.sprites[0].layers[1].image, "b.png");
+}

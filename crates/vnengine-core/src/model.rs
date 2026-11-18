@@ -3,9 +3,11 @@
 //! The renderer reads this model each frame. The engine mutates it in
 //! response to [`Command`]s coming from the script VM.
 
+use crate::atl::SpriteTrack;
 use crate::command::{Anchor, SpriteSpec};
 use crate::transition::Transition;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Rendering layer for organizing sprites.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -21,6 +23,24 @@ pub enum Layer {
     Overlay,
 }
 
+/// An extra quad stacked onto a sprite (`image name:` composite).
+/// Resolved by the VM at `show`/`scene` time; `when` conditions are
+/// evaluated then and produce a layer only when truthy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpriteLayer {
+    /// Image asset path.
+    pub image: String,
+    /// Offset relative to the sprite's position (normalized coords).
+    #[serde(default)]
+    pub offset: [f32; 2],
+    /// Extra zoom factor multiplying the sprite scale.
+    #[serde(default = "default_zoom")]
+    pub zoom: f32,
+    /// Opacity multiplier (1.0 = opaque).
+    #[serde(default = "default_zoom")]
+    pub alpha: f32,
+}
+
 /// A sprite currently displayed on screen.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSprite {
@@ -28,7 +48,9 @@ pub struct ActiveSprite {
     pub image: String,
     pub anchor: Anchor,
     pub position: Option<(f32, f32)>,
-    pub scale: f32,
+    /// Scale per axis (`xzoom`, `yzoom`); `zoom` sets both.
+    #[serde(default = "default_scale")]
+    pub scale: [f32; 2],
     pub z: i32,
     /// Current opacity used for transitions.
     pub opacity: f32,
@@ -38,10 +60,27 @@ pub struct ActiveSprite {
     pub rotation: f32,
     /// Which layer this sprite belongs to.
     pub layer: Layer,
+    /// Anchor point inside the sprite (0..1, 0.5 = center). Set by
+    /// `xanchor`/`yanchor`; `None` keeps the historical center anchor.
+    #[serde(default)]
+    pub anchor_frac: Option<(f32, f32)>,
     /// Entrance animation in progress; `opacity`/`offset`/`scale` hold
     /// the *target* values while this runs.
     #[serde(default)]
     pub entering: Option<EnterAnim>,
+    /// Running ATL tracks (`show ... at bob`), ticked on the logical
+    /// clock. Serialized so saves resume mid-animation.
+    #[serde(default)]
+    pub anims: Vec<SpriteTrack>,
+    /// ATL event templates resolved at show time (`on show` /
+    /// `on replace` / `on hide`), keyed by event name. Consumed when
+    /// the matching event fires.
+    #[serde(default)]
+    pub anim_events: BTreeMap<String, Vec<SpriteTrack>>,
+    /// Composite sub-layers (`image name:` blocks) drawn on top of the
+    /// base image with the sprite transform.
+    #[serde(default)]
+    pub layers: Vec<SpriteLayer>,
 }
 
 impl From<&SpriteSpec> for ActiveSprite {
@@ -51,12 +90,13 @@ impl From<&SpriteSpec> for ActiveSprite {
             image: s.image.clone(),
             anchor: s.anchor,
             position: s.position,
-            scale: s.scale.unwrap_or(1.0),
+            scale: [s.scale.unwrap_or(1.0), s.scale.unwrap_or(1.0)],
             z: s.z.unwrap_or(0),
             opacity: 1.0,
             offset: [0.0, 0.0],
             rotation: 0.0,
             layer: s.layer.unwrap_or(Layer::Foreground),
+            anchor_frac: None,
             entering: s.transition.as_ref().and_then(|t| {
                 let duration = t.default_duration();
                 (duration > 0.0).then(|| EnterAnim {
@@ -65,6 +105,9 @@ impl From<&SpriteSpec> for ActiveSprite {
                     duration,
                 })
             }),
+            anims: s.anims.clone(),
+            anim_events: s.anim_events.clone(),
+            layers: s.layers.clone(),
         }
     }
 }
@@ -86,6 +129,32 @@ impl EnterAnim {
             (self.elapsed / self.duration).min(1.0)
         }
     }
+}
+
+/// A background image on a non-default layer (`scene x onlayer midground`).
+/// Drawn behind the sprites of its layer. Masked transitions apply to
+/// the default background only; layer backgrounds fade in via `fade`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerBg {
+    pub image: String,
+    #[serde(default = "default_zoom")]
+    pub opacity: f32,
+    #[serde(default = "default_zoom")]
+    pub zoom: f32,
+    /// Composite sub-layers when the image name resolved to an
+    /// `image name:` definition.
+    #[serde(default)]
+    pub layers: Vec<SpriteLayer>,
+    /// Fade-in in progress on the logical clock.
+    #[serde(default)]
+    pub fade: Option<LayerFade>,
+}
+
+/// Fade-in animation for a [`LayerBg`] (`scene x onlayer l with dissolve`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LayerFade {
+    pub elapsed: f32,
+    pub duration: f32,
 }
 
 /// A sprite being removed with a transition (`hide ... with dissolve`).
@@ -131,6 +200,24 @@ pub struct Scene {
     /// Peaks mid-transition while the scene swaps underneath.
     #[serde(default)]
     pub fade_overlay: [f32; 4],
+    /// Extra backgrounds on non-default layers (`scene x onlayer mid`).
+    /// Keyed by `Layer` discriminant so serialization is stable.
+    #[serde(default)]
+    pub layer_bgs: BTreeMap<u8, LayerBg>,
+    /// Pixel offset applied to the current background (push transitions).
+    #[serde(default)]
+    pub bg_offset: [f32; 2],
+    /// Pixel offset applied to the previous background (push transitions).
+    #[serde(default)]
+    pub prev_bg_offset: [f32; 2],
+    /// Masked transition in progress on the whole frame
+    /// (blinds/iris/pixelate/squares): `(kind, progress)`.
+    #[serde(default)]
+    pub trans_fx: Option<(Transition, f32)>,
+    /// Composite sub-layers of the default background (`scene` with an
+    /// `image name:` definition).
+    #[serde(default)]
+    pub bg_layers: Vec<SpriteLayer>,
     /// Sprites currently on screen, sorted by layer then z.
     pub sprites: Vec<ActiveSprite>,
     /// Sprites mid-exit transition (drawn with their remaining opacity).
@@ -161,6 +248,11 @@ impl Default for Scene {
             bg_zoom: 1.0,
             prev_bg_zoom: 1.0,
             fade_overlay: [0.0; 4],
+            layer_bgs: BTreeMap::new(),
+            bg_layers: Vec::new(),
+            bg_offset: [0.0, 0.0],
+            prev_bg_offset: [0.0, 0.0],
+            trans_fx: None,
             sprites: Vec::new(),
             exiting: Vec::new(),
             lights: Vec::new(),
@@ -176,8 +268,13 @@ impl Scene {
     /// a timed transition, the replaced sprite's previous image exits
     /// through `exiting` while the new one enters — a true cross-fade
     /// instead of an image swap.
+    ///
+    /// ATL: the transform's own tracks always run; additionally the
+    /// `replace` event templates fire when an existing sprite is
+    /// replaced, `show` otherwise.
     pub fn set_sprite(&mut self, spec: &SpriteSpec) {
         let mut active = ActiveSprite::from(spec);
+        let replacing = self.sprites.iter().any(|s| s.character == spec.character);
         if let Some(existing) = self
             .sprites
             .iter()
@@ -204,6 +301,10 @@ impl Scene {
                 }
             }
         }
+        let event = if replacing { "replace" } else { "show" };
+        if let Some(tracks) = active.anim_events.get(event) {
+            active.anims.extend(tracks.iter().cloned());
+        }
         self.sprites.retain(|s| s.character != spec.character);
         self.sprites.push(active);
         self.sprites.sort_by_key(|s| (s.layer, s.z));
@@ -215,8 +316,9 @@ impl Scene {
     pub fn hide_sprite(&mut self, character: &str, transition: Transition) -> bool {
         let duration = transition.default_duration();
         if let Some(pos) = self.sprites.iter().position(|s| s.character == character) {
-            let sprite = self.sprites.remove(pos);
-            if duration > 0.0 {
+            let mut sprite = self.sprites.remove(pos);
+            fire_hide_event(&mut sprite);
+            if duration > 0.0 || !sprite.anims.is_empty() {
                 self.exiting.push(ExitingSprite {
                     sprite,
                     transition,
@@ -235,14 +337,55 @@ impl Scene {
     pub fn hide_all_sprites(&mut self, transition: Transition) {
         let duration = transition.default_duration();
         let sprites = std::mem::take(&mut self.sprites);
-        if duration > 0.0 {
-            for sprite in sprites {
+        for mut sprite in sprites {
+            fire_hide_event(&mut sprite);
+            if duration > 0.0 || !sprite.anims.is_empty() {
                 self.exiting.push(ExitingSprite {
                     sprite,
                     transition: transition.clone(),
                     elapsed: 0.0,
                     duration,
                 });
+            }
+        }
+    }
+
+    /// Hide every sprite on one layer (`scene x onlayer l`). Sprites
+    /// move to `exiting` with the given transition like
+    /// [`Scene::hide_sprite`].
+    pub fn hide_sprites_on_layer(&mut self, layer: Layer, transition: Transition) {
+        let duration = transition.default_duration();
+        let (on, off): (Vec<ActiveSprite>, Vec<ActiveSprite>) =
+            std::mem::take(&mut self.sprites)
+                .into_iter()
+                .partition(|s| s.layer == layer);
+        self.sprites = off;
+        for mut sprite in on {
+            fire_hide_event(&mut sprite);
+            if duration > 0.0 || !sprite.anims.is_empty() {
+                self.exiting.push(ExitingSprite {
+                    sprite,
+                    transition: transition.clone(),
+                    elapsed: 0.0,
+                    duration,
+                });
+            }
+        }
+    }
+
+    /// Apply the final values of every running animation and clear them.
+    /// Used by `reduce_motion` to flatten ATL instantly.
+    pub fn finish_anims(&mut self) {
+        for i in 0..self.sprites.len() {
+            let tracks = std::mem::take(&mut self.sprites[i].anims);
+            for t in &tracks {
+                t.finish(&mut self.sprites[i]);
+            }
+        }
+        for i in 0..self.exiting.len() {
+            let tracks = std::mem::take(&mut self.exiting[i].sprite.anims);
+            for t in &tracks {
+                t.finish(&mut self.exiting[i].sprite);
             }
         }
     }
@@ -273,6 +416,17 @@ impl Scene {
         self.lights.retain(|l| l.name != name);
         self.lights.len() != n
     }
+}
+
+/// Move a sprite's `on hide` ATL templates into its running tracks.
+/// Called when a sprite exits so `on hide:` blocks play during the
+/// exit (the sprite stays in `exiting` while tracks run).
+fn fire_hide_event(sprite: &mut ActiveSprite) {
+    if let Some(tracks) = sprite.anim_events.get("hide") {
+        sprite.anims.extend(tracks.iter().cloned());
+    }
+    // An exiting sprite should never run the `show`/`replace` events.
+    sprite.anim_events.clear();
 }
 
 /// Parallax factor per layer: how much the camera moves it.
@@ -370,6 +524,10 @@ impl CameraAnim {
 
 fn default_zoom() -> f32 {
     1.0
+}
+
+fn default_scale() -> [f32; 2] {
+    [1.0, 1.0]
 }
 
 fn default_ambient() -> [f32; 3] {

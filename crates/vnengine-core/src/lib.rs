@@ -5,6 +5,7 @@
 //! dependencies so it can be reused everywhere.
 
 pub mod assets;
+pub mod atl;
 pub mod command;
 pub mod config;
 pub mod model;
@@ -13,6 +14,7 @@ pub mod settings;
 pub mod transition;
 pub mod value;
 
+pub use atl::*;
 pub use command::Command;
 pub use config::EngineConfig;
 pub use model::*;

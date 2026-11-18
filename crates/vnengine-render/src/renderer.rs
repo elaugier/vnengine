@@ -39,6 +39,42 @@ pub struct ColorVertex {
     pub color: [f32; 4],
 }
 
+/// Per-draw transition-FX parameters passed to the masked pipeline
+/// through `set_immediates` (wgpu immediate data).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct FxParams {
+    /// Mask kind: 0 = none, 1 = blinds-v, 2 = blinds-h, 3 = iris in,
+    /// 4 = iris out, 5 = pixelate, 6 = squares.
+    pub kind: u32,
+    /// Reveal progress in 0..1.
+    pub progress: f32,
+    /// Mask parameter: strip count (blinds) / grid cells (squares).
+    pub p0: f32,
+    /// Reserved.
+    pub p1: f32,
+}
+
+impl FxParams {
+    /// No effect — every draw not carrying a transition mask uses this.
+    pub const NONE: FxParams = FxParams {
+        kind: 0,
+        progress: 0.0,
+        p0: 0.0,
+        p1: 0.0,
+    };
+
+    /// Build the params for a transition at `progress`.
+    pub fn of(t: &vnengine_core::transition::Transition, progress: f32) -> FxParams {
+        FxParams {
+            kind: t.mask_kind(),
+            progress,
+            p0: t.mask_param(),
+            p1: 0.0,
+        }
+    }
+}
+
 /// A quad to draw this frame.
 pub struct Quad {
     /// Center position in normalized coords (0..1), with y growing downward.
@@ -66,6 +102,9 @@ pub struct Renderer {
     pub textured_pipeline: RenderPipeline,
     pub color_pipeline: RenderPipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
+    /// Whether the device supports `set_immediates` (masked
+    /// transitions). False degrades masks to plain draws.
+    pub immediates: bool,
 }
 
 impl Renderer {
@@ -129,7 +168,9 @@ impl Renderer {
             ],
         });
 
-        let textured_pipeline = create_textured_pipeline(&device, format, &bind_group_layout);
+        let immediates = device.features().contains(wgpu::Features::IMMEDIATES);
+        let textured_pipeline =
+            create_textured_pipeline(&device, format, &bind_group_layout, immediates);
         let color_pipeline = create_color_pipeline(&device, format);
 
         Ok(Self {
@@ -143,6 +184,7 @@ impl Renderer {
             textured_pipeline,
             color_pipeline,
             bind_group_layout,
+            immediates,
         })
     }
 
@@ -202,9 +244,24 @@ impl Renderer {
             }
             for s in &scene.sprites {
                 self.textures.ensure_loaded(src, image_dir, &s.image);
+                for l in &s.layers {
+                    self.textures.ensure_loaded(src, image_dir, &l.image);
+                }
             }
             for e in &scene.exiting {
                 self.textures.ensure_loaded(src, image_dir, &e.sprite.image);
+                for l in &e.sprite.layers {
+                    self.textures.ensure_loaded(src, image_dir, &l.image);
+                }
+            }
+            for l in &scene.bg_layers {
+                self.textures.ensure_loaded(src, image_dir, &l.image);
+            }
+            for lb in scene.layer_bgs.values() {
+                self.textures.ensure_loaded(src, image_dir, &lb.image);
+                for l in &lb.layers {
+                    self.textures.ensure_loaded(src, image_dir, &l.image);
+                }
             }
             for img in &ui.images {
                 self.textures.ensure_loaded(src, image_dir, &img.path);
@@ -229,6 +286,15 @@ impl Renderer {
 
             let screen_aspect = self.config.width as f32 / self.config.height as f32;
             const BG_PARALLAX: f32 = 0.25;
+            // Frame mask for masked scene transitions (`with blinds`
+            // etc.): applied to the *new* frame — bg, its layers and
+            // the active sprites.
+            let frame_fx = scene
+                .trans_fx
+                .as_ref()
+                .map(|(t, p)| FxParams::of(t, *p))
+                .unwrap_or(FxParams::NONE);
+            let immediates = self.immediates;
             // Background.
             if let Some(bg) = &scene.background {
                 if let Some(img) = self.textures.get(bg) {
@@ -236,6 +302,7 @@ impl Renderer {
                         full_screen_quad(img.width, img.height, screen_aspect, scene.bg_opacity);
                     quad.hw *= scene.bg_zoom;
                     quad.hh *= scene.bg_zoom;
+                    quad.offset = scene.bg_offset;
                     apply_camera(&mut quad, BG_PARALLAX, &scene.camera);
                     let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
                     draw_textured(
@@ -246,10 +313,43 @@ impl Renderer {
                         &self.sampler,
                         img,
                         &verts,
+                        frame_fx,
+                        immediates,
                     );
                 }
             }
-            // Previous background (for cross-fades).
+            // Composite layers of the default background.
+            for l in &scene.bg_layers {
+                if let Some(img) = self.textures.get(&l.image) {
+                    let mut quad = full_screen_quad(
+                        img.width,
+                        img.height,
+                        screen_aspect,
+                        scene.bg_opacity * l.alpha,
+                    );
+                    quad.hw *= scene.bg_zoom * l.zoom;
+                    quad.hh *= scene.bg_zoom * l.zoom;
+                    quad.offset = [
+                        scene.bg_offset[0] + l.offset[0],
+                        scene.bg_offset[1] + l.offset[1],
+                    ];
+                    apply_camera(&mut quad, BG_PARALLAX, &scene.camera);
+                    let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
+                    draw_textured(
+                        &mut pass,
+                        &self.textured_pipeline,
+                        &self.device,
+                        &self.bind_group_layout,
+                        &self.sampler,
+                        img,
+                        &verts,
+                        frame_fx,
+                        immediates,
+                    );
+                }
+            }
+            // Previous background (for cross-fades) — the outgoing
+            // frame is never masked.
             if let Some(bg) = &scene.prev_background {
                 if let Some(img) = self.textures.get(bg) {
                     let mut quad = full_screen_quad(
@@ -260,6 +360,7 @@ impl Renderer {
                     );
                     quad.hw *= scene.prev_bg_zoom;
                     quad.hh *= scene.prev_bg_zoom;
+                    quad.offset = scene.prev_bg_offset;
                     apply_camera(&mut quad, BG_PARALLAX, &scene.camera);
                     let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
                     draw_textured(
@@ -270,16 +371,21 @@ impl Renderer {
                         &self.sampler,
                         img,
                         &verts,
+                        FxParams::NONE,
+                        immediates,
                     );
                 }
             }
 
-            // Sprites (active, then exiting mid-transition).
-            let sprite_quad = |s: &vnengine_core::model::ActiveSprite,
-                               opacity: f32,
-                               offset: [f32; 2],
-                               scale: f32,
-                               aspect: f32| {
+            // Shared sprite-quad builder: composite `layers` draw as
+            // extra quads with the same transform; `anchor_frac`
+            // shifts the quad so the anchor point lands on `position`.
+            let make_sprite_quad = |s: &vnengine_core::model::ActiveSprite,
+                                    opacity: f32,
+                                    offset: [f32; 2],
+                                    zoom: f32,
+                                    alpha: f32,
+                                    aspect: f32| {
                 let hh = 0.45;
                 let hw = hh * aspect;
                 let x = s
@@ -287,26 +393,105 @@ impl Renderer {
                     .map(|p| p.0)
                     .unwrap_or_else(|| anchor_x(s.anchor));
                 let y = s.position.map(|p| p.1).unwrap_or(0.5);
-                Quad {
+                let mut q = Quad {
                     x,
                     y: y * 0.5 + 0.05,
-                    hw: hw * scale,
-                    hh: hh * scale,
-                    color: [1.0, 1.0, 1.0, opacity],
+                    hw: hw * s.scale[0] * zoom,
+                    hh: hh * s.scale[1] * zoom,
+                    color: [1.0, 1.0, 1.0, opacity * alpha],
                     offset,
                     rotation: s.rotation,
+                };
+                if let Some((ax, ay)) = s.anchor_frac {
+                    q.x += (0.5 - ax) * 2.0 * q.hw;
+                    q.y += (0.5 - ay) * 2.0 * q.hh;
                 }
+                q
             };
-            for s in &scene.sprites {
-                if let Some(img) = self.textures.get(&s.image) {
-                    let aspect = img.width as f32 / img.height as f32;
-                    // Entrance transition: fade/dissolve zoom ramp the
-                    // opacity (zoom also scales), slide offsets in.
-                    let (opacity, offset, scale) = match &s.entering {
+
+            // Per-layer content: a `scene x onlayer l` background sits
+            // behind that layer's sprites.
+            for layer in [
+                vnengine_core::model::Layer::Background,
+                vnengine_core::model::Layer::Midground,
+                vnengine_core::model::Layer::Foreground,
+                vnengine_core::model::Layer::Overlay,
+            ] {
+                if let Some(lb) = scene.layer_bgs.get(&(layer as u8)) {
+                    if let Some(img) = self.textures.get(&lb.image) {
+                        let mut quad = full_screen_quad(
+                            img.width,
+                            img.height,
+                            screen_aspect,
+                            lb.opacity,
+                        );
+                        quad.hw *= lb.zoom;
+                        quad.hh *= lb.zoom;
+                        apply_camera(
+                            &mut quad,
+                            vnengine_core::model::parallax(layer),
+                            &scene.camera,
+                        );
+                        let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
+                        draw_textured(
+                            &mut pass,
+                            &self.textured_pipeline,
+                            &self.device,
+                            &self.bind_group_layout,
+                            &self.sampler,
+                            img,
+                            &verts,
+                            FxParams::NONE,
+                            immediates,
+                        );
+                    }
+                    for l in &lb.layers {
+                        if let Some(img) = self.textures.get(&l.image) {
+                            let mut quad = full_screen_quad(
+                                img.width,
+                                img.height,
+                                screen_aspect,
+                                lb.opacity * l.alpha,
+                            );
+                            quad.hw *= lb.zoom * l.zoom;
+                            quad.hh *= lb.zoom * l.zoom;
+                            quad.offset = l.offset;
+                            apply_camera(
+                                &mut quad,
+                                vnengine_core::model::parallax(layer),
+                                &scene.camera,
+                            );
+                            let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
+                            draw_textured(
+                                &mut pass,
+                                &self.textured_pipeline,
+                                &self.device,
+                                &self.bind_group_layout,
+                                &self.sampler,
+                                img,
+                                &verts,
+                                FxParams::NONE,
+                                immediates,
+                            );
+                        }
+                    }
+                }
+                for s in scene.sprites.iter().filter(|s| s.layer == layer) {
+                    // Entrance transition: fades ramp opacity, slides
+                    // offset in, masks drive the shader reveal.
+                    let mut fx = frame_fx;
+                    let (opacity, offset, scale_mul) = match &s.entering {
                         Some(a) => {
                             let p = a.progress();
                             match &a.transition {
+                                t if t.is_masked() => {
+                                    fx = FxParams::of(t, p);
+                                    (s.opacity, s.offset, 1.0)
+                                }
                                 vnengine_core::transition::Transition::Slide {
+                                    direction, ..
+                                }
+                                | vnengine_core::transition::Transition::Push {
                                     direction, ..
                                 } => {
                                     let d = 1.0 - p;
@@ -323,78 +508,124 @@ impl Renderer {
                                     (
                                         s.opacity,
                                         [s.offset[0] + off[0], s.offset[1] + off[1]],
-                                        s.scale,
+                                        1.0,
                                     )
                                 }
                                 vnengine_core::transition::Transition::Zoom { .. } => {
-                                    (s.opacity * p, s.offset, s.scale * (0.5 + 0.5 * p))
+                                    (s.opacity * p, s.offset, 0.5 + 0.5 * p)
                                 }
-                                _ => (s.opacity * p, s.offset, s.scale),
+                                _ => (s.opacity * p, s.offset, 1.0),
                             }
                         }
-                        None => (s.opacity, s.offset, s.scale),
+                        None => (s.opacity, s.offset, 1.0),
                     };
-                    let mut quad = sprite_quad(s, opacity, offset, scale, aspect);
-                    apply_camera(
-                        &mut quad,
-                        vnengine_core::model::parallax(s.layer),
-                        &scene.camera,
-                    );
-                    let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
-                    draw_textured(
-                        &mut pass,
-                        &self.textured_pipeline,
-                        &self.device,
-                        &self.bind_group_layout,
-                        &self.sampler,
-                        img,
-                        &verts,
-                    );
+                    // Base image, or every composite layer.
+                    let mut images: Vec<(&str, [f32; 2], f32, f32)> = Vec::new();
+                    if s.layers.is_empty() {
+                        images.push((s.image.as_str(), offset, scale_mul, 1.0));
+                    } else {
+                        for l in &s.layers {
+                            images.push((
+                                l.image.as_str(),
+                                [offset[0] + l.offset[0], offset[1] + l.offset[1]],
+                                scale_mul * l.zoom,
+                                l.alpha,
+                            ));
+                        }
+                    }
+                    for (image, off, zoom, alpha) in images {
+                        let Some(img) = self.textures.get(image) else {
+                            continue;
+                        };
+                        let aspect = img.width as f32 / img.height as f32;
+                        let mut quad = make_sprite_quad(s, opacity, off, zoom, alpha, aspect);
+                        apply_camera(
+                            &mut quad,
+                            vnengine_core::model::parallax(s.layer),
+                            &scene.camera,
+                        );
+                        let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
+                        draw_textured(
+                            &mut pass,
+                            &self.textured_pipeline,
+                            &self.device,
+                            &self.bind_group_layout,
+                            &self.sampler,
+                            img,
+                            &verts,
+                            fx,
+                            immediates,
+                        );
+                    }
                 }
             }
             // Exiting sprites: transition applied from their progress.
+            // They belong to the outgoing frame — no `trans_fx`.
             for e in &scene.exiting {
-                if let Some(img) = self.textures.get(&e.sprite.image) {
-                    let s = &e.sprite;
-                    let aspect = img.width as f32 / img.height as f32;
-                    let p = e.progress();
-                    let (opacity, offset, scale) = match &e.transition {
-                        vnengine_core::transition::Transition::Slide { direction, .. } => {
-                            let dir = match direction {
-                                vnengine_core::transition::SlideDirection::Left => [-p, 0.0],
-                                vnengine_core::transition::SlideDirection::Right => [p, 0.0],
-                                vnengine_core::transition::SlideDirection::Up => [0.0, -p],
-                                vnengine_core::transition::SlideDirection::Down => [0.0, p],
-                            };
-                            (
-                                s.opacity,
-                                [s.offset[0] + dir[0], s.offset[1] + dir[1]],
-                                s.scale,
-                            )
-                        }
-                        vnengine_core::transition::Transition::Zoom { .. } => (
-                            s.opacity * (1.0 - p),
-                            s.offset,
-                            s.scale * (0.5 + 0.5 * (1.0 - p)),
-                        ),
-                        _ => (s.opacity * (1.0 - p), s.offset, s.scale),
-                    };
-                    let mut quad = sprite_quad(s, opacity, offset, scale, aspect);
-                    apply_camera(
-                        &mut quad,
-                        vnengine_core::model::parallax(s.layer),
-                        &scene.camera,
-                    );
-                    let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
-                    draw_textured(
-                        &mut pass,
-                        &self.textured_pipeline,
-                        &self.device,
-                        &self.bind_group_layout,
-                        &self.sampler,
-                        img,
-                        &verts,
-                    );
+                let s = &e.sprite;
+                let p = e.progress();
+                let mut fx = FxParams::NONE;
+                let (opacity, offset, scale_mul) = match &e.transition {
+                    t if t.is_masked() => {
+                        // The sprite disappears through the mask.
+                        fx = FxParams::of(t, 1.0 - p);
+                        (s.opacity, s.offset, 1.0)
+                    }
+                    vnengine_core::transition::Transition::Slide { direction, .. }
+                    | vnengine_core::transition::Transition::Push { direction, .. } => {
+                        let dir = match direction {
+                            vnengine_core::transition::SlideDirection::Left => [-p, 0.0],
+                            vnengine_core::transition::SlideDirection::Right => [p, 0.0],
+                            vnengine_core::transition::SlideDirection::Up => [0.0, -p],
+                            vnengine_core::transition::SlideDirection::Down => [0.0, p],
+                        };
+                        (
+                            s.opacity,
+                            [s.offset[0] + dir[0], s.offset[1] + dir[1]],
+                            1.0,
+                        )
+                    }
+                    vnengine_core::transition::Transition::Zoom { .. } => {
+                        (s.opacity * (1.0 - p), s.offset, 0.5 + 0.5 * (1.0 - p))
+                    }
+                    _ => (s.opacity * (1.0 - p), s.offset, 1.0),
+                };
+                let mut images: Vec<(&str, [f32; 2], f32, f32)> = Vec::new();
+                if s.layers.is_empty() {
+                    images.push((s.image.as_str(), offset, scale_mul, 1.0));
+                } else {
+                    for l in &s.layers {
+                        images.push((
+                            l.image.as_str(),
+                            [offset[0] + l.offset[0], offset[1] + l.offset[1]],
+                            scale_mul * l.zoom,
+                            l.alpha,
+                        ));
+                    }
+                }
+                for (image, off, zoom, alpha) in images {
+                    if let Some(img) = self.textures.get(image) {
+                        let aspect = img.width as f32 / img.height as f32;
+                        let quad = make_sprite_quad(s, opacity, off, zoom, alpha, aspect);
+                        let mut quad = quad;
+                        apply_camera(
+                            &mut quad,
+                            vnengine_core::model::parallax(s.layer),
+                            &scene.camera,
+                        );
+                        let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
+                        draw_textured(
+                            &mut pass,
+                            &self.textured_pipeline,
+                            &self.device,
+                            &self.bind_group_layout,
+                            &self.sampler,
+                            img,
+                            &verts,
+                            fx,
+                            immediates,
+                        );
+                    }
                 }
             }
 
@@ -604,19 +835,76 @@ impl UiDraw {
 
 // ---- pipeline creation ----
 
+/// Build the textured shader source. When `immediates` is true the
+/// transition-FX declaration and mask body are injected, keyed off
+/// `var<immediate>` per-draw params.
+fn textured_wgsl(immediates: bool) -> String {
+    let src = include_str!("textured.wgsl");
+    if !immediates {
+        return src.replace("// @@FX_DECL", "").replace("// @@FX_BODY", "");
+    }
+    let decl = r#"
+struct FxParams {
+    kind: u32,
+    progress: f32,
+    p0: f32,
+    p1: f32,
+};
+var<immediate> fx: FxParams;
+"#;
+    let body = r#"
+    if (fx.kind == 5u) {
+        // pixelate: uv snapped to a grid that refines with progress
+        let cells = mix(6.0, 512.0, fx.progress);
+        uv = (floor(uv * cells) + 0.5) / cells;
+    } else if (fx.kind != 0u) {
+        var m = 1.0;
+        if (fx.kind == 1u || fx.kind == 2u) {
+            // blinds: p0 strips along x (1 = vertical) or y (2)
+            let coord = select(uv.y, uv.x, fx.kind == 1u);
+            let strips = max(fx.p0, 1.0);
+            m = step(fract(coord * strips), fx.progress);
+        } else if (fx.kind == 3u) {
+            // iris in: reveal from center outward
+            let d = distance(uv, vec2<f32>(0.5));
+            let r = fx.progress * 0.72;
+            m = 1.0 - smoothstep(r - 0.03, r, d);
+        } else if (fx.kind == 4u) {
+            // iris out: reveal from edges inward
+            let d = distance(uv, vec2<f32>(0.5));
+            let r = (1.0 - fx.progress) * 0.72;
+            m = smoothstep(r, r + 0.03, d);
+        } else if (fx.kind == 6u) {
+            // squares: grid cells revealed by a stable hash threshold
+            let cells = max(fx.p0, 1.0);
+            let cell = floor(uv * cells);
+            let h = fract(sin(dot(cell, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+            m = step(h, fx.progress);
+        }
+        cm.a *= m;
+    }
+"#;
+    src.replace("// @@FX_DECL", decl).replace("// @@FX_BODY", body)
+}
+
 fn create_textured_pipeline(
     device: &Device,
     format: TextureFormat,
     bgl: &wgpu::BindGroupLayout,
+    immediates: bool,
 ) -> RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("textured shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("textured.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(textured_wgsl(immediates).into()),
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("textured layout"),
         bind_group_layouts: &[Some(bgl)],
-        immediate_size: 0,
+        immediate_size: if immediates {
+            std::mem::size_of::<FxParams>() as u32
+        } else {
+            0
+        },
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("textured pipeline"),
@@ -823,6 +1111,8 @@ fn draw_textured<'pass>(
     sampler: &'pass wgpu::Sampler,
     img: &'pass crate::texture::GpuImage,
     verts: &[TexturedVertex],
+    fx: FxParams,
+    immediates: bool,
 ) {
     pass.set_pipeline(pipeline);
     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -840,6 +1130,11 @@ fn draw_textured<'pass>(
         ],
     });
     pass.set_bind_group(0, &bind, &[]);
+    if immediates {
+        // Immediate data persists across draws in a pass — every draw
+        // writes its params (masked or NONE) explicitly.
+        pass.set_immediates(0, bytemuck::bytes_of(&fx));
+    }
     let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("quad verts"),
         contents: bytemuck::cast_slice(verts),

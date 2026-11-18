@@ -246,8 +246,14 @@ impl App {
         ));
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+        // Masked transitions (blinds/iris/pixelate/squares) use wgpu
+        // immediate data; request it when the adapter supports it.
+        let mut device_desc = wgpu::DeviceDescriptor::default();
+        if adapter.features().contains(wgpu::Features::IMMEDIATES) {
+            device_desc.required_features |= wgpu::Features::IMMEDIATES;
+            device_desc.required_limits.max_immediate_size = 16;
+        }
+        let (device, queue) = pollster::block_on(adapter.request_device(&device_desc))?;
         let surface = instance.create_surface(window.clone())?;
         // Query the surface's preferred format instead of hardcoding.
         let capabilities = surface.get_capabilities(&adapter);
@@ -402,6 +408,15 @@ impl App {
                     scene.bg_zoom = 1.0;
                     scene.prev_bg_zoom = 1.0;
                     scene.fade_overlay = [0.0; 4];
+                    scene.bg_offset = [0.0; 2];
+                    scene.prev_bg_offset = [0.0; 2];
+                    scene.trans_fx = None;
+                    for bg in scene.layer_bgs.values_mut() {
+                        bg.opacity = 1.0;
+                        bg.fade = None;
+                    }
+                    scene.exiting.clear();
+                    scene.finish_anims();
                     return;
                 }
                 Command::Show(_) | Command::Hide { .. } | Command::HideAll { .. } => {
@@ -409,6 +424,7 @@ impl App {
                         s.entering = None;
                     }
                     scene.exiting.clear();
+                    scene.finish_anims();
                     return;
                 }
                 Command::Camera { .. } => {
@@ -750,6 +766,32 @@ impl App {
                     self.runtime.scene.bg_zoom = 0.8 + 0.2 * progress;
                     self.runtime.scene.prev_bg_zoom = 1.0 + 0.3 * progress;
                 }
+                Transition::Push { direction, .. } => {
+                    // The old frame slides out while the new one slides
+                    // in from the opposite side.
+                    self.runtime.scene.bg_opacity = 1.0;
+                    self.runtime.scene.prev_bg_opacity = 1.0;
+                    let (dx, dy) = match direction {
+                        SlideDirection::Left => (-1.0, 0.0),
+                        SlideDirection::Right => (1.0, 0.0),
+                        SlideDirection::Up => (0.0, -1.0),
+                        SlideDirection::Down => (0.0, 1.0),
+                    };
+                    self.runtime.scene.prev_bg_offset = [dx * progress, dy * progress];
+                    self.runtime.scene.bg_offset =
+                        [dx * (progress - 1.0), dy * (progress - 1.0)];
+                    for s in &mut self.runtime.scene.sprites {
+                        s.offset = [dx * (progress - 1.0), dy * (progress - 1.0)];
+                    }
+                }
+                t if t.is_masked() => {
+                    // Masked transitions reveal the new frame through a
+                    // shader mask over the previous one.
+                    self.runtime.scene.bg_opacity = 1.0;
+                    self.runtime.scene.prev_bg_opacity = 1.0;
+                    self.runtime.scene.trans_fx = Some((t.clone(), progress));
+                }
+                _ => {}
             }
             if t.elapsed >= t.duration {
                 self.runtime.scene.prev_background = None;
@@ -758,6 +800,9 @@ impl App {
                 self.runtime.scene.bg_zoom = 1.0;
                 self.runtime.scene.prev_bg_zoom = 1.0;
                 self.runtime.scene.fade_overlay = [0.0; 4];
+                self.runtime.scene.bg_offset = [0.0, 0.0];
+                self.runtime.scene.prev_bg_offset = [0.0, 0.0];
+                self.runtime.scene.trans_fx = None;
                 for s in &mut self.runtime.scene.sprites {
                     s.offset = [0.0, 0.0];
                 }

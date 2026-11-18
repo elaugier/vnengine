@@ -193,6 +193,16 @@ impl Parser {
                     script.labels.push(label);
                     idx += consumed;
                 }
+                Token::Transform => {
+                    let (def, consumed) = self.parse_transform_def(&lines[idx..])?;
+                    script.transforms.push(def);
+                    idx += consumed;
+                }
+                Token::Ident(s) if s == "image" => {
+                    let (def, consumed) = self.parse_image_def(&lines[idx..])?;
+                    script.images.push(def);
+                    idx += consumed;
+                }
                 _ => {
                     return Err(err(
                         line.line_no,
@@ -676,11 +686,12 @@ impl Parser {
         // `scene [expr]` evaluates the image name dynamically.
         let mut image_parts = Vec::new();
         let mut transition = None;
+        let mut layer = None;
         let mut i = 1;
-        // Collect image tokens until `with` keyword or end.
+        // Collect image tokens until `with`/`onlayer` keyword or end.
         while i < toks.len() {
             match &toks[i].token {
-                Token::Ident(s) if s == "with" => break,
+                Token::Ident(s) if s == "with" || s == "onlayer" => break,
                 Token::StringLit(s) => {
                     image_parts.push(s.clone());
                     i += 1;
@@ -717,17 +728,44 @@ impl Parser {
                 });
             }
         }
-        if let Some(t) = toks.get(i) {
-            if matches!(t.token, Token::With) {
-                i += 1;
-                let (name, dur) = self.parse_transition(&toks[i..], line_no)?;
-                transition = Some(TransitionSpec {
-                    name,
-                    duration: dur,
-                });
+        // `with <trans>` and `onlayer <layer>` in either order.
+        for _ in 0..2 {
+            match toks.get(i).map(|t| &t.token) {
+                Some(Token::With) => {
+                    i += 1;
+                    let (name, dur) = self.parse_transition(&toks[i..], line_no)?;
+                    transition = Some(TransitionSpec {
+                        name,
+                        duration: dur,
+                    });
+                    i += 1;
+                    if let Some(t) = toks.get(i) {
+                        if let Token::FloatLit(_) | Token::IntLit(_) = t.token {
+                            i += 1;
+                        }
+                    }
+                }
+                Some(Token::Ident(s)) if s == "onlayer" => {
+                    i += 1;
+                    match toks.get(i).map(|t| &t.token) {
+                        Some(Token::Ident(n)) | Some(Token::StringLit(n)) => {
+                            layer = Some(n.clone());
+                            i += 1;
+                        }
+                        _ => return Err(err(line_no, "expected layer name after `onlayer`")),
+                    }
+                }
+                _ => break,
             }
         }
-        Ok((Stmt::Scene { image, transition }, 1))
+        Ok((
+            Stmt::Scene {
+                image,
+                transition,
+                layer,
+            },
+            1,
+        ))
     }
 
     fn parse_show_stmt(
@@ -781,6 +819,7 @@ impl Parser {
         let mut z = None;
         let mut layer = None;
         let mut transition = None;
+        let mut at = Vec::new();
         while i < toks.len() {
             match &toks[i].token {
                 Token::At => {
@@ -799,11 +838,23 @@ impl Parser {
                             expect_token(&toks[i], Token::RParen, line_no, ")")?;
                             i += 1;
                             position = Some((x, y));
-                        } else if let Token::Ident(ref a) = t.token {
-                            anchor = Some(parse_anchor_ident(a, line_no)?);
-                            i += 1;
                         } else {
-                            return Err(err(line_no, "expected anchor after `at`"));
+                            // `at left` (anchor) / `at bob` (transform) /
+                            // `at t1, t2` (several transforms/anchors).
+                            loop {
+                                let a = expect_ident(&toks[i], line_no, "anchor or transform")?;
+                                i += 1;
+                                match parse_anchor_ident(&a, line_no) {
+                                    Ok(a) => anchor = Some(a),
+                                    Err(_) => at.push(a),
+                                }
+                                match toks.get(i).map(|t| &t.token) {
+                                    Some(Token::Comma) => {
+                                        i += 1;
+                                    }
+                                    _ => break,
+                                }
+                            }
                         }
                     }
                 }
@@ -862,6 +913,7 @@ impl Parser {
                 z,
                 layer,
                 transition,
+                at,
             },
             1,
         ))
@@ -1294,6 +1346,266 @@ impl Parser {
         let mut consumed = 1;
         let body = self.parse_block(lines, base_indent, &mut consumed)?;
         Ok((FunctionDef { name, params, body }, consumed))
+    }
+
+    /// Parse `transform <name>:` + an indented ATL block (top level).
+    fn parse_transform_def(&self, lines: &[Line]) -> Result<(TransformDef, usize), ParseError> {
+        let first = &lines[0];
+        let line_no = first.line_no;
+        let name = expect_ident(&first.tokens[1], line_no, "transform name")?;
+        if let Some(t) = first.tokens.get(2) {
+            expect_token(t, Token::Colon, line_no, ":")?;
+        }
+        let base_indent = first.indent;
+        let mut consumed = 1;
+        let body = self.parse_atl_block(lines, base_indent, &mut consumed)?;
+        Ok((TransformDef { name, body }, consumed))
+    }
+
+    /// Parse `image <name>:` + indented layer lines (top level).
+    ///
+    /// A layer line is `<asset-expr> [when <e>] [alpha=<e>]
+    /// [offset=(<e>,<e>)] [zoom=<e>]`.
+    fn parse_image_def(&self, lines: &[Line]) -> Result<(ImageDef, usize), ParseError> {
+        let first = &lines[0];
+        let line_no = first.line_no;
+        let name = expect_ident(&first.tokens[1], line_no, "image name")?;
+        if let Some(t) = first.tokens.get(2) {
+            expect_token(t, Token::Colon, line_no, ":")?;
+        }
+        let base_indent = first.indent;
+        let mut consumed = 1;
+        let mut layers = Vec::new();
+        while consumed < lines.len() {
+            let line = &lines[consumed];
+            if line.tokens.is_empty() {
+                consumed += 1;
+                continue;
+            }
+            if line.indent <= base_indent {
+                break;
+            }
+            layers.push(self.parse_image_layer(&line.tokens, line.line_no)?);
+            consumed += 1;
+        }
+        if layers.is_empty() {
+            return Err(err(line_no, "image block requires at least one layer"));
+        }
+        Ok((ImageDef { name, layers }, consumed))
+    }
+
+    /// Parse one `image` composite layer line.
+    fn parse_image_layer(
+        &self,
+        toks: &[Spanned],
+        line_no: usize,
+    ) -> Result<ImageLayerDef, ParseError> {
+        let (image, mut i) = self.parse_asset_expr(toks, 0, line_no)?;
+        let mut when = None;
+        let mut offset = None;
+        let mut zoom = None;
+        let mut alpha = None;
+        while i < toks.len() {
+            match &toks[i].token {
+                Token::Ident(k) if k == "when" => {
+                    i += 1;
+                    let (e, used) = parse_expr_with_len(&toks[i..], line_no)?;
+                    i += used;
+                    when = Some(e);
+                }
+                Token::Ident(k) if k == "alpha" || k == "zoom" => {
+                    i += 1;
+                    expect_token(&toks[i], Token::Assign, line_no, "=")?;
+                    i += 1;
+                    let (e, used) = parse_expr_with_len(&toks[i..], line_no)?;
+                    i += used;
+                    if k == "alpha" {
+                        alpha = Some(e);
+                    } else {
+                        zoom = Some(e);
+                    }
+                }
+                Token::Ident(k) if k == "offset" => {
+                    i += 1;
+                    expect_token(&toks[i], Token::Assign, line_no, "=")?;
+                    i += 1;
+                    expect_token(&toks[i], Token::LParen, line_no, "(")?;
+                    i += 1;
+                    let (x, nx) = parse_expr_with_len(&toks[i..], line_no)?;
+                    i += nx;
+                    expect_token(&toks[i], Token::Comma, line_no, ",")?;
+                    i += 1;
+                    let (y, ny) = parse_expr_with_len(&toks[i..], line_no)?;
+                    i += ny;
+                    expect_token(&toks[i], Token::RParen, line_no, ")")?;
+                    i += 1;
+                    offset = Some((x, y));
+                }
+                t => {
+                    return Err(err(
+                        line_no,
+                        format!("unexpected token {t:?} in image layer"),
+                    ))
+                }
+            }
+        }
+        Ok(ImageLayerDef {
+            image,
+            when,
+            offset,
+            zoom,
+            alpha,
+        })
+    }
+
+    /// Parse an indented ATL block (used by `transform` defs and by
+    /// `parallel:`/`choice:`/`on` sub-blocks).
+    fn parse_atl_block(
+        &self,
+        lines: &[Line],
+        parent_indent: usize,
+        consumed: &mut usize,
+    ) -> Result<Vec<AtlStmt>, ParseError> {
+        let mut out = Vec::new();
+        while *consumed < lines.len() {
+            let line = &lines[*consumed];
+            if line.tokens.is_empty() {
+                *consumed += 1;
+                continue;
+            }
+            if line.indent <= parent_indent {
+                break;
+            }
+            let (stmt, extra) = self.parse_atl_stmt(&lines[*consumed..])?;
+            out.push(stmt);
+            *consumed += extra;
+        }
+        Ok(out)
+    }
+
+    /// Parse one ATL statement (line or `keyword:` sub-block).
+    fn parse_atl_stmt(&self, lines: &[Line]) -> Result<(AtlStmt, usize), ParseError> {
+        let line = &lines[0];
+        let toks = &line.tokens;
+        let line_no = line.line_no;
+
+        // `pause <expr>`
+        if matches!(toks[0].token, Token::Pause) {
+            let (e, used) = parse_expr_with_len(&toks[1..], line_no)?;
+            if used != toks.len() - 1 {
+                return Err(err(line_no, "unexpected tokens after `pause`"));
+            }
+            return Ok((AtlStmt::Pause { seconds: e }, 1));
+        }
+
+        if let Token::Ident(kw) = &toks[0].token {
+            match kw.as_str() {
+                "parallel" | "choice" | "on" => {
+                    // `parallel:` / `choice [w]:` / `on <event>:`
+                    let mut i = 1;
+                    let mut weight = None;
+                    let mut event = None;
+                    if kw == "choice" {
+                        if !matches!(toks.get(i).map(|t| &t.token), Some(Token::Colon)) {
+                            let (e, used) = parse_expr_with_len(&toks[i..], line_no)?;
+                            i += used;
+                            weight = Some(e);
+                        }
+                    } else if kw == "on" {
+                        let ev = match toks.get(i).map(|t| &t.token) {
+                            Some(Token::Ident(e)) => e.clone(),
+                            Some(Token::Show) => "show".to_string(),
+                            Some(Token::Hide) => "hide".to_string(),
+                            _ => return Err(err(line_no, "expected event after `on`")),
+                        };
+                        event = Some(ev);
+                        i += 1;
+                    }
+                    expect_token(&toks[i], Token::Colon, line_no, ":")?;
+                    let mut consumed = 1;
+                    let body = self.parse_atl_block(lines, line.indent, &mut consumed)?;
+                    return Ok((
+                        match kw.as_str() {
+                            "parallel" => AtlStmt::Parallel { body },
+                            "choice" => AtlStmt::Choice { weight, body },
+                            _ => AtlStmt::On {
+                                event: event.unwrap(),
+                                body,
+                            },
+                        },
+                        consumed,
+                    ));
+                }
+                "repeat" => {
+                    // `repeat` / `repeat <n>` — wraps the current sequence.
+                    if toks.len() == 1 {
+                        return Ok((AtlStmt::Repeat { count: None }, 1));
+                    }
+                    let (e, used) = parse_expr_with_len(&toks[1..], line_no)?;
+                    if used != toks.len() - 1 {
+                        return Err(err(line_no, "unexpected tokens after `repeat`"));
+                    }
+                    return Ok((AtlStmt::Repeat { count: Some(e) }, 1));
+                }
+                "time" => {
+                    let (e, used) = parse_expr_with_len(&toks[1..], line_no)?;
+                    if used != toks.len() - 1 {
+                        return Err(err(line_no, "unexpected tokens after `time`"));
+                    }
+                    return Ok((AtlStmt::Time { at: e }, 1));
+                }
+                _ => {}
+            }
+        }
+
+        // Warp/set line: `[warper] <dur>? <prop> <expr> [<prop> <expr>...]`
+        let mut i = 0;
+        let mut warper = "linear".to_string();
+        let mut duration = None;
+        if let Token::Ident(n) = &toks[0].token {
+            if vnengine_core::atl::AnimProp::parse(n).is_none() {
+                // First ident is a warper name, not a property.
+                warper = n.clone();
+                i = 1;
+            }
+        }
+        // A leading expression that isn't a property name is the duration.
+        if !matches!(toks.get(i).map(|t| &t.token), Some(Token::Ident(n)) if vnengine_core::atl::AnimProp::parse(n).is_some())
+        {
+            if toks.get(i).is_some() {
+                let (e, used) = parse_expr_with_len(&toks[i..], line_no)?;
+                i += used;
+                duration = Some(e);
+            }
+        }
+        let mut props = Vec::new();
+        while i < toks.len() {
+            let prop = expect_ident(&toks[i], line_no, "property name")?;
+            if vnengine_core::atl::AnimProp::parse(&prop).is_none() {
+                return Err(err(line_no, format!("unknown ATL property `{prop}`")));
+            }
+            i += 1;
+            let (e, used) = parse_expr_with_len(&toks[i..], line_no)?;
+            if used == 0 {
+                return Err(err(line_no, format!("expected value for `{prop}`")));
+            }
+            i += used;
+            props.push((prop, e));
+        }
+        if props.is_empty() && duration.is_none() {
+            return Err(err(line_no, "empty ATL statement"));
+        }
+        match duration {
+            Some(duration) => Ok((
+                AtlStmt::Warp {
+                    warper,
+                    duration,
+                    props,
+                },
+                1,
+            )),
+            None => Ok((AtlStmt::Set { props }, 1)),
+        }
     }
 
     fn parse_shake_stmt(

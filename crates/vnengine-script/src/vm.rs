@@ -9,9 +9,10 @@
 use crate::ast::*;
 use crate::funcs::call_user_function;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use vnengine_core::atl::{AnimProp, AnimStep, SpriteTrack};
 use vnengine_core::command::{Anchor, Command, MenuChoice, SpriteSpec};
-use vnengine_core::model::Layer;
+use vnengine_core::model::{Layer, SpriteLayer};
 use vnengine_core::transition::Transition;
 use vnengine_core::Value;
 
@@ -610,6 +611,225 @@ impl Vm {
             .ok_or_else(|| format!("expected a string, got {v}"))
     }
 
+    /// Evaluate an expression and coerce to `f32`.
+    fn eval_f32(&mut self, expr: &Expr) -> Result<f32, String> {
+        let v = self.eval(expr)?;
+        v.as_float()
+            .map(|f| f as f32)
+            .ok_or_else(|| format!("expected a number, got {v}"))
+    }
+
+    /// Compile a named `transform` block into running tracks plus
+    /// event templates (`on show`/`replace`/`hide`). All expressions
+    /// are evaluated in the current variable context and `choice`
+    /// branches draw from the serialized PRNG — the result is plain
+    /// serializable data for the scene model.
+    fn compile_atl(
+        &mut self,
+        name: &str,
+    ) -> Result<(Vec<SpriteTrack>, BTreeMap<String, Vec<SpriteTrack>>), String> {
+        let def = self
+            .script
+            .find_transform(name)
+            .ok_or_else(|| format!("unknown transform `{name}`"))?
+            .clone();
+        let mut out = Vec::new();
+        let mut events = BTreeMap::new();
+        self.compile_atl_body(&def.body, &mut out, &mut events)?;
+        Ok((out, events))
+    }
+
+    /// Flatten an ATL block into tracks. Sequential statements share
+    /// one track; each `parallel` block is its own track; `choice`
+    /// groups resolve immediately through the seeded PRNG; `on`
+    /// blocks compile into `events`; `repeat` tags the last track.
+    fn compile_atl_body(
+        &mut self,
+        body: &[AtlStmt],
+        out: &mut Vec<SpriteTrack>,
+        events: &mut BTreeMap<String, Vec<SpriteTrack>>,
+    ) -> Result<(), String> {
+        let mut cur: Vec<AnimStep> = Vec::new();
+        let mut i = 0;
+        while i < body.len() {
+            match &body[i] {
+                AtlStmt::Warp {
+                    warper,
+                    duration,
+                    props,
+                } => {
+                    let d = self.eval_f32(duration)?;
+                    let targets = self.eval_atl_props(props)?;
+                    cur.push(AnimStep {
+                        duration: d.max(0.0),
+                        warper: warper.clone(),
+                        targets,
+                        at: None,
+                    });
+                }
+                AtlStmt::Set { props } => {
+                    let targets = self.eval_atl_props(props)?;
+                    cur.push(AnimStep {
+                        duration: 0.0,
+                        warper: "linear".into(),
+                        targets,
+                        at: None,
+                    });
+                }
+                AtlStmt::Pause { seconds } => {
+                    let s = self.eval_f32(seconds)?.max(0.0);
+                    cur.push(AnimStep {
+                        duration: s,
+                        warper: "linear".into(),
+                        targets: Vec::new(),
+                        at: None,
+                    });
+                }
+                AtlStmt::Time { at } => {
+                    let t = self.eval_f32(at)?.max(0.0);
+                    cur.push(AnimStep {
+                        duration: 0.0,
+                        warper: "linear".into(),
+                        targets: Vec::new(),
+                        at: Some(t),
+                    });
+                }
+                AtlStmt::Parallel { body } => {
+                    if !cur.is_empty() {
+                        out.push(SpriteTrack::once(std::mem::take(&mut cur)));
+                    }
+                    self.compile_atl_body(body, out, events)?;
+                }
+                AtlStmt::On { event, body } => {
+                    let mut ev_tracks = Vec::new();
+                    self.compile_atl_body(body, &mut ev_tracks, events)?;
+                    events
+                        .entry(event.clone())
+                        .or_insert_with(Vec::new)
+                        .extend(ev_tracks);
+                }
+                AtlStmt::Choice { .. } => {
+                    // Consecutive `choice` blocks form one group.
+                    let mut j = i;
+                    let mut weight_exprs: Vec<Option<Expr>> = Vec::new();
+                    while j < body.len() {
+                        if let AtlStmt::Choice { weight, .. } = &body[j] {
+                            weight_exprs.push(weight.clone());
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let mut weights = Vec::with_capacity(j - i);
+                    for w in &weight_exprs {
+                        let v = match w {
+                            Some(e) => self.eval(e)?.as_float().unwrap_or(1.0).max(0.0),
+                            None => 1.0,
+                        };
+                        weights.push(v);
+                    }
+                    let total: f64 = weights.iter().sum();
+                    let mut r = next_f64(&mut self.state.rng_seed) * total;
+                    let mut pick = 0usize;
+                    for (k, w) in weights.iter().enumerate() {
+                        r -= w;
+                        if r <= 0.0 {
+                            pick = k;
+                            break;
+                        }
+                    }
+                    if !cur.is_empty() {
+                        out.push(SpriteTrack::once(std::mem::take(&mut cur)));
+                    }
+                    if let AtlStmt::Choice { body: cb, .. } = &body[i + pick] {
+                        self.compile_atl_body(cb, out, events)?;
+                    }
+                    i = j;
+                    continue;
+                }
+                AtlStmt::Repeat { count } => {
+                    let n = match count {
+                        Some(e) => {
+                            let v = self.eval(e)?;
+                            let v = v
+                                .as_int()
+                                .ok_or_else(|| format!("repeat expects an integer, got {v}"))?;
+                            Some(v.max(0) as u32)
+                        }
+                        None => None, // infinite
+                    };
+                    if !cur.is_empty() {
+                        out.push(SpriteTrack::once(std::mem::take(&mut cur)));
+                    }
+                    if let Some(last) = out.last_mut() {
+                        last.repeats = n;
+                    }
+                }
+            }
+            i += 1;
+        }
+        if !cur.is_empty() {
+            out.push(SpriteTrack::once(cur));
+        }
+        Ok(())
+    }
+
+    /// Evaluate `(prop-name, expr)` pairs into `(AnimProp, f32)` targets.
+    fn eval_atl_props(
+        &mut self,
+        props: &[(String, Expr)],
+    ) -> Result<Vec<(AnimProp, f32)>, String> {
+        let mut out = Vec::with_capacity(props.len());
+        for (name, e) in props {
+            let prop = AnimProp::parse(name)
+                .ok_or_else(|| format!("unknown ATL property `{name}`"))?;
+            out.push((prop, self.eval_f32(e)?));
+        }
+        Ok(out)
+    }
+
+    /// Resolve an `image name:` composite into concrete layers by
+    /// evaluating `when`/`alpha`/`offset`/`zoom` in the current
+    /// context. Returns `None` when `name` isn't a composite.
+    fn resolve_image_layers(&mut self, name: &str) -> Result<Option<Vec<SpriteLayer>>, String> {
+        let Some(def) = self.script.find_image(name).cloned() else {
+            return Ok(None);
+        };
+        let mut layers = Vec::new();
+        for l in &def.layers {
+            let show = match &l.when {
+                Some(e) => self.eval(e)?.is_truthy(),
+                None => true,
+            };
+            if !show {
+                continue;
+            }
+            let image = self.eval_str(&l.image)?;
+            let offset = match &l.offset {
+                Some((x, y)) => [self.eval_f32(x)?, self.eval_f32(y)?],
+                None => [0.0, 0.0],
+            };
+            let zoom = match &l.zoom {
+                Some(e) => self.eval_f32(e)?,
+                None => 1.0,
+            };
+            let alpha = match &l.alpha {
+                Some(e) => self.eval_f32(e)?,
+                None => 1.0,
+            };
+            layers.push(SpriteLayer {
+                image,
+                offset,
+                zoom,
+                alpha,
+            });
+        }
+        if layers.is_empty() {
+            return Err(format!("image composite `{name}` resolved to zero layers"));
+        }
+        Ok(Some(layers))
+    }
+
     /// Interpolate `[expr]` references in dialogue text. Falls back to
     /// the literal `[name]` when the content is not a valid expression
     /// or references an undefined variable (backward compatible with
@@ -682,7 +902,11 @@ impl Vm {
 
     fn exec_stmt(&mut self, stmt: Stmt) -> Result<ExecOutcome, String> {
         match stmt {
-            Stmt::Scene { image, transition } => {
+            Stmt::Scene {
+                image,
+                transition,
+                layer,
+            } => {
                 let image = match &image {
                     Some(e) => Some(self.eval_str(e)?),
                     None => None,
@@ -690,9 +914,18 @@ impl Vm {
                 let trans = transition
                     .and_then(|t| Transition::parse(&t.name, t.duration))
                     .unwrap_or(Transition::Cut);
+                let layer = layer.map(|l| parse_layer(&l));
+                // `scene <image-name>` where the name is an `image` def
+                // resolves to a composite (extra layers on the bg).
+                let layers = match &image {
+                    Some(name) => self.resolve_image_layers(name)?.unwrap_or_default(),
+                    None => Vec::new(),
+                };
                 Ok(ExecOutcome::Command(Command::Scene {
                     image,
                     transition: trans,
+                    layer,
+                    layers,
                 }))
             }
             Stmt::Show {
@@ -704,6 +937,7 @@ impl Vm {
                 z,
                 layer,
                 transition,
+                at,
             } => {
                 let transition = transition.and_then(|t| Transition::parse(&t.name, t.duration));
                 let anchor = anchor_to_anchor(&anchor);
@@ -725,6 +959,17 @@ impl Vm {
                     .map(|i| i as i32);
                 let layer = layer.map(|l| parse_layer(&l));
                 let image = self.eval_str(&image)?;
+                let layers = self.resolve_image_layers(&image)?.unwrap_or_default();
+                // `at <transform>` names compile to ATL tracks + events.
+                let mut anims = Vec::new();
+                let mut anim_events: BTreeMap<String, Vec<SpriteTrack>> = BTreeMap::new();
+                for name in &at {
+                    let (tracks, events) = self.compile_atl(name)?;
+                    anims.extend(tracks);
+                    for (k, v) in events {
+                        anim_events.entry(k).or_insert_with(Vec::new).extend(v);
+                    }
+                }
                 Ok(ExecOutcome::Command(Command::Show(SpriteSpec {
                     character,
                     image,
@@ -734,6 +979,9 @@ impl Vm {
                     z,
                     layer,
                     transition,
+                    anims,
+                    anim_events,
+                    layers,
                 })))
             }
             Stmt::Hide {

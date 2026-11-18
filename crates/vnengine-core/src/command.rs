@@ -4,9 +4,11 @@
 //! they require the engine to wait for user input or for an animation to
 //! finish before the VM can resume execution.
 
-use crate::model::Layer;
+use crate::atl::SpriteTrack;
+use crate::model::{Layer, SpriteLayer};
 use crate::{transition::Transition, Value};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Where a sprite should be anchored on the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -42,6 +44,17 @@ pub struct SpriteSpec {
     /// Entry transition (`show ... with dissolve`). `None`/`Cut` is instant.
     #[serde(default)]
     pub transition: Option<Transition>,
+    /// Compiled ATL tracks started when the sprite attaches
+    /// (`show ... at <transform>`). Resolved by the VM.
+    #[serde(default)]
+    pub anims: Vec<SpriteTrack>,
+    /// ATL event templates (`on show`/`replace`/`hide`) resolved by
+    /// the VM; the scene fires the matching one on attach/hide.
+    #[serde(default)]
+    pub anim_events: BTreeMap<String, Vec<SpriteTrack>>,
+    /// Composite sub-layers from an `image name:` definition.
+    #[serde(default)]
+    pub layers: Vec<SpriteLayer>,
 }
 
 /// A single choice in a menu.
@@ -57,9 +70,17 @@ pub struct MenuChoice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     /// Show a background image, replacing the current one.
+    /// `layer` targets a non-default background layer (`scene x onlayer
+    /// midground`); `None`/`Background` uses `Scene.background` and hides
+    /// the sprites of that layer, Ren'Py-style.
     Scene {
         image: Option<String>,
         transition: Transition,
+        #[serde(default)]
+        layer: Option<Layer>,
+        /// Composite sub-layers when `image` names an `image` def.
+        #[serde(default)]
+        layers: Vec<SpriteLayer>,
     },
     /// Show (or replace) a character sprite.
     Show(SpriteSpec),

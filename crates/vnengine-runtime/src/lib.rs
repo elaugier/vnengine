@@ -208,8 +208,28 @@ impl Runtime {
         // finished exits leave the model (and the save) entirely.
         for e in &mut self.scene.exiting {
             e.elapsed += dt;
+            // `on hide` ATL tracks keep the exiting sprite alive until
+            // they finish (an infinite `repeat` keeps it forever).
+            let mut anims = std::mem::take(&mut e.sprite.anims);
+            for t in &mut anims {
+                t.tick(dt, &mut e.sprite);
+            }
+            anims.retain(|t| !t.finished());
+            e.sprite.anims = anims;
         }
-        self.scene.exiting.retain(|e| e.progress() < 1.0);
+        self.scene
+            .exiting
+            .retain(|e| e.progress() < 1.0 || !e.sprite.anims.is_empty());
+        // Layer background fade-ins on the same clock.
+        for bg in self.scene.layer_bgs.values_mut() {
+            if let Some(fade) = &mut bg.fade {
+                fade.elapsed += dt;
+                bg.opacity = (fade.elapsed / fade.duration).min(1.0);
+                if bg.opacity >= 1.0 {
+                    bg.fade = None;
+                }
+            }
+        }
         // Camera move on the same logical clock.
         if let Some(anim) = &mut self.scene.camera_anim {
             anim.elapsed += dt;
@@ -225,6 +245,14 @@ impl Runtime {
                     s.entering = None;
                 }
             }
+            // ATL tracks (`show ... at <transform>`): same logical
+            // clock; finished tracks drop out.
+            let mut anims = std::mem::take(&mut s.anims);
+            for t in &mut anims {
+                t.tick(dt, s);
+            }
+            anims.retain(|t| !t.finished());
+            s.anims = anims;
         }
 
         if let Some(remaining) = &mut self.pause_remaining {
@@ -349,19 +377,62 @@ impl Runtime {
             let pre_state = self.vm.save_state();
             match self.vm.step() {
                 StepResult::Command(cmd) => match cmd {
-                    Command::Scene { image, transition } => {
-                        let duration = transition.default_duration();
-                        if duration > 0.0 && self.scene.background.is_some() {
-                            self.scene.prev_background = self.scene.background.take();
-                            self.scene.prev_bg_opacity = 1.0;
-                            self.scene.bg_opacity = 0.0;
+                    Command::Scene {
+                        image,
+                        transition,
+                        layer,
+                        layers,
+                    } => {
+                        // Ren'Py `scene` semantics: it resets a layer —
+                        // sprites of the target layer exit (with the
+                        // scene transition) and the background changes.
+                        // Without `onlayer` the default stage is reset:
+                        // the background swaps and foreground sprites
+                        // (where characters live) exit.
+                        let layer = layer.unwrap_or(vnengine_core::model::Layer::Background);
+                        let sprite_layer = if layer == vnengine_core::model::Layer::Background {
+                            vnengine_core::model::Layer::Foreground
                         } else {
-                            self.scene.bg_opacity = 1.0;
+                            layer
+                        };
+                        self.scene
+                            .hide_sprites_on_layer(sprite_layer, transition.clone());
+                        if layer == vnengine_core::model::Layer::Background {
+                            let duration = transition.default_duration();
+                            if duration > 0.0 && self.scene.background.is_some() {
+                                self.scene.prev_background = self.scene.background.take();
+                                self.scene.prev_bg_opacity = 1.0;
+                                self.scene.bg_opacity = 0.0;
+                            } else {
+                                self.scene.bg_opacity = 1.0;
+                            }
+                            self.scene.background = image.clone();
+                            self.scene.bg_layers = layers;
+                        } else {
+                            let duration = transition.default_duration();
+                            self.scene.layer_bgs.insert(
+                                layer as u8,
+                                vnengine_core::model::LayerBg {
+                                    image: image.clone().unwrap_or_default(),
+                                    opacity: if duration > 0.0 { 0.0 } else { 1.0 },
+                                    zoom: 1.0,
+                                    layers,
+                                    fade: if duration > 0.0 {
+                                        Some(vnengine_core::model::LayerFade {
+                                            elapsed: 0.0,
+                                            duration,
+                                        })
+                                    } else {
+                                        None
+                                    },
+                                },
+                            );
                         }
-                        self.scene.background = image;
                         return RuntimeEvent::Effect(Command::Scene {
                             image: self.scene.background.clone(),
                             transition,
+                            layer: Some(layer),
+                            layers: Vec::new(),
                         });
                     }
                     Command::Show(spec) => {
@@ -522,7 +593,7 @@ impl Runtime {
                                 sprite.rotation = r;
                             }
                             if let Some(s) = scale {
-                                sprite.scale = s;
+                                sprite.scale = [s, s];
                             }
                             if let Some((ox, oy)) = offset {
                                 sprite.offset = [ox, oy];

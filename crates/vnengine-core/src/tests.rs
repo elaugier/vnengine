@@ -233,6 +233,9 @@ fn scene_set_sprite_replaces_same_character() {
         z: None,
         transition: None,
         layer: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
     };
     scene.set_sprite(&spec1);
     assert_eq!(scene.sprites.len(), 1);
@@ -247,6 +250,9 @@ fn scene_set_sprite_replaces_same_character() {
         z: None,
         transition: None,
         layer: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
     };
     scene.set_sprite(&spec2);
     assert_eq!(scene.sprites.len(), 1);
@@ -266,6 +272,9 @@ fn scene_set_sprite_multiple_characters() {
         z: None,
         transition: None,
         layer: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
     });
     scene.set_sprite(&SpriteSpec {
         character: "bob".into(),
@@ -276,6 +285,9 @@ fn scene_set_sprite_multiple_characters() {
         z: None,
         transition: None,
         layer: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
     });
     assert_eq!(scene.sprites.len(), 2);
 }
@@ -292,6 +304,9 @@ fn scene_hide_sprite() {
         z: None,
         transition: None,
         layer: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
     });
     assert!(scene.hide_sprite("alice", crate::transition::Transition::Cut));
     assert_eq!(scene.sprites.len(), 0);
@@ -310,6 +325,9 @@ fn scene_hide_sprite_with_transition_goes_to_exiting() {
         z: None,
         transition: None,
         layer: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
     });
     assert!(scene.hide_sprite(
         "alice",
@@ -334,6 +352,9 @@ fn scene_sprite_lookup() {
         z: None,
         transition: None,
         layer: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
     });
     assert!(scene.sprite("alice").is_some());
     assert!(scene.sprite("bob").is_none());
@@ -352,6 +373,9 @@ fn scene_z_sorting() {
         z: Some(0),
         transition: None,
         layer: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
     });
     scene.set_sprite(&SpriteSpec {
         character: "front".into(),
@@ -362,6 +386,9 @@ fn scene_z_sorting() {
         z: Some(10),
         transition: None,
         layer: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
     });
     assert_eq!(scene.sprites[0].character, "back");
     assert_eq!(scene.sprites[1].character, "front");
@@ -383,6 +410,9 @@ fn scene_serde_roundtrip() {
         z: None,
         transition: None,
         layer: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
     });
     let json = serde_json::to_string(&scene).unwrap();
     let scene2: Scene = serde_json::from_str(&json).unwrap();
@@ -606,4 +636,306 @@ fn scene_light_upsert_and_remove() {
     assert!(scene.remove_light("a"));
     assert!(!scene.remove_light("a"));
     assert_eq!(scene.ambient, [1.0, 1.0, 1.0]);
+}
+
+// ---------- Phase 2: ATL & transitions ----------
+
+#[test]
+fn atl_warp_endpoints_and_fallback() {
+    use crate::atl::warp;
+    for name in ["linear", "ease", "easein", "easeout", "bounce", "elastic"] {
+        assert!((warp(name, 0.0)).abs() < 1e-4, "{name} at 0");
+        assert!((warp(name, 1.0) - 1.0).abs() < 1e-4, "{name} at 1");
+    }
+    // Unknown warpers degrade to linear.
+    assert_eq!(warp("nonexistent", 0.37), 0.37);
+    // Ease is slower than linear at mid-time.
+    assert!(warp("easein", 0.5) < 0.5);
+    assert!(warp("easeout", 0.5) > 0.5);
+}
+
+#[test]
+fn atl_track_tween_interpolates() {
+    use crate::atl::{AnimProp, AnimStep, SpriteTrack};
+    use crate::command::SpriteSpec;
+    use crate::model::Scene;
+    let mut scene = Scene::default();
+    scene.set_sprite(&SpriteSpec {
+        character: "e".into(),
+        image: "e".into(),
+        anchor: crate::command::Anchor::Center,
+        position: Some((0.0, 0.5)),
+        scale: None,
+        z: None,
+        transition: None,
+        layer: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
+    });
+    let mut s = scene.sprites[0].clone();
+    let mut track = SpriteTrack::once(vec![AnimStep {
+        duration: 1.0,
+        warper: "linear".into(),
+        targets: vec![(AnimProp::XPos, 1.0)],
+        at: None,
+    }]);
+    track.tick(0.5, &mut s);
+    let x = s.position.unwrap().0;
+    assert!((x - 0.5).abs() < 0.01, "midpoint x={x}");
+    track.tick(0.5, &mut s);
+    assert!((s.position.unwrap().0 - 1.0).abs() < 1e-4);
+    assert!(track.finished());
+}
+
+#[test]
+fn atl_track_instant_set_then_pause() {
+    use crate::atl::{AnimProp, AnimStep, SpriteTrack};
+    let mut s = crate::model::ActiveSprite {
+        character: "e".into(),
+        image: "e".into(),
+        anchor: crate::command::Anchor::Center,
+        position: None,
+        scale: [1.0, 1.0],
+        z: 0,
+        opacity: 1.0,
+        offset: [0.0, 0.0],
+        rotation: 0.0,
+        layer: crate::model::Layer::Foreground,
+        anchor_frac: None,
+        entering: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
+    };
+    let mut track = SpriteTrack::once(vec![
+        AnimStep {
+            duration: 0.0,
+            warper: "linear".into(),
+            targets: vec![(AnimProp::Alpha, 0.5)],
+            at: None,
+        },
+        AnimStep {
+            duration: 2.0,
+            warper: "linear".into(),
+            targets: Vec::new(), // wait
+            at: None,
+        },
+        AnimStep {
+            duration: 0.0,
+            warper: "linear".into(),
+            targets: vec![(AnimProp::Alpha, 1.0)],
+            at: None,
+        },
+    ]);
+    // Instant set applies inside the first tick regardless of dt.
+    track.tick(0.0, &mut s);
+    assert!((s.opacity - 0.5).abs() < 1e-4);
+    // The wait step holds the value.
+    track.tick(1.0, &mut s);
+    assert!((s.opacity - 0.5).abs() < 1e-4);
+    assert!(!track.finished());
+    track.tick(1.0, &mut s);
+    assert!((s.opacity - 1.0).abs() < 1e-4);
+    assert!(track.finished());
+}
+
+#[test]
+fn atl_track_time_sync_waits_for_absolute() {
+    use crate::atl::{AnimProp, AnimStep, SpriteTrack};
+    let mut s = crate::model::ActiveSprite {
+        character: "e".into(),
+        image: "e".into(),
+        anchor: crate::command::Anchor::Center,
+        position: Some((0.0, 0.5)),
+        scale: [1.0, 1.0],
+        z: 0,
+        opacity: 1.0,
+        offset: [0.0, 0.0],
+        rotation: 0.0,
+        layer: crate::model::Layer::Foreground,
+        anchor_frac: None,
+        entering: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
+    };
+    let mut track = SpriteTrack::once(vec![
+        AnimStep {
+            duration: 0.0,
+            warper: "linear".into(),
+            targets: Vec::new(),
+            at: Some(1.0), // `time 1.0`
+        },
+        AnimStep {
+            duration: 0.0,
+            warper: "linear".into(),
+            targets: vec![(AnimProp::XPos, 0.9)],
+            at: None,
+        },
+    ]);
+    track.tick(0.5, &mut s); // elapsed 0.5 < 1.0: still waiting
+    assert_eq!(s.position.unwrap().0, 0.0);
+    track.tick(0.6, &mut s); // elapsed 1.1 >= 1.0: runs through
+    assert!((s.position.unwrap().0 - 0.9).abs() < 1e-4);
+    assert!(track.finished());
+}
+
+#[test]
+fn atl_track_repeat_finite_and_infinite() {
+    use crate::atl::{AnimProp, AnimStep, SpriteTrack};
+    let mk = |repeats| {
+        let mut t = SpriteTrack::once(vec![AnimStep {
+            duration: 0.0,
+            warper: "linear".into(),
+            targets: vec![(AnimProp::XOff, 0.1)],
+            at: None,
+        }]);
+        t.repeats = repeats;
+        t
+    };
+    let mut s = crate::model::ActiveSprite {
+        character: "e".into(),
+        image: "e".into(),
+        anchor: crate::command::Anchor::Center,
+        position: None,
+        scale: [1.0, 1.0],
+        z: 0,
+        opacity: 1.0,
+        offset: [0.0, 0.0],
+        rotation: 0.0,
+        layer: crate::model::Layer::Foreground,
+        anchor_frac: None,
+        entering: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
+    };
+    // repeat 3: runs 3 times then finishes.
+    let mut t3 = mk(Some(3));
+    for _ in 0..3 {
+        t3.tick(0.0, &mut s);
+    }
+    assert!(t3.finished());
+    assert_eq!(t3.iteration, 3);
+    // Infinite: never finishes.
+    let mut ti = mk(None);
+    for _ in 0..20 {
+        ti.tick(0.0, &mut s);
+    }
+    assert!(!ti.finished());
+    assert!(ti.iteration >= 20);
+}
+
+#[test]
+fn atl_track_finish_flattens_reduce_motion() {
+    use crate::atl::{AnimProp, AnimStep, SpriteTrack};
+    let mut s = crate::model::ActiveSprite {
+        character: "e".into(),
+        image: "e".into(),
+        anchor: crate::command::Anchor::Center,
+        position: Some((0.0, 0.0)),
+        scale: [1.0, 1.0],
+        z: 0,
+        opacity: 1.0,
+        offset: [0.0, 0.0],
+        rotation: 0.0,
+        layer: crate::model::Layer::Foreground,
+        anchor_frac: None,
+        entering: None,
+        anims: Vec::new(),
+        anim_events: Default::default(),
+        layers: Vec::new(),
+    };
+    let track = SpriteTrack::once(vec![
+        AnimStep {
+            duration: 5.0,
+            warper: "ease".into(),
+            targets: vec![(AnimProp::XPos, 0.8)],
+            at: None,
+        },
+        AnimStep {
+            duration: 1.0,
+            warper: "linear".into(),
+            targets: vec![(AnimProp::Alpha, 0.2)],
+            at: None,
+        },
+    ]);
+    track.finish(&mut s);
+    assert!((s.position.unwrap().0 - 0.8).abs() < 1e-4);
+    assert!((s.opacity - 0.2).abs() < 1e-4);
+}
+
+#[test]
+fn transition_parse_new_kinds() {
+    use crate::transition::{SlideDirection, Transition};
+    assert_eq!(
+        Transition::parse("pushleft", None),
+        Some(Transition::Push {
+            direction: SlideDirection::Left,
+            duration: 0.5
+        })
+    );
+    assert_eq!(
+        Transition::parse("pushdown", Some(1.5)),
+        Some(Transition::Push {
+            direction: SlideDirection::Down,
+            duration: 1.5
+        })
+    );
+    assert_eq!(
+        Transition::parse("blinds", None),
+        Some(Transition::Blinds {
+            vertical: true,
+            strips: 10,
+            duration: 0.5
+        })
+    );
+    assert_eq!(
+        Transition::parse("blindsh", None),
+        Some(Transition::Blinds {
+            vertical: false,
+            strips: 10,
+            duration: 0.5
+        })
+    );
+    assert_eq!(
+        Transition::parse("irisin", None),
+        Some(Transition::Iris {
+            inward: true,
+            duration: 0.5
+        })
+    );
+    assert_eq!(
+        Transition::parse("irisout", None),
+        Some(Transition::Iris {
+            inward: false,
+            duration: 0.5
+        })
+    );
+    assert_eq!(
+        Transition::parse("pixelate", None),
+        Some(Transition::Pixelate { duration: 0.5 })
+    );
+    assert_eq!(
+        Transition::parse("squares", Some(2.0)),
+        Some(Transition::Squares {
+            cells: 12,
+            duration: 2.0
+        })
+    );
+}
+
+#[test]
+fn transition_mask_classification() {
+    use crate::transition::Transition;
+    assert!(!Transition::parse("dissolve", None).unwrap().is_masked());
+    assert!(!Transition::parse("pushleft", None).unwrap().is_masked());
+    assert_eq!(Transition::parse("blinds", None).unwrap().mask_kind(), 1);
+    assert_eq!(Transition::parse("blindsh", None).unwrap().mask_kind(), 2);
+    assert_eq!(Transition::parse("irisin", None).unwrap().mask_kind(), 3);
+    assert_eq!(Transition::parse("irisout", None).unwrap().mask_kind(), 4);
+    assert_eq!(Transition::parse("pixelate", None).unwrap().mask_kind(), 5);
+    assert_eq!(Transition::parse("squares", None).unwrap().mask_kind(), 6);
+    assert_eq!(Transition::parse("blinds", None).unwrap().mask_param(), 10.0);
 }

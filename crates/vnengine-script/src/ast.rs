@@ -13,6 +13,80 @@ pub struct Script {
     pub labels: Vec<Label>,
     /// User-defined functions.
     pub functions: Vec<FunctionDef>,
+    /// Named ATL transform definitions (`transform name:`).
+    #[serde(default)]
+    pub transforms: Vec<TransformDef>,
+    /// Composite image definitions (`image name:`).
+    #[serde(default)]
+    pub images: Vec<ImageDef>,
+}
+
+impl Script {
+    /// Find a transform definition by name.
+    pub fn find_transform(&self, name: &str) -> Option<&TransformDef> {
+        self.transforms.iter().find(|t| t.name == name)
+    }
+
+    /// Find a composite image definition by name.
+    pub fn find_image(&self, name: &str) -> Option<&ImageDef> {
+        self.images.iter().find(|i| i.name == name)
+    }
+}
+
+/// A named ATL transform: `transform <name>: <body>`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransformDef {
+    pub name: String,
+    pub body: Vec<AtlStmt>,
+}
+
+/// A composite image definition: `image <name>: <layers>`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageDef {
+    pub name: String,
+    pub layers: Vec<ImageLayerDef>,
+}
+
+/// One layer of an `image name:` composite. `when` gates the layer on
+/// an expression evaluated at show time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageLayerDef {
+    pub image: Expr,
+    #[serde(default)]
+    pub when: Option<Expr>,
+    #[serde(default)]
+    pub offset: Option<(Expr, Expr)>,
+    #[serde(default)]
+    pub zoom: Option<Expr>,
+    #[serde(default)]
+    pub alpha: Option<Expr>,
+}
+
+/// A statement inside an ATL `transform` block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AtlStmt {
+    /// `[warper] <duration> <prop> <value> [<prop> <value> ...]` —
+    /// tween the properties to their targets.
+    Warp {
+        warper: String,
+        duration: Expr,
+        props: Vec<(String, Expr)>,
+    },
+    /// `<prop> <value> [<prop> <value> ...]` — instant set.
+    Set { props: Vec<(String, Expr)> },
+    /// `pause <seconds>` — wait.
+    Pause { seconds: Expr },
+    /// `time <t>` — hold until the track elapsed time reaches `t`.
+    Time { at: Expr },
+    /// `parallel:` — the block compiles to an extra concurrent track.
+    Parallel { body: Vec<AtlStmt> },
+    /// `choice [weight]:` — pick one child via the seeded PRNG.
+    Choice { weight: Option<Expr>, body: Vec<AtlStmt> },
+    /// `repeat [n]` — wraps the *preceding* sibling list; the parser
+    /// turns it into a track-level repeat.
+    Repeat { count: Option<Expr> },
+    /// `on show|replace|hide:` — event block.
+    On { event: String, body: Vec<AtlStmt> },
 }
 
 /// A user-defined function: `def name(params): body`
@@ -67,15 +141,20 @@ pub struct Label {
 /// A statement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Stmt {
-    /// `scene <image> [with <transition>]` — `image` is an expression
-    /// evaluating to a string (or `None` to clear).
+    /// `scene <image> [with <transition>] [onlayer <layer>]` —
+    /// `image` is an expression evaluating to a string (or `None`
+    /// to clear).
     Scene {
         image: Option<Expr>,
         transition: Option<TransitionSpec>,
+        /// Target layer (`onlayer <layer>`); `None` = default background.
+        #[serde(default)]
+        layer: Option<String>,
     },
-    /// `show <character> <image> [at <anchor>] [layer=<layer>] [with <transition>]`
+    /// `show <character> <image> [at <anchor>|<transform>,...] [layer=<layer>] [with <transition>]`
     /// `image` is an expression evaluating to a string; `show e [expr]`
-    /// appends the evaluated suffix to the character name.
+    /// appends the evaluated suffix to the character name. `at` accepts
+    /// named anchors (`left`, `right`...) and named ATL transforms.
     Show {
         character: String,
         image: Expr,
@@ -85,6 +164,10 @@ pub enum Stmt {
         z: Option<Expr>,
         layer: Option<String>,
         transition: Option<TransitionSpec>,
+        /// ATL transform names from `at <name>` (`at left` stays in
+        /// `anchor`; unknown names are treated as transforms).
+        #[serde(default)]
+        at: Vec<String>,
     },
     /// `hide <character> [with <transition>]` or bare `hide [with <transition>]`
     /// (equivalent to `hide all`).
