@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kit:
+    name: Author kit (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x64
+            ext: .exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            name: windows-arm64
+            ext: .exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x64
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build engine binaries
+        run: >
+          cargo build --release --locked
+          --target ${{ matrix.target }}
+          -p vnengine-cli -p vnengine-pack
+      - name: Assemble author kit
+        shell: bash
+        run: >
+          bash scripts/package-kit.sh
+          target/${{ matrix.target }}/release
+          vnengine-kit-${{ matrix.name }}
+          "${{ matrix.ext }}"
+      - name: Upload kit to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/vnengine-kit-${{ matrix.name }}.*
+
+  extension:
+    name: VS Code extension (.vsix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build WASM linter
+        run: >
+          cargo build --release --locked
+          -p vnengine-lint-wasm
+          --target wasm32-unknown-unknown
+      - name: Stage WASM linter into the extension
+        run: >
+          cp target/wasm32-unknown-unknown/release/vnengine_lint_wasm.wasm
+          editors/vscode/media/vnengine-lint.wasm
+      - name: Package .vsix
+        working-directory: editors/vscode
+        run: npx -y @vscode/vsce package --out vnengine.vsix
+      - name: Upload .vsix to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: editors/vscode/vnengine.vsix

@@ -16,6 +16,25 @@ pub enum ParseError {
     },
 }
 
+impl ParseError {
+    /// 1-based source line where the error occurred.
+    pub fn line(&self) -> usize {
+        match self {
+            ParseError::Generic { line, .. } | ParseError::Unexpected { line, .. } => *line,
+        }
+    }
+
+    /// The error message without the `line N:` display prefix.
+    pub fn message(&self) -> String {
+        match self {
+            ParseError::Generic { message, .. } => message.clone(),
+            ParseError::Unexpected { got, expected, .. } => {
+                format!("unexpected token {got}, expected {expected}")
+            }
+        }
+    }
+}
+
 /// Split a token slice on top-level commas (commas inside parens,
 /// brackets or braces don't split). An empty input yields no chunks.
 fn split_commas(toks: &[Spanned]) -> Vec<&[Spanned]> {
@@ -104,7 +123,7 @@ impl Parser {
     pub fn parse(src: &str) -> Result<Script, ParseError> {
         let tokens = Lexer::new(src)
             .tokenize()
-            .map_err(|e| err(0, e.to_string()))?;
+            .map_err(|e| err(e.line(), e.to_string()))?;
         let mut p = Parser::new(tokens);
         p.parse_script()
     }

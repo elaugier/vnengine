@@ -1,0 +1,16 @@
+[package]
+name = "vnengine-lint-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WASM build of the vnengine script linter for editor integrations"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vnengine-core = { workspace = true }
+vnengine-script = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"

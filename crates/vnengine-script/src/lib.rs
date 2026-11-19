@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod funcs;
 pub mod lexer;
+pub mod lint;
 pub mod parser;
 pub mod vm;
 

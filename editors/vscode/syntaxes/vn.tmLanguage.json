@@ -1,0 +1,91 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "vnengine Script",
+  "scopeName": "source.vn",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#label-def" },
+    { "include": "#keyword" },
+    { "include": "#constant" },
+    { "include": "#builtin" },
+    { "include": "#number" },
+    { "include": "#dollar-assign" },
+    { "include": "#named-def" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.vn",
+      "match": "#.*$"
+    },
+    "string": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.vn",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "name": "constant.character.escape.vn", "match": "\\\\." },
+            { "include": "#interpolation" }
+          ]
+        },
+        {
+          "name": "string.quoted.single.vn",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            { "name": "constant.character.escape.vn", "match": "\\\\." },
+            { "include": "#interpolation" }
+          ]
+        }
+      ]
+    },
+    "interpolation": {
+      "name": "meta.interpolation.vn",
+      "begin": "\\[",
+      "end": "\\]",
+      "patterns": [
+        { "include": "#string" },
+        { "include": "#builtin" },
+        { "include": "#constant" },
+        { "include": "#number" },
+        { "name": "variable.other.vn", "match": "[A-Za-z_][A-Za-z0-9_]*" }
+      ]
+    },
+    "label-def": {
+      "name": "meta.label.vn",
+      "match": "^\\s*(label)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.control.vn" },
+        "2": { "name": "entity.name.label.vn" }
+      }
+    },
+    "named-def": {
+      "match": "\\b(screen|transform|image|achievement|def|menu|button|camera|light|unlight|define|default)\\s+([A-Za-z_][A-Za-z0-9_]*|\"[^\"]*\")",
+      "captures": {
+        "1": { "name": "keyword.control.vn" },
+        "2": { "name": "entity.name.function.vn" }
+      }
+    },
+    "keyword": {
+      "name": "keyword.control.vn",
+      "match": "\\b(label|define|default|def|return|scene|show|hide|with|at|as|onlayer|layer|menu|set|jump|call|if|elif|else|while|for|in|break|continue|pause|play|stop|queue|volume|filter|music|sfx|voice|channel|screen|text|box|image|button|window|nvl|input|confirm|transform|choice|repeat|parallel|on|time|achievement|grant|persistent|plugin|light|unlight|ambient|camera|shake|end|pass|warper|linear|ease|easein|easeout|bounce|elastic)\\b"
+    },
+    "constant": {
+      "name": "constant.language.vn",
+      "match": "\\b(True|False|None)\\b"
+    },
+    "builtin": {
+      "name": "support.function.builtin.vn",
+      "match": "\\b(random|randint|srand|len|str|int|float|bool|abs|min|max|round|choice|sample|shuffle|range|sorted|reversed|keys|values|items|has|get|upper|lower|strip|lstrip|rstrip|split|replace|startswith|endswith|count|find|index|join|Character)\\b"
+    },
+    "number": {
+      "name": "constant.numeric.vn",
+      "match": "\\b\\d+(\\.\\d+)?\\b"
+    },
+    "dollar-assign": {
+      "name": "keyword.operator.vn",
+      "match": "\\$|==|!=|<=|>=|&&|\\|\\||[+*/%<>=!]=?|\\b(and|or|not|is)\\b"
+    }
+  }
+}

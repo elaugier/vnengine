@@ -25,10 +25,9 @@ use std::path::{Path, PathBuf};
 use vnengine_core::assets::{sanitize_rel, AssetSource};
 use vnengine_core::EngineConfig;
 use vnengine_script::ast::Script;
+use vnengine_script::lint::{check_source, Diagnostic, LintOptions, Severity};
 use vnengine_script::Parser as ScriptParser;
 use zip::write::SimpleFileOptions;
-
-pub mod lint;
 
 /// Package format version written by [`build`].
 pub const MANIFEST_FORMAT: u32 = 2;
@@ -208,15 +207,83 @@ pub fn load_config(project: &Path) -> Result<EngineConfig> {
     .with_context(|| format!("failed to parse {}", config_path.display()))
 }
 
+/// A [`Diagnostic`] tied to the project-relative file it was found in.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileDiagnostic {
+    pub file: String,
+    #[serde(flatten)]
+    pub diagnostic: Diagnostic,
+}
+
+/// Structured result of [`check`]: the JSON shape emitted by
+/// `vnengine-pack --check-only --json` and consumed by the editor
+/// extension.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckReport {
+    /// `false` when any error-severity diagnostic was produced.
+    pub ok: bool,
+    /// Project title from `project.toml`, when it parsed.
+    pub title: Option<String>,
+    /// Number of labels in the entry script, when it parsed.
+    pub labels: Option<usize>,
+    /// Number of asset files found under the asset dirs.
+    pub assets: usize,
+    /// License/notice files found.
+    pub licenses: usize,
+    pub diagnostics: Vec<FileDiagnostic>,
+}
+
 /// Validate a project without writing a package: parses the config and
-/// the entry script, and reports asset/license file counts.
-pub fn validate(project: &Path) -> Result<()> {
-    let config = load_config(project)?;
+/// the entry script, lints the script against the on-disk asset set, and
+/// collects everything into a [`CheckReport`]. Nothing here is fatal —
+/// config/IO/parse failures come back as `error` diagnostics.
+pub fn check(project: &Path) -> Result<CheckReport> {
+    let mut diagnostics = Vec::new();
+    let fail = |file: &str, e: &anyhow::Error| FileDiagnostic {
+        file: file.to_string(),
+        diagnostic: Diagnostic {
+            severity: Severity::Error,
+            message: e.to_string(),
+            line: None,
+            col: None,
+            span: None,
+        },
+    };
+
+    let config = match load_config(project) {
+        Ok(c) => c,
+        Err(e) => {
+            diagnostics.push(fail("project.toml", &e));
+            return Ok(CheckReport {
+                ok: false,
+                title: None,
+                labels: None,
+                assets: 0,
+                licenses: 0,
+                diagnostics,
+            });
+        }
+    };
+
+    let script_rel = config.entry_script.replace('\\', "/");
     let script_path = project.join(&config.entry_script);
-    let source = fs::read_to_string(&script_path)
-        .with_context(|| format!("failed to read {}", script_path.display()))?;
-    let script = ScriptParser::parse(&source)
-        .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", script_path.display()))?;
+    let source = match fs::read_to_string(&script_path) {
+        Ok(s) => s,
+        Err(e) => {
+            diagnostics.push(fail(
+                &script_rel,
+                &anyhow::anyhow!("failed to read {}: {e}", script_path.display()),
+            ));
+            return Ok(CheckReport {
+                ok: false,
+                title: Some(config.title),
+                labels: None,
+                assets: 0,
+                licenses: license_files(project).len(),
+                diagnostics,
+            });
+        }
+    };
 
     let mut assets = Vec::new();
     for dir in asset_dirs(&config) {
@@ -234,25 +301,69 @@ pub fn validate(project: &Path) -> Result<()> {
                 .map(|r| r.to_string_lossy().replace('\\', "/"))
         })
         .collect();
-    let warnings = lint::lint_script(&script, &config, &asset_set);
-    for warn in &warnings {
-        println!("warning: {warn}");
+
+    let mut labels = None;
+    let diags = check_source(&source, &config, Some(&asset_set), &LintOptions::default());
+    if !diags.iter().any(|d| d.severity == Severity::Error) {
+        labels = ScriptParser::parse(&source).ok().map(|s| s.labels.len());
     }
-    if !warnings.is_empty() {
-        println!("lint: {} warning(s)", warnings.len());
-    }
+    diagnostics.extend(diags.into_iter().map(|d| FileDiagnostic {
+        file: script_rel.clone(),
+        diagnostic: d,
+    }));
+
     let licenses = license_files(project);
-    println!("valid project: {}", config.title);
-    println!(
-        "script: {} ({} labels)",
-        script_path.display(),
-        script.labels.len()
-    );
-    println!("assets: {} files", assets.len());
-    if licenses.is_empty() {
+    let ok = !diagnostics
+        .iter()
+        .any(|d| d.diagnostic.severity == Severity::Error);
+    Ok(CheckReport {
+        ok,
+        title: Some(config.title),
+        labels,
+        assets: assets.len(),
+        licenses: licenses.len(),
+        diagnostics,
+    })
+}
+
+/// Human-readable validation output built on [`check`]. Returns an error
+/// when the report contains error-severity diagnostics.
+pub fn validate(project: &Path) -> Result<()> {
+    let report = check(project)?;
+    for d in &report.diagnostics {
+        let marker = match d.diagnostic.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        };
+        println!("{marker}: {}", d.diagnostic.message);
+        if let Some(line) = d.diagnostic.line {
+            println!("  --> {}:{line}", d.file);
+        }
+    }
+    if !report.ok {
+        bail!("project validation failed");
+    }
+    let warnings = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.diagnostic.severity == Severity::Warning)
+        .count();
+    if warnings > 0 {
+        println!("lint: {warnings} warning(s)");
+    }
+    println!("valid project: {}", report.title.as_deref().unwrap_or("?"));
+    if let Some(labels) = report.labels {
+        let config = load_config(project)?;
+        println!(
+            "script: {} ({labels} labels)",
+            project.join(config.entry_script).display()
+        );
+    }
+    println!("assets: {} files", report.assets);
+    if report.licenses == 0 {
         println!("licenses: none found (add LICENSE/NOTICE files or a licenses/ dir)");
     } else {
-        println!("licenses: {} files", licenses.len());
+        println!("licenses: {} files", report.licenses);
     }
     Ok(())
 }

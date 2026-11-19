@@ -23,15 +23,34 @@ A cross-platform visual novel engine written in Rust, inspired by Ren'Py.
 vnengine/
 ├── crates/
 │   ├── vnengine-core/     # Shared types, config, save/load, scene model
-│   ├── vnengine-script/   # .vn DSL: lexer, parser, AST, VM
+│   ├── vnengine-script/   # .vn DSL: lexer, parser, AST, VM, linter
+│   ├── vnengine-runtime/  # Headless game state (no OS access)
 │   ├── vnengine-render/   # wgpu renderer (sprites, backgrounds, text, UI)
 │   ├── vnengine-audio/    # kira audio engine (BGM/SFX/voice)
 │   ├── vnengine-app/      # Main loop, input, scene management, UI
-│   └── vnengine-cli/      # Command-line runner
-└── demo/                  # Example visual novel project
-    ├── project.toml
-    └── script/main.vn
+│   ├── vnengine-cli/      # `vnengine` command-line runner
+│   ├── vnengine-pack/     # `vnengine-pack` .vnpkg builder/validator
+│   ├── vnengine-plugins/  # sandboxed WASM plugins (wasmtime)
+│   └── vnengine-lint-wasm/# WASM build of the linter for editors
+├── editors/vscode/        # VS Code extension (highlighting + diagnostics)
+├── demo/                  # Example VN — doubles as the kit's template
+├── docs/                  # Tutorial (EN/FR), DSL reference, deployment
+├── kit/                   # Author-kit README template
+└── scripts/               # Release packaging helpers
 ```
+
+## For authors (no Rust required)
+
+Releases ship an **author kit** per platform (`windows-x64`,
+`windows-arm64`, `linux-x64`): the `vnengine` and `vnengine-pack`
+binaries, the `demo/` project as a template, and the docs — everything
+needed to write, run, validate and package a game. A `.vsix` VS Code
+extension provides `.vn` syntax highlighting and diagnostics from the
+engine's own parser/linter.
+
+- `docs/TUTORIAL.md` / `docs/TUTORIAL.fr.md` — end-to-end walkthrough
+- `docs/DSL_REFERENCE.md` — complete `.vn` language reference (all
+  examples are validated by the test suite)
 
 ## Getting Started
 

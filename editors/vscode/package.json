@@ -1,0 +1,96 @@
+{
+  "name": "vnengine",
+  "displayName": "vnengine",
+  "description": "Syntax highlighting, diagnostics and project commands for vnengine .vn visual novel scripts",
+  "version": "0.1.0",
+  "publisher": "vnengine",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:vn"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "vn",
+        "extensions": [
+          ".vn"
+        ],
+        "aliases": [
+          "vnengine Script",
+          "vn"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "vn",
+        "scopeName": "source.vn",
+        "path": "./syntaxes/vn.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "vnengine.run",
+        "title": "vnengine: Run Project",
+        "category": "vnengine"
+      },
+      {
+        "command": "vnengine.validate",
+        "title": "vnengine: Validate Project",
+        "category": "vnengine"
+      },
+      {
+        "command": "vnengine.package",
+        "title": "vnengine: Package Project (.vnpkg)",
+        "category": "vnengine"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "vnengine.run",
+          "when": "editorLangId == vn",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "vnengine",
+      "properties": {
+        "vnengine.enginePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the `vnengine` binary. Empty: resolved from PATH."
+        },
+        "vnengine.packPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the `vnengine-pack` binary. Empty: resolved from PATH."
+        },
+        "vnengine.diagnostics": {
+          "type": "string",
+          "enum": [
+            "wasm",
+            "binary",
+            "off"
+          ],
+          "default": "wasm",
+          "description": "Diagnostics source: the embedded WASM linter, the vnengine-pack binary for saved files (WASM for unsaved edits), or off."
+        },
+        "vnengine.diagnosticsDebounceMs": {
+          "type": "number",
+          "default": 300,
+          "description": "Delay in milliseconds before live diagnostics refresh after an edit."
+        }
+      }
+    }
+  }
+}

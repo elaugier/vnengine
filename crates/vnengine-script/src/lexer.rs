@@ -125,6 +125,15 @@ pub enum LexError {
     Generic { line: usize, message: String },
 }
 
+impl LexError {
+    /// 1-based source line where the error occurred.
+    pub fn line(&self) -> usize {
+        match self {
+            LexError::Generic { line, .. } => *line,
+        }
+    }
+}
+
 fn lex_error(line: usize, msg: impl Into<String>) -> LexError {
     LexError::Generic {
         line,

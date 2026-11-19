@@ -5,6 +5,14 @@
 *.ogg
 *.wav
 *.mp3
+# demo/ is the shipped template project — its assets are tracked
+!demo/**/*.png
+!demo/**/*.jpg
+!demo/**/*.ogg
+!demo/**/*.wav
+!demo/**/*.mp3
 temp/
 .vscode/
-
+/dist
+/build
+editors/vscode/*.vsix
