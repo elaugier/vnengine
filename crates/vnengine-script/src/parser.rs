@@ -212,6 +212,23 @@ impl Parser {
                     script.screens.push(def);
                     idx += consumed;
                 }
+                Token::Ident(s) if s == "achievement" => {
+                    // `achievement <name> ["description"]`
+                    let name = expect_ident(&line.tokens[1], line.line_no, "achievement name")
+                        .or_else(|_| match &line.tokens[1].token {
+                            Token::StringLit(n) => Ok(n.clone()),
+                            _ => Err(err(line.line_no, "expected achievement name")),
+                        })?;
+                    let desc = match line.tokens.get(2).map(|t| &t.token) {
+                        Some(Token::StringLit(d)) => Some(d.clone()),
+                        Some(Token::Ident(d)) => Some(d.clone()),
+                        _ => None,
+                    };
+                    script
+                        .achievements
+                        .push(crate::ast::AchievementDef { name, desc });
+                    idx += 1;
+                }
                 _ => {
                     return Err(err(
                         line.line_no,
@@ -329,9 +346,7 @@ impl Parser {
                 // `voice` lexes as a keyword token; `image`/`kind` are idents.
                 let attr = match &t.token {
                     Token::Voice => Some("voice"),
-                    Token::Ident(s) if s == "image" || s == "kind" => {
-                        Some(s.as_str())
-                    }
+                    Token::Ident(s) if s == "image" || s == "kind" => Some(s.as_str()),
                     _ => None,
                 };
                 if let Some(attr) = attr {
@@ -408,17 +423,16 @@ impl Parser {
                     i += 1;
                     continue;
                 }
-                params.push(expect_ident(&first.tokens[i], first.line_no, "parameter name")?);
+                params.push(expect_ident(
+                    &first.tokens[i],
+                    first.line_no,
+                    "parameter name",
+                )?);
                 i += 1;
             }
             colon_idx = i + 1; // skip RParen
         }
-        expect_token(
-            &first.tokens[colon_idx],
-            Token::Colon,
-            first.line_no,
-            ":",
-        )?;
+        expect_token(&first.tokens[colon_idx], Token::Colon, first.line_no, ":")?;
         let base_indent = first.indent;
         let mut consumed = 1;
         let mut body = Vec::new();
@@ -435,14 +449,7 @@ impl Parser {
             body.push(stmt);
             consumed += extra;
         }
-        Ok((
-            Label {
-                name,
-                params,
-                body,
-            },
-            consumed,
-        ))
+        Ok((Label { name, params, body }, consumed))
     }
 
     /// Parse a single statement starting at `lines[0]`, which has indent
@@ -466,8 +473,7 @@ impl Parser {
             }
             Token::Call => {
                 // `call screen <expr> [set <var>]` — blocking screen.
-                if matches!(toks.get(1).map(|t| &t.token), Some(Token::Ident(s)) if s == "screen")
-                {
+                if matches!(toks.get(1).map(|t| &t.token), Some(Token::Ident(s)) if s == "screen") {
                     let (screen, used) = parse_expr_with_len(&toks[2..], line_no)?;
                     let mut i = 2 + used;
                     let mut set_var = None;
@@ -511,7 +517,12 @@ impl Parser {
             Token::Pause => {
                 if toks.len() > 1 {
                     let expr = self.parse_expr_tokens(&toks[1..], line_no)?;
-                    Ok((Stmt::Pause { seconds: Some(expr) }, 1))
+                    Ok((
+                        Stmt::Pause {
+                            seconds: Some(expr),
+                        },
+                        1,
+                    ))
                 } else {
                     Ok((Stmt::Pause { seconds: None }, 1))
                 }
@@ -535,25 +546,31 @@ impl Parser {
                 ))
             }
             Token::Dollar => {
-                // $ name = expr  OR  $ name += expr  etc.
-                let name = expect_ident(&toks[1], line_no, "variable name")?;
-                if let Some(op) = compound_assign_op(&toks[2].token) {
-                    let value = self.parse_expr_tokens(&toks[3..], line_no)?;
-                    return Ok((Stmt::AssignOp { name, op, value }, 1));
+                // $ target = expr  OR  $ target += expr  etc.
+                let (target, i) = self.parse_assign_target(toks, 1, line_no)?;
+                if let Some(op) = toks.get(i).and_then(|t| compound_assign_op(&t.token)) {
+                    let value = self.parse_expr_tokens(&toks[i + 1..], line_no)?;
+                    return Ok((Stmt::AssignOp { target, op, value }, 1));
                 }
-                expect_token(&toks[2], Token::Assign, line_no, "=")?;
-                let value = self.parse_expr_tokens(&toks[3..], line_no)?;
-                Ok((Stmt::Assign { name, value }, 1))
+                if i >= toks.len() {
+                    return Err(err(line_no, "expected `=` after assignment target"));
+                }
+                expect_token(&toks[i], Token::Assign, line_no, "=")?;
+                let value = self.parse_expr_tokens(&toks[i + 1..], line_no)?;
+                Ok((Stmt::Assign { target, value }, 1))
             }
             Token::Set => {
-                let name = expect_ident(&toks[1], line_no, "variable name")?;
-                if let Some(op) = compound_assign_op(&toks[2].token) {
-                    let value = self.parse_expr_tokens(&toks[3..], line_no)?;
-                    return Ok((Stmt::AssignOp { name, op, value }, 1));
+                let (target, i) = self.parse_assign_target(toks, 1, line_no)?;
+                if let Some(op) = toks.get(i).and_then(|t| compound_assign_op(&t.token)) {
+                    let value = self.parse_expr_tokens(&toks[i + 1..], line_no)?;
+                    return Ok((Stmt::AssignOp { target, op, value }, 1));
                 }
-                expect_token(&toks[2], Token::Assign, line_no, "=")?;
-                let value = self.parse_expr_tokens(&toks[3..], line_no)?;
-                Ok((Stmt::Assign { name, value }, 1))
+                if i >= toks.len() {
+                    return Err(err(line_no, "expected `=` after assignment target"));
+                }
+                expect_token(&toks[i], Token::Assign, line_no, "=")?;
+                let value = self.parse_expr_tokens(&toks[i + 1..], line_no)?;
+                Ok((Stmt::Assign { target, value }, 1))
             }
             Token::Ident(s) if s == "plugin" => {
                 // `plugin <name> [<expr>, <expr>, ...]`
@@ -706,15 +723,17 @@ impl Parser {
                     1,
                 ))
             }
-            Token::Ident(s)
-                if s == "queue" && is_channel_stmt(toks) =>
-            {
+            Token::Ident(s) if s == "grant" => {
+                // `grant <name>` — name is a literal ident/string or
+                // `[expr]` for a computed id.
+                let (name, _) = self.parse_channel_name(toks, 1, line_no)?;
+                Ok((Stmt::Grant { name }, 1))
+            }
+            Token::Ident(s) if s == "queue" && is_channel_stmt(toks) => {
                 // `queue channel <name> <track> [volume=<e>] [fade=<e>] [loop]`
                 self.parse_channel_track_stmt(toks, line_no, true)
             }
-            Token::Ident(s)
-                if s == "volume" && is_channel_stmt(toks) =>
-            {
+            Token::Ident(s) if s == "volume" && is_channel_stmt(toks) => {
                 // `volume channel <name> <e> [fade=<e>]`
                 let (channel, mut i) = self.parse_channel_name(toks, 2, line_no)?;
                 let (volume, used) = parse_expr_with_len(&toks[i..], line_no)?;
@@ -734,9 +753,7 @@ impl Parser {
                     1,
                 ))
             }
-            Token::Ident(s)
-                if s == "filter" && is_channel_stmt(toks) =>
-            {
+            Token::Ident(s) if s == "filter" && is_channel_stmt(toks) => {
                 // `filter channel <name> <kind> [k=<e> ...]`
                 let (channel, i) = self.parse_channel_name(toks, 2, line_no)?;
                 let kind = match toks.get(i).map(|t| &t.token) {
@@ -1109,7 +1126,13 @@ impl Parser {
                 });
             }
         }
-        Ok((Stmt::Hide { character, transition }, 1))
+        Ok((
+            Stmt::Hide {
+                character,
+                transition,
+            },
+            1,
+        ))
     }
 
     fn parse_transition(
@@ -1244,10 +1267,7 @@ impl Parser {
                     // Skip transition name and optional numeric duration.
                     i += 2;
                     if i < colon_idx
-                        && matches!(
-                            toks[i].token,
-                            Token::FloatLit(_) | Token::IntLit(_)
-                        )
+                        && matches!(toks[i].token, Token::FloatLit(_) | Token::IntLit(_))
                     {
                         i += 1;
                     }
@@ -1848,16 +1868,7 @@ impl Parser {
             Token::Ident(kw) => match kw.as_str() {
                 "box" => {
                     let (x, y, w, h, color) = self.screen_rect_attrs(toks, 1, line_no)?;
-                    Ok((
-                        ScreenStmt::Box {
-                            x,
-                            y,
-                            w,
-                            h,
-                            color,
-                        },
-                        1,
-                    ))
+                    Ok((ScreenStmt::Box { x, y, w, h, color }, 1))
                 }
                 "text" => {
                     let (text, used) = parse_expr_with_len(&toks[1..], line_no)?;
@@ -1871,9 +1882,7 @@ impl Parser {
                             "y" => y = Some(self.parse_expr_tokens(&vt, line_no)?),
                             "size" => size = Some(self.parse_expr_tokens(&vt, line_no)?),
                             "color" => color = Some(self.parse_expr_tokens(&vt, line_no)?),
-                            _ => {
-                                return Err(err(line_no, format!("unknown text property `{k}`")))
-                            }
+                            _ => return Err(err(line_no, format!("unknown text property `{k}`"))),
                         }
                     }
                     let (Some(x), Some(y)) = (x, y) else {
@@ -1904,9 +1913,7 @@ impl Parser {
                             "w" => w = Some(self.parse_expr_tokens(&vt, line_no)?),
                             "h" => h = Some(self.parse_expr_tokens(&vt, line_no)?),
                             "alpha" => alpha = Some(self.parse_expr_tokens(&vt, line_no)?),
-                            _ => {
-                                return Err(err(line_no, format!("unknown image property `{k}`")))
-                            }
+                            _ => return Err(err(line_no, format!("unknown image property `{k}`"))),
                         }
                     }
                     let (Some(x), Some(y)) = (x, y) else {
@@ -1947,10 +1954,7 @@ impl Parser {
                             "h" => h = Some(self.parse_expr_tokens(&vt, line_no)?),
                             "color" => color = Some(self.parse_expr_tokens(&vt, line_no)?),
                             _ => {
-                                return Err(err(
-                                    line_no,
-                                    format!("unknown button property `{k}`"),
-                                ))
+                                return Err(err(line_no, format!("unknown button property `{k}`")))
                             }
                         }
                     }
@@ -1961,8 +1965,7 @@ impl Parser {
                         return Err(err(line_no, "button requires `:` + action block"));
                     }
                     let mut consumed = 1;
-                    let actions =
-                        self.parse_button_actions(lines, line.indent, &mut consumed)?;
+                    let actions = self.parse_button_actions(lines, line.indent, &mut consumed)?;
                     Ok((
                         ScreenStmt::Button {
                             label,
@@ -2030,15 +2033,16 @@ impl Parser {
             let toks = &line.tokens;
             let line_no = line.line_no;
             let action = match &toks[0].token {
-                Token::Jump => {
-                    ButtonAction::Jump(self.parse_expr_tokens(&toks[1..], line_no)?)
-                }
+                Token::Jump => ButtonAction::Jump(self.parse_expr_tokens(&toks[1..], line_no)?),
                 Token::Set => {
-                    let name = expect_ident(&toks[1], line_no, "variable name")?;
-                    expect_token(&toks[2], Token::Assign, line_no, "=")?;
+                    let (target, i) = self.parse_assign_target(toks, 1, line_no)?;
+                    if i >= toks.len() {
+                        return Err(err(line_no, "expected `=` after assignment target"));
+                    }
+                    expect_token(&toks[i], Token::Assign, line_no, "=")?;
                     ButtonAction::Set {
-                        name,
-                        value: self.parse_expr_tokens(&toks[3..], line_no)?,
+                        target,
+                        value: self.parse_expr_tokens(&toks[i + 1..], line_no)?,
                     }
                 }
                 Token::Return => ButtonAction::Return(if toks.len() > 1 {
@@ -2060,12 +2064,7 @@ impl Parser {
                     }
                     ButtonAction::HideScreen(self.parse_expr_tokens(&toks[2..], line_no)?)
                 }
-                t => {
-                    return Err(err(
-                        line_no,
-                        format!("unsupported button action {t:?}"),
-                    ))
-                }
+                t => return Err(err(line_no, format!("unsupported button action {t:?}"))),
             };
             out.push(action);
             *consumed += 1;
@@ -2351,6 +2350,42 @@ impl Parser {
         }
     }
 
+    /// Assignment target: `name` optionally followed by `.attr` /
+    /// `[expr]` index chains — produces a `Var`/`Attr`/`Index` expr
+    /// usable as an lvalue. Returns (expr, next index).
+    fn parse_assign_target(
+        &self,
+        toks: &[Spanned],
+        start: usize,
+        line_no: usize,
+    ) -> Result<(Expr, usize), ParseError> {
+        let name = expect_ident(&toks[start], line_no, "assignment target")?;
+        let mut target = Expr::Var(name);
+        let mut i = start + 1;
+        loop {
+            match toks.get(i).map(|t| &t.token) {
+                Some(Token::Dot) => {
+                    let n = expect_ident(&toks[i + 1], line_no, "attribute name")?;
+                    target = Expr::Attr {
+                        object: Box::new(target),
+                        name: n,
+                    };
+                    i += 2;
+                }
+                Some(Token::LBracket) => {
+                    let (e, used) = self.parse_bracket_expr(&toks[i..], line_no)?;
+                    target = Expr::Index {
+                        collection: Box::new(target),
+                        index: Box::new(e),
+                    };
+                    i += used;
+                }
+                _ => break,
+            }
+        }
+        Ok((target, i))
+    }
+
     /// Channel name operand: bare ident or string literal stays literal
     /// (like label names); `[expr]` is dynamic. Returns (expr, next index).
     fn parse_channel_name(
@@ -2385,8 +2420,7 @@ impl Parser {
         // `loop` is a bare trailing flag — strip it before kv_pairs.
         let mut end = toks.len();
         let mut loop_ = false;
-        if matches!(toks.last().map(|t| &t.token), Some(Token::Ident(l)) if l == "loop")
-            && end > i
+        if matches!(toks.last().map(|t| &t.token), Some(Token::Ident(l)) if l == "loop") && end > i
         {
             loop_ = true;
             end -= 1;
@@ -2794,9 +2828,7 @@ impl<'a> ExprParser<'a> {
                         let key = match self.next().map(|t| &t.token) {
                             Some(Token::StringLit(s)) => s.clone(),
                             Some(Token::Ident(s)) => s.clone(),
-                            _ => {
-                                return Err(err(line_no, "expected dict key (ident or string)"))
-                            }
+                            _ => return Err(err(line_no, "expected dict key (ident or string)")),
                         };
                         expect_token(
                             self.next().ok_or_else(|| err(line_no, "expected `:`"))?,
@@ -2844,16 +2876,13 @@ impl<'a> ExprParser<'a> {
                     // Slice form: `expr[:]` / `expr[a:]` / `expr[:b]` / `expr[a:b]`
                     if matches!(self.peek().map(|t| &t.token), Some(Token::Colon)) {
                         self.next(); // consume :
-                        let end = if matches!(
-                            self.peek().map(|t| &t.token),
-                            Some(Token::RBracket)
-                        ) {
+                        let end = if matches!(self.peek().map(|t| &t.token), Some(Token::RBracket))
+                        {
                             None
                         } else {
                             Some(Box::new(self.parse_expr()?))
                         };
-                        let close =
-                            self.next().ok_or_else(|| err(line_no, "expected `]`"))?;
+                        let close = self.next().ok_or_else(|| err(line_no, "expected `]`"))?;
                         expect_token(close, Token::RBracket, line_no, "]")?;
                         expr = Expr::Slice {
                             collection: Box::new(expr),
@@ -2866,16 +2895,13 @@ impl<'a> ExprParser<'a> {
                     if matches!(self.peek().map(|t| &t.token), Some(Token::Colon)) {
                         // `expr[a:b]` or `expr[a:]`
                         self.next(); // consume :
-                        let end = if matches!(
-                            self.peek().map(|t| &t.token),
-                            Some(Token::RBracket)
-                        ) {
+                        let end = if matches!(self.peek().map(|t| &t.token), Some(Token::RBracket))
+                        {
                             None
                         } else {
                             Some(Box::new(self.parse_expr()?))
                         };
-                        let close =
-                            self.next().ok_or_else(|| err(line_no, "expected `]`"))?;
+                        let close = self.next().ok_or_else(|| err(line_no, "expected `]`"))?;
                         expect_token(close, Token::RBracket, line_no, "]")?;
                         expr = Expr::Slice {
                             collection: Box::new(expr),
@@ -2883,8 +2909,7 @@ impl<'a> ExprParser<'a> {
                             end,
                         };
                     } else {
-                        let close =
-                            self.next().ok_or_else(|| err(line_no, "expected `]`"))?;
+                        let close = self.next().ok_or_else(|| err(line_no, "expected `]`"))?;
                         expect_token(close, Token::RBracket, line_no, "]")?;
                         expr = Expr::Index {
                             collection: Box::new(expr),

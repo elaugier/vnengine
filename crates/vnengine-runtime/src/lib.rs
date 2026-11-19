@@ -9,8 +9,9 @@
 use vnengine_core::command::Command;
 use vnengine_core::model::{CameraAnim, Scene};
 use vnengine_core::save::GalleryState;
-use vnengine_core::screen::ScreenInst;
 pub use vnengine_core::save::{ChannelState, ChannelTrack, JournalEntry, MusicLayerState};
+use vnengine_core::screen::ScreenInst;
+use vnengine_core::Value;
 use vnengine_script::vm::{MenuResponse, StepResult, Vm, VmState};
 
 /// Maximum number of rollback snapshots kept.
@@ -134,6 +135,15 @@ pub struct Runtime {
     /// this against its audio engine and calls `channel_advance` when a
     /// channel's current track finishes.
     pub channels: std::collections::BTreeMap<String, ChannelState>,
+    /// Achievements granted via `grant`, kept OUTSIDE snapshots/saves —
+    /// persisted in the host's persistent store (Ren'Py `persistent`
+    /// semantics). Mirrored into `vm.state.variables["achievements"]`
+    /// as a `List` so scripts can test `"x" in achievements`.
+    pub achievements: std::collections::BTreeSet<String>,
+    /// Last-flushed copy of the `persistent` variable. The live value
+    /// scripts mutate is `vm.state.variables["persistent"]`; the host
+    /// diffs via `persistent_dirty`/`mark_persistent_clean`.
+    persistent: Value,
     rollback_stack: Vec<RollbackSnapshot>,
     rollforward_stack: Vec<RollbackSnapshot>,
     /// True while re-executing a restored snapshot. Suppresses clearing
@@ -144,7 +154,7 @@ pub struct Runtime {
 impl Runtime {
     /// Create a runtime at the start of the script.
     pub fn new(script: vnengine_script::ast::Script) -> Self {
-        Self {
+        let mut rt = Self {
             vm: Vm::new(script),
             scene: Scene {
                 bg_opacity: 1.0,
@@ -163,10 +173,14 @@ impl Runtime {
             nvl_start: 0,
             window_mode: "auto".to_string(),
             channels: std::collections::BTreeMap::new(),
+            achievements: std::collections::BTreeSet::new(),
+            persistent: Value::Dict(Default::default()),
             rollback_stack: Vec::new(),
             rollforward_stack: Vec::new(),
             replaying: false,
-        }
+        };
+        rt.sync_persistent_vars();
+        rt
     }
 
     /// Rebuild a runtime from a saved snapshot.
@@ -183,6 +197,78 @@ impl Runtime {
         rt.window_mode = snap.window_mode;
         rt.channels = snap.channels;
         rt
+    }
+
+    // ---- persistent store + achievements -----------------------------
+
+    /// Install the host's persistent data: the `persistent` variable
+    /// (a `Dict` scripts mutate through `$ persistent.x = ...`) and the
+    /// granted-achievement set. Both are mirrored into VM variables so
+    /// scripts use ordinary dict/list access; rollback never reverts
+    /// them (they are re-injected after every snapshot restore).
+    pub fn set_persistent(
+        &mut self,
+        vars: std::collections::BTreeMap<String, Value>,
+        achievements: std::collections::BTreeSet<String>,
+    ) {
+        self.persistent = Value::Dict(vars);
+        self.achievements = achievements;
+        self.sync_persistent_vars();
+    }
+
+    /// Inject `persistent` + `achievements` into the live VM variables.
+    /// Called after snapshot restores (which carry the stale saved copy)
+    /// and by `set_persistent`.
+    fn sync_persistent_vars(&mut self) {
+        self.vm
+            .state
+            .variables
+            .insert("persistent".into(), self.persistent.clone());
+        let achieved: Vec<Value> = self
+            .achievements
+            .iter()
+            .map(|a| Value::Str(a.clone()))
+            .collect();
+        self.vm
+            .state
+            .variables
+            .insert("achievements".into(), Value::List(achieved));
+    }
+
+    /// The live `persistent` dict as scripts currently see it.
+    pub fn persistent(&self) -> &Value {
+        self.vm
+            .state
+            .variables
+            .get("persistent")
+            .unwrap_or(&self.persistent)
+    }
+
+    /// Whether the live `persistent` var differs from the last-flushed
+    /// copy (host uses this to decide when to write the store file).
+    pub fn persistent_dirty(&self) -> bool {
+        self.persistent() != &self.persistent
+    }
+
+    /// Mark the live store as flushed to disk.
+    pub fn mark_persistent_clean(&mut self) {
+        self.persistent = self.persistent().clone();
+    }
+
+    /// Record a `grant` achievement; returns `true` on first grant
+    /// (host shows a toast). The achievement set is mirrored into
+    /// `variables["achievements"]` for `in`/`has` checks.
+    pub fn grant_achievement(&mut self, name: &str) -> bool {
+        let first = self.achievements.insert(name.to_string());
+        if first {
+            self.sync_persistent_vars();
+        }
+        first
+    }
+
+    /// Whether an achievement has been granted.
+    pub fn achieved(&self, name: &str) -> bool {
+        self.achievements.contains(name)
     }
 
     /// Capture the current runtime state for saving.
@@ -292,10 +378,7 @@ impl Runtime {
     }
 
     /// Apply a `show screen`/`hide screen` action to `self.screens`.
-    fn apply_screen_action(
-        &mut self,
-        action: &vnengine_core::screen::ScreenAction,
-    ) {
+    fn apply_screen_action(&mut self, action: &vnengine_core::screen::ScreenAction) {
         use vnengine_core::screen::ScreenAction;
         match action {
             ScreenAction::ShowScreen(name) => {
@@ -326,11 +409,7 @@ impl Runtime {
     /// VM evaluates the node's raw actions at click time
     /// (`set`/`jump`/`return`/`show screen`/`hide screen`). Returns
     /// true if a `jump` fired and the host should resume stepping.
-    pub fn screen_action(
-        &mut self,
-        screen_idx: usize,
-        node_idx: usize,
-    ) -> bool {
+    pub fn screen_action(&mut self, screen_idx: usize, node_idx: usize) -> bool {
         let Some(name) = self.screens.get(screen_idx).map(|s| s.name.clone()) else {
             return false;
         };
@@ -513,7 +592,24 @@ impl Runtime {
     /// Restore a snapshot and re-execute its blocking statement so the
     /// same line/menu is displayed again.
     fn restore_snapshot(&mut self, snap: RollbackSnapshot) -> RuntimeEvent {
+        // The live persistent vars survive restores — snapshots hold
+        // the stale save-time copies.
+        let persistent = self.persistent().clone();
+        let achievements = Value::List(
+            self.achievements
+                .iter()
+                .map(|a| Value::Str(a.clone()))
+                .collect(),
+        );
         self.vm.state = snap.vm_state;
+        self.vm
+            .state
+            .variables
+            .insert("persistent".into(), persistent);
+        self.vm
+            .state
+            .variables
+            .insert("achievements".into(), achievements);
         self.scene = snap.scene;
         self.history.truncate(snap.history_len);
         self.music = snap.music;
@@ -791,7 +887,9 @@ impl Runtime {
                         return RuntimeEvent::Effect(cmd);
                     }
                     Command::VolumeChannel {
-                        ref channel, volume, ..
+                        ref channel,
+                        volume,
+                        ..
                     } => {
                         self.channels.entry(channel.clone()).or_default().volume = volume;
                         return RuntimeEvent::Effect(cmd);
@@ -808,6 +906,10 @@ impl Runtime {
                         self.channels.clear();
                         self.music = None;
                         self.music_layers.clear();
+                        return RuntimeEvent::Effect(cmd);
+                    }
+                    Command::Grant { ref name } => {
+                        self.grant_achievement(name);
                         return RuntimeEvent::Effect(cmd);
                     }
                     Command::LightSet(light) => {

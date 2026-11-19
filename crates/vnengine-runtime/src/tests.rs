@@ -849,8 +849,9 @@ label start:
     let mid = rt.scene.sprites[0].position.unwrap().0;
     rt.update(0.5);
     // Restore mid-animation: position and track resume identically.
-    let mut rt2 = Runtime::restore(Parser::parse(
-        r##"
+    let mut rt2 = Runtime::restore(
+        Parser::parse(
+            r##"
 transform slidein:
     linear 2.0 xpos 0.9
 
@@ -859,8 +860,10 @@ label start:
     "shown"
     end
 "##,
-    )
-    .unwrap(), snap);
+        )
+        .unwrap(),
+        snap,
+    );
     assert_eq!(rt2.scene.sprites[0].position.unwrap().0, mid);
     assert_eq!(rt2.scene.sprites[0].anims.len(), 1);
     rt2.update(1.5);
@@ -1152,14 +1155,26 @@ label start:
     assert_eq!(st.queue.len(), 2);
 
     // Host reports end of a non-looping track — queue advances.
-    rt.channels.get_mut("amb").unwrap().current.as_mut().unwrap().loop_ = false;
+    rt.channels
+        .get_mut("amb")
+        .unwrap()
+        .current
+        .as_mut()
+        .unwrap()
+        .loop_ = false;
     let next = rt.channel_advance("amb").unwrap();
     assert_eq!(next.track, "rain.ogg");
-    assert_eq!(rt.channels["amb"].current.as_ref().unwrap().track, "rain.ogg");
+    assert_eq!(
+        rt.channels["amb"].current.as_ref().unwrap().track,
+        "rain.ogg"
+    );
     assert_eq!(rt.channels["amb"].queue.len(), 1);
 
     rt.channel_advance("amb");
-    assert_eq!(rt.channels["amb"].current.as_ref().unwrap().track, "storm.ogg");
+    assert_eq!(
+        rt.channels["amb"].current.as_ref().unwrap().track,
+        "storm.ogg"
+    );
     // Last track finished, queue empty → channel state released.
     assert!(rt.channel_advance("amb").is_none());
     assert!(!rt.channels.contains_key("amb"));
@@ -1181,7 +1196,10 @@ label start:
     assert_eq!(blocking_text(&next_block(&mut rt)), "hold");
     let st = &rt.channels["amb"];
     assert!((st.volume - 0.7).abs() < 1e-6);
-    assert!(matches!(st.filter, Some(vnengine_core::command::ChannelFilter::Filter { .. })));
+    assert!(matches!(
+        st.filter,
+        Some(vnengine_core::command::ChannelFilter::Filter { .. })
+    ));
     assert!(!rt.channels.contains_key("aux"));
 
     let mut rt = runtime(
@@ -1238,4 +1256,107 @@ label start:
     assert_eq!(blocking_text(&ev), "first");
     // Channel was added after `first` — rollback drops it.
     assert!(!rt.channels.contains_key("amb"));
+}
+
+// ---------- Phase 5: persistent & achievements ----------
+
+use std::collections::{BTreeMap, BTreeSet};
+use vnengine_core::value::Value;
+
+fn drive_to_end(rt: &mut Runtime) {
+    loop {
+        match rt.step() {
+            RuntimeEvent::Finished => return,
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn persistent_injected_and_dirty_tracking() {
+    let mut rt = runtime(
+        r##"
+label start:
+    $ persistent.seen_end = True
+    $ persistent.count = persistent.get("count", 0) + 1
+    end
+"##,
+    );
+    assert!(!rt.persistent_dirty());
+    assert!(matches!(rt.persistent(), Value::Dict(_)));
+    drive_to_end(&mut rt);
+    assert!(rt.persistent_dirty());
+    match rt.persistent() {
+        Value::Dict(m) => {
+            assert_eq!(m.get("seen_end"), Some(&Value::Bool(true)));
+            assert_eq!(m.get("count"), Some(&Value::Int(1)));
+        }
+        other => panic!("expected dict, got {other:?}"),
+    }
+    // Flushing resets the dirty flag.
+    rt.mark_persistent_clean();
+    assert!(!rt.persistent_dirty());
+    // Reloading the store into a fresh runtime carries the values.
+    let mut rt2 = runtime(
+        "label start:
+    end
+",
+    );
+    let vars = match rt.persistent() {
+        Value::Dict(m) => m.clone(),
+        _ => unreachable!(),
+    };
+    rt2.set_persistent(vars, BTreeSet::new());
+    match rt2.vm.state.variables.get("persistent") {
+        Some(Value::Dict(m)) => assert_eq!(m.get("count"), Some(&Value::Int(1))),
+        other => panic!("persistent not injected, got {other:?}"),
+    }
+}
+
+#[test]
+fn persistent_survives_rollback() {
+    let mut rt = runtime(
+        r##"
+label start:
+    $ persistent.score = 99
+    "line"
+    end
+"##,
+    );
+    next_block(&mut rt); // reach the "line"
+    rt.rollback(); // step back past the say
+    match rt.persistent() {
+        Value::Dict(m) => assert_eq!(m.get("score"), Some(&Value::Int(99))),
+        other => panic!("expected dict, got {other:?}"),
+    }
+    assert!(rt.persistent_dirty());
+}
+
+#[test]
+fn grant_adds_achievement() {
+    let mut rt = runtime(
+        r##"
+achievement win "You won"
+
+label start:
+    grant win
+    end
+"##,
+    );
+    drive_to_end(&mut rt);
+    assert!(rt.achieved("win"));
+    assert!(!rt.achieved("nope"));
+    // The achievement set travels with the store.
+    let mut rt2 = runtime(
+        "label start:
+    end
+",
+    );
+    rt2.set_persistent(BTreeMap::new(), rt.achievements.clone());
+    assert!(rt2.achieved("win"));
+    assert!(rt2.vm.state.variables.contains_key("achievements"));
+    match rt2.vm.state.variables.get("achievements") {
+        Some(Value::List(l)) => assert!(l.contains(&Value::Str("win".into()))),
+        other => panic!("achievements var missing, got {other:?}"),
+    }
 }

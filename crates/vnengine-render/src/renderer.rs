@@ -419,12 +419,8 @@ impl Renderer {
             ] {
                 if let Some(lb) = scene.layer_bgs.get(&(layer as u8)) {
                     if let Some(img) = self.textures.get(&lb.image) {
-                        let mut quad = full_screen_quad(
-                            img.width,
-                            img.height,
-                            screen_aspect,
-                            lb.opacity,
-                        );
+                        let mut quad =
+                            full_screen_quad(img.width, img.height, screen_aspect, lb.opacity);
                         quad.hw *= lb.zoom;
                         quad.hh *= lb.zoom;
                         apply_camera(
@@ -505,11 +501,7 @@ impl Renderer {
                                         vnengine_core::transition::SlideDirection::Up => [0.0, -d],
                                         vnengine_core::transition::SlideDirection::Down => [0.0, d],
                                     };
-                                    (
-                                        s.opacity,
-                                        [s.offset[0] + off[0], s.offset[1] + off[1]],
-                                        1.0,
-                                    )
+                                    (s.opacity, [s.offset[0] + off[0], s.offset[1] + off[1]], 1.0)
                                 }
                                 vnengine_core::transition::Transition::Zoom { .. } => {
                                     (s.opacity * p, s.offset, 0.5 + 0.5 * p)
@@ -579,11 +571,7 @@ impl Renderer {
                             vnengine_core::transition::SlideDirection::Up => [0.0, -p],
                             vnengine_core::transition::SlideDirection::Down => [0.0, p],
                         };
-                        (
-                            s.opacity,
-                            [s.offset[0] + dir[0], s.offset[1] + dir[1]],
-                            1.0,
-                        )
+                        (s.opacity, [s.offset[0] + dir[0], s.offset[1] + dir[1]], 1.0)
                     }
                     vnengine_core::transition::Transition::Zoom { .. } => {
                         (s.opacity * (1.0 - p), s.offset, 0.5 + 0.5 * (1.0 - p))
@@ -884,7 +872,8 @@ var<immediate> fx: FxParams;
         cm.a *= m;
     }
 "#;
-    src.replace("// @@FX_DECL", decl).replace("// @@FX_BODY", body)
+    src.replace("// @@FX_DECL", decl)
+        .replace("// @@FX_BODY", body)
 }
 
 fn create_textured_pipeline(

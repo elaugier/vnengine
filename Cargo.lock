@@ -3982,7 +3982,6 @@ dependencies = [
 name = "vnengine-core"
 version = "0.1.0"
 dependencies = [
- "ahash",
  "anyhow",
  "glam",
  "log",
@@ -4052,7 +4051,6 @@ dependencies = [
 name = "vnengine-script"
 version = "0.1.0"
 dependencies = [
- "ahash",
  "log",
  "serde",
  "serde_json",

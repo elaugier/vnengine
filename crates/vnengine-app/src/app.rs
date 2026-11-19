@@ -9,10 +9,11 @@ use std::time::Instant;
 use vnengine_audio::AudioEngine;
 use vnengine_core::assets::{AssetSource, DirAssets, IMAGE_EXTS};
 use vnengine_core::command::Command;
-use vnengine_core::save::{GalleryState, SaveState};
+use vnengine_core::save::{GalleryState, PersistentStore, SaveState};
 use vnengine_core::settings::UserSettings;
 use vnengine_core::transition::{SlideDirection, Transition};
 use vnengine_core::EngineConfig;
+use vnengine_core::Value;
 use vnengine_render::renderer::{UiBox, UiDraw, UiText};
 use vnengine_render::Renderer;
 use vnengine_runtime::{Runtime, RuntimeEvent, RuntimeSnapshot};
@@ -157,6 +158,8 @@ pub struct App {
     auto_save_timer: f32,
     /// Screen shake state: (remaining_time, intensity).
     shake: Option<(f32, f32)>,
+    /// Achievement toast: (text, remaining seconds).
+    ach_toast: Option<(String, f32)>,
     /// Logical window size.
     window_size: (u32, u32),
 }
@@ -299,6 +302,11 @@ impl App {
         let gallery_path = save_root.join(&config.save_dir).join("gallery.json");
         runtime.gallery = GalleryState::load(&gallery_path);
 
+        // Cross-save persistent store (`persistent.*` vars + achievements).
+        let persistent =
+            PersistentStore::load(&save_root.join(&config.save_dir).join("persistent.json"));
+        runtime.set_persistent(persistent.vars, persistent.achievements);
+
         // Sandboxed WASM plugins declared under `plugins/`.
         let mut plugins = vnengine_plugins::PluginHost::new()?;
         vnengine_plugins::load_source(&mut plugins, &*assets, "plugins");
@@ -338,6 +346,7 @@ impl App {
             skip: false,
             auto_save_timer: 0.0,
             shake: None,
+            ach_toast: None,
             window_size: (window_size.width, window_size.height),
         };
 
@@ -493,6 +502,15 @@ impl App {
                     .play_voice(&*self.assets, &self.config.voice_dir, &track);
             }
             Command::StopVoice => self.audio.stop_voice(),
+            Command::Grant { ref name } => {
+                let title = self
+                    .script
+                    .find_achievement(name)
+                    .and_then(|a| a.desc.clone())
+                    .unwrap_or_else(|| name.clone());
+                self.ach_toast = Some((format!("Achievement unlocked: {title}"), 4.0));
+                self.flush_persistent();
+            }
             Command::StopAll { fade } => self.audio.stop_all(fade),
             // PlayChannel/QueueChannel/StopChannel/VolumeChannel/
             // FilterChannel are handled by `resync_channels`, which
@@ -760,6 +778,17 @@ impl App {
 
         // Voice ducking on the music category (voice_duck setting).
         self.audio.update();
+
+        // Flush the persistent store when scripts changed it.
+        if self.runtime.persistent_dirty() {
+            self.flush_persistent();
+        }
+        if let Some((_, t)) = &mut self.ach_toast {
+            *t -= dt;
+            if *t <= 0.0 {
+                self.ach_toast = None;
+            }
+        }
         self.poll_hot_reload(dt);
 
         // Auto-save every 60 seconds.
@@ -837,8 +866,7 @@ impl App {
                         SlideDirection::Down => (0.0, 1.0),
                     };
                     self.runtime.scene.prev_bg_offset = [dx * progress, dy * progress];
-                    self.runtime.scene.bg_offset =
-                        [dx * (progress - 1.0), dy * (progress - 1.0)];
+                    self.runtime.scene.bg_offset = [dx * (progress - 1.0), dy * (progress - 1.0)];
                     for s in &mut self.runtime.scene.sprites {
                         s.offset = [dx * (progress - 1.0), dy * (progress - 1.0)];
                     }
@@ -1578,8 +1606,7 @@ impl App {
                         node.rect[2] * w,
                         node.rect[3] * h,
                     );
-                    if click.x >= x && click.x < x + bw && click.y >= y && click.y < y + bh
-                    {
+                    if click.x >= x && click.x < x + bw && click.y >= y && click.y < y + bh {
                         if is_pending {
                             self.runtime.resume_screen(ci);
                             if !self.runtime.is_on_screen() {
@@ -1640,11 +1667,7 @@ impl App {
                                 left: x,
                                 top: y,
                                 font_size: node.font_size,
-                                color: [
-                                    node.color[0],
-                                    node.color[1],
-                                    node.color[2],
-                                ],
+                                color: [node.color[0], node.color[1], node.color[2]],
                                 bounds: None,
                                 rich: node.rich,
                             });
@@ -1692,7 +1715,8 @@ impl App {
                         color: [0.0, 0.0, 0.0, 0.55],
                     });
                     let mut top = h * 0.08;
-                    for entry in &self.runtime.history[self.runtime.nvl_start.min(self.runtime.history.len())..]
+                    for entry in &self.runtime.history
+                        [self.runtime.nvl_start.min(self.runtime.history.len())..]
                     {
                         let mut line = String::new();
                         if let Some(sp) = &entry.speaker {
@@ -1749,65 +1773,65 @@ impl App {
                             rich: true,
                         });
                     } else {
-                    // Dialogue box background.
-                    let box_h = 0.25;
-                    let box_y = 1.0 - box_h - 0.02;
-                    ui.boxes.push(UiBox {
-                        x: 0.02,
-                        y: box_y,
-                        w: 0.96,
-                        h: box_h,
-                        color: [0.0, 0.0, 0.0, 0.7],
-                    });
-
-                    // Side image (character portrait next to dialogue box).
-                    if let Some(side) = &b.side_image {
-                        ui.images.push(vnengine_render::renderer::UiImage {
-                            path: side.clone(),
-                            left: w * 0.75,
-                            top: box_y * h - h * 0.15,
-                            size: Some((w * 0.2, h * 0.2)),
-                            opacity: 1.0,
-                        });
-                    }
-
-                    // Namebox (styled speaker name box).
-                    if let Some(speaker) = &b.speaker {
-                        let namebox_w = 0.2;
-                        let namebox_h = 0.04;
-                        let namebox_y = box_y - namebox_h + 0.005;
+                        // Dialogue box background.
+                        let box_h = 0.25;
+                        let box_y = 1.0 - box_h - 0.02;
                         ui.boxes.push(UiBox {
-                            x: 0.04,
-                            y: namebox_y,
-                            w: namebox_w,
-                            h: namebox_h,
-                            color: [0.15, 0.15, 0.3, 0.9],
+                            x: 0.02,
+                            y: box_y,
+                            w: 0.96,
+                            h: box_h,
+                            color: [0.0, 0.0, 0.0, 0.7],
                         });
+
+                        // Side image (character portrait next to dialogue box).
+                        if let Some(side) = &b.side_image {
+                            ui.images.push(vnengine_render::renderer::UiImage {
+                                path: side.clone(),
+                                left: w * 0.75,
+                                top: box_y * h - h * 0.15,
+                                size: Some((w * 0.2, h * 0.2)),
+                                opacity: 1.0,
+                            });
+                        }
+
+                        // Namebox (styled speaker name box).
+                        if let Some(speaker) = &b.speaker {
+                            let namebox_w = 0.2;
+                            let namebox_h = 0.04;
+                            let namebox_y = box_y - namebox_h + 0.005;
+                            ui.boxes.push(UiBox {
+                                x: 0.04,
+                                y: namebox_y,
+                                w: namebox_w,
+                                h: namebox_h,
+                                color: [0.15, 0.15, 0.3, 0.9],
+                            });
+                            ui.text.push(UiText {
+                                text: speaker.clone(),
+                                left: w * 0.06,
+                                top: namebox_y * h + 5.0,
+                                font_size: 22.0,
+                                color: [1.0, 1.0, 0.6],
+                                bounds: None,
+                                rich: true,
+                            });
+                        }
+
+                        // Dialogue text (typewriter with rich text support).
+                        let visible_segs =
+                            vnengine_render::richtext::take_visible_chars(&b.text, b.chars_shown);
+                        let visible_text: String =
+                            visible_segs.iter().map(|s| s.text.as_str()).collect();
                         ui.text.push(UiText {
-                            text: speaker.clone(),
+                            text: visible_text,
                             left: w * 0.06,
-                            top: namebox_y * h + 5.0,
-                            font_size: 22.0,
-                            color: [1.0, 1.0, 0.6],
+                            top: box_y * h + 50.0,
+                            font_size: 28.0,
+                            color: [1.0, 1.0, 1.0],
                             bounds: None,
                             rich: true,
                         });
-                    }
-
-                    // Dialogue text (typewriter with rich text support).
-                    let visible_segs =
-                        vnengine_render::richtext::take_visible_chars(&b.text, b.chars_shown);
-                    let visible_text: String =
-                        visible_segs.iter().map(|s| s.text.as_str()).collect();
-                    ui.text.push(UiText {
-                        text: visible_text,
-                        left: w * 0.06,
-                        top: box_y * h + 50.0,
-                        font_size: 28.0,
-                        color: [1.0, 1.0, 1.0],
-                        bounds: None,
-                        rich: true,
-                    });
                     }
                 }
 
@@ -2376,16 +2400,37 @@ impl App {
         // like save/load or settings.
         if matches!(
             self.screen,
-            Screen::Dialogue
-                | Screen::Menu { .. }
-                | Screen::Input { .. }
-                | Screen::Confirm { .. }
+            Screen::Dialogue | Screen::Menu { .. } | Screen::Input { .. } | Screen::Confirm { .. }
         ) {
             self.push_screen_nodes(&mut ui, w, h);
         }
 
         if self.debug_overlay {
             self.debug_panel(&mut ui);
+        }
+        // Achievement toast (top-center, ~4s).
+        if let Some((text, t)) = &self.ach_toast {
+            let fade = if *t > 3.5 {
+                (4.0 - *t) * 2.0
+            } else {
+                (*t / 0.5).min(1.0)
+            };
+            ui.boxes.push(UiBox {
+                x: 0.3,
+                y: 0.02,
+                w: 0.4,
+                h: 0.055,
+                color: [0.1, 0.1, 0.15, 0.85 * fade],
+            });
+            ui.text.push(UiText {
+                text: text.clone(),
+                left: w * 0.31,
+                top: h * 0.032,
+                font_size: h * 0.032,
+                color: [1.0 * fade, 0.9 * fade, 0.4 * fade],
+                bounds: None,
+                rich: false,
+            });
         }
         // Accessibility: global text scale (settings.text_scale).
         if (self.settings.text_scale - 1.0).abs() > f32::EPSILON {
@@ -2526,8 +2571,31 @@ impl App {
         Some(buf)
     }
 
+    /// Write `<save_dir>/persistent.json` with the live persistent vars
+    /// and granted achievements, then mark the runtime copy clean.
+    fn flush_persistent(&mut self) {
+        let vars = match self.runtime.persistent() {
+            Value::Dict(d) => d.clone(),
+            _ => Default::default(),
+        };
+        let store = PersistentStore {
+            vars,
+            achievements: self.runtime.achievements.clone(),
+        };
+        let path = self
+            .save_root
+            .join(&self.config.save_dir)
+            .join("persistent.json");
+        if let Err(e) = store.save(&path) {
+            log::warn!("failed to write persistent store: {e}");
+        }
+        self.runtime.mark_persistent_clean();
+    }
+
     /// Load the game from a slot.
     pub fn load(&mut self, slot: u32) -> anyhow::Result<()> {
+        // Preserve in-session persistent data before overwriting state.
+        self.flush_persistent();
         let save_dir = self.save_root.join(&self.config.save_dir);
         let state = SaveState::read(&save_dir, slot)?;
         let vm_state: vnengine_script::vm::VmState = serde_json::from_slice(&state.vm_state)?;
@@ -2546,6 +2614,16 @@ impl App {
                 channels: state.channels,
             },
         );
+        // persistent.* vars and achievements live outside save slots —
+        // re-inject the on-disk copy into the restored runtime.
+        let persistent = PersistentStore::load(
+            &self
+                .save_root
+                .join(&self.config.save_dir)
+                .join("persistent.json"),
+        );
+        self.runtime
+            .set_persistent(persistent.vars, persistent.achievements);
         self.blocking = None;
         self.transition = None;
         let pending = self.runtime.is_on_menu()
@@ -2633,6 +2711,7 @@ impl winit::application::ApplicationHandler for AppHandler {
                 }
             }
             winit::event::WindowEvent::CloseRequested => {
+                app.flush_persistent();
                 event_loop.exit();
             }
             winit::event::WindowEvent::RedrawRequested => {

@@ -950,5 +950,8 @@ fn transition_mask_classification() {
     assert_eq!(Transition::parse("irisout", None).unwrap().mask_kind(), 4);
     assert_eq!(Transition::parse("pixelate", None).unwrap().mask_kind(), 5);
     assert_eq!(Transition::parse("squares", None).unwrap().mask_kind(), 6);
-    assert_eq!(Transition::parse("blinds", None).unwrap().mask_param(), 10.0);
+    assert_eq!(
+        Transition::parse("blinds", None).unwrap().mask_param(),
+        10.0
+    );
 }

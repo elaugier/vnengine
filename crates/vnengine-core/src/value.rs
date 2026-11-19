@@ -31,6 +31,26 @@ impl Value {
         }
     }
 
+    /// Mutable access to a nested slot for assignment paths
+    /// (`d.k = v`, `d["k"] = v`, `list[i] = v`). `Str` keys index dicts
+    /// (auto-creating missing entries); `Int` keys index lists
+    /// (negative = from the end, must be in range).
+    pub fn path_mut<'a>(&'a mut self, key: &Value) -> Result<&'a mut Value, String> {
+        match (self, key) {
+            (Value::Dict(d), Value::Str(k)) => Ok(d.entry(k.clone()).or_insert(Value::None)),
+            (Value::List(l), Value::Int(i)) => {
+                let idx = if *i < 0 { l.len() as i64 + i } else { *i };
+                if idx < 0 || idx as usize >= l.len() {
+                    return Err(format!("list index {i} out of range"));
+                }
+                Ok(&mut l[idx as usize])
+            }
+            (Value::Dict(_), other) => Err(format!("dict key must be a string, got `{other}`")),
+            (Value::List(_), other) => Err(format!("list index must be an int, got `{other}`")),
+            (v, _) => Err(format!("cannot index-assign into `{v}`")),
+        }
+    }
+
     pub fn as_int(&self) -> Option<i64> {
         match self {
             Value::Int(i) => Some(*i),

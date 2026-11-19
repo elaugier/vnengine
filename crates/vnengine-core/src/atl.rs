@@ -124,10 +124,7 @@ impl SpriteTrack {
     pub fn finished(&self) -> bool {
         self.steps.is_empty()
             || (self.step_idx >= self.steps.len()
-                && self
-                    .repeats
-                    .map(|r| self.iteration >= r)
-                    .unwrap_or(false))
+                && self.repeats.map(|r| self.iteration >= r).unwrap_or(false))
     }
 
     /// Apply the final target values of every step (used by
@@ -161,8 +158,7 @@ impl SpriteTrack {
             }
             if !self.primed {
                 for (prop, _) in &step.targets {
-                    self.from
-                        .insert(*prop as u8, get_prop(sprite, *prop));
+                    self.from.insert(*prop as u8, get_prop(sprite, *prop));
                 }
                 self.primed = true;
             }

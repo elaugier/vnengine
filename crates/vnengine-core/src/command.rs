@@ -160,6 +160,9 @@ pub enum Command {
     },
     /// Stop every named channel plus music and voice (`stop all`).
     StopAll { fade: f32 },
+    /// Grant an achievement (`grant <name>`). Recorded in the
+    /// persistent store — the host shows a toast on first grant.
+    Grant { name: String },
     /// Play a one-shot sound effect.
     PlaySfx { track: String, volume: f32 },
     /// Play a voice line.

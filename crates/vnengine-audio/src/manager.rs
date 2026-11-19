@@ -9,7 +9,9 @@ use kira::effect::reverb::{ReverbBuilder, ReverbHandle};
 use kira::sound::static_sound::{StaticSoundData, StaticSoundSettings};
 use kira::sound::PlaybackState;
 use kira::track::{TrackBuilder, TrackHandle};
-use kira::{AudioManager as KiraManager, AudioManagerSettings, Decibels, DefaultBackend, Mix, Tween};
+use kira::{
+    AudioManager as KiraManager, AudioManagerSettings, Decibels, DefaultBackend, Mix, Tween,
+};
 use std::time::Duration;
 use vnengine_core::assets::{AssetSource, AUDIO_EXTS};
 use vnengine_core::command::ChannelFilter;
@@ -348,10 +350,8 @@ impl AudioEngine {
             };
             // Channel gain rides on the sub-track; per-sound volume is
             // baked into the sound settings.
-            ch.track.set_volume(
-                db_from_linear(sfx_vol * st.volume as f64),
-                Tween::default(),
-            );
+            ch.track
+                .set_volume(db_from_linear(sfx_vol * st.volume as f64), Tween::default());
             match &st.current {
                 Some(ct) if ch.playing_track != ct.track => {
                     if let Some(mut h) = ch.playing.take() {
@@ -370,11 +370,17 @@ impl AudioEngine {
                                 ch.playing_track = ct.track.clone();
                             }
                             Err(e) => {
-                                log::warn!("failed to play channel `{name}` track `{}`: {e}", ct.track)
+                                log::warn!(
+                                    "failed to play channel `{name}` track `{}`: {e}",
+                                    ct.track
+                                )
                             }
                         },
                         Err(e) => {
-                            log::warn!("failed to load channel `{name}` track `{dir}/{}`: {e}", ct.track)
+                            log::warn!(
+                                "failed to load channel `{name}` track `{dir}/{}`: {e}",
+                                ct.track
+                            )
                         }
                     }
                 }
@@ -440,8 +446,7 @@ fn apply_channel_filter(ch: &mut ChannelAudio, filter: Option<&ChannelFilter>) {
             });
             ch.filter.set_cutoff(*cutoff, Tween::default());
             ch.filter.set_resonance(*resonance, Tween::default());
-            ch.filter
-                .set_mix(Mix(*mix as f32), Tween::default());
+            ch.filter.set_mix(Mix(*mix as f32), Tween::default());
             ch.reverb.set_mix(Mix(0.0), Tween::default());
         }
         Some(ChannelFilter::Reverb {

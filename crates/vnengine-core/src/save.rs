@@ -187,6 +187,36 @@ impl SaveState {
     }
 }
 
+/// Cross-save persistent data (`persistent.*` script variables and
+/// granted achievements) stored in `<save_root>/persistent.json` —
+/// independent of save slots and never reverted by rollback.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PersistentStore {
+    /// Script-visible `persistent` dict (`$ persistent.x = ...`).
+    #[serde(default)]
+    pub vars: std::collections::BTreeMap<String, crate::value::Value>,
+    /// Achievement ids granted via `grant`.
+    #[serde(default)]
+    pub achievements: std::collections::BTreeSet<String>,
+}
+
+impl PersistentStore {
+    pub fn load(path: &Path) -> Self {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+}
+
 /// Metadata for the CG gallery: which CGs have been unlocked.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GalleryState {

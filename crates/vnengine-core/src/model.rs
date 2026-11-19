@@ -355,10 +355,9 @@ impl Scene {
     /// [`Scene::hide_sprite`].
     pub fn hide_sprites_on_layer(&mut self, layer: Layer, transition: Transition) {
         let duration = transition.default_duration();
-        let (on, off): (Vec<ActiveSprite>, Vec<ActiveSprite>) =
-            std::mem::take(&mut self.sprites)
-                .into_iter()
-                .partition(|s| s.layer == layer);
+        let (on, off): (Vec<ActiveSprite>, Vec<ActiveSprite>) = std::mem::take(&mut self.sprites)
+            .into_iter()
+            .partition(|s| s.layer == layer);
         self.sprites = off;
         for mut sprite in on {
             fire_hide_event(&mut sprite);

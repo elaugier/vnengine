@@ -617,10 +617,7 @@ impl Vm {
                         self.state.finished = true;
                         return StepResult::Finished;
                     };
-                    let body_len = frame
-                        .body_stmts(&self.script)
-                        .map(|s| s.len())
-                        .unwrap_or(0);
+                    let body_len = frame.body_stmts(&self.script).map(|s| s.len()).unwrap_or(0);
                     frame.stmt = body_len;
                     continue;
                 }
@@ -652,9 +649,7 @@ impl Vm {
             if let Some(MenuResponse::Selected(idx)) = response {
                 // `menu ... set <var>:` stores the chosen index.
                 if let Some(var) = menu.set_var {
-                    self.state
-                        .variables
-                        .insert(var, Value::Int(idx as i64));
+                    self.state.variables.insert(var, Value::Int(idx as i64));
                 }
                 if let Some(choice) = menu.choices.get(idx) {
                     // Push the choice body as an inline frame. The parent
@@ -846,9 +841,7 @@ impl Vm {
                     let items: Vec<Value> = match &iter_val {
                         Value::List(items) => items.clone(),
                         Value::Dict(map) => map.keys().cloned().map(Value::Str).collect(),
-                        Value::Str(s) => {
-                            s.chars().map(|c| Value::Str(c.to_string())).collect()
-                        }
+                        Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
                         _ => {
                             return Err(format!(
                                 "screen `for` iterable must be list/dict/str, got {iter_val}"
@@ -871,11 +864,76 @@ impl Vm {
         match e {
             // A bare identifier is a literal screen name unless it is a
             // defined variable — mirrors `jump` label semantics.
-            Expr::Var(name) if !self.state.variables.contains_key(name) => {
-                Ok(name.clone())
-            }
+            Expr::Var(name) if !self.state.variables.contains_key(name) => Ok(name.clone()),
             _ => self.eval_str(e),
         }
+    }
+
+    /// Resolve an assignment target to `(root_variable, path_keys)`.
+    /// Index expressions are evaluated left-to-right in the current
+    /// context before any variable borrow is taken.
+    fn resolve_assign_path(&mut self, target: &Expr) -> Result<(String, Vec<Value>), String> {
+        match target {
+            Expr::Var(n) => Ok((n.clone(), Vec::new())),
+            Expr::Attr { object, name } => {
+                let (root, mut path) = self.resolve_assign_path(object)?;
+                path.push(Value::Str(name.clone()));
+                Ok((root, path))
+            }
+            Expr::Index { collection, index } => {
+                let (root, mut path) = self.resolve_assign_path(collection)?;
+                let k = self.eval(index)?;
+                path.push(k);
+                Ok((root, path))
+            }
+            _ => Err("invalid assignment target (expected name, .attr or [index])".into()),
+        }
+    }
+
+    /// Assign `v` to a `Var`/`Attr`/`Index` target — dict entries are
+    /// created, list indices must exist.
+    fn assign_target(&mut self, target: &Expr, v: Value) -> Result<(), String> {
+        let (root, path) = self.resolve_assign_path(target)?;
+        if path.is_empty() {
+            self.state.variables.insert(root, v);
+            return Ok(());
+        }
+        let mut slot = self
+            .state
+            .variables
+            .get_mut(&root)
+            .ok_or_else(|| format!("undefined variable `{root}` in assignment"))?;
+        for k in &path {
+            slot = slot.path_mut(k)?;
+        }
+        *slot = v;
+        Ok(())
+    }
+
+    /// Read the current value of an assignment target (for `+=` etc.).
+    fn read_target(&mut self, target: &Expr) -> Result<&Value, String> {
+        let (root, path) = self.resolve_assign_path(target)?;
+        let mut slot = self
+            .state
+            .variables
+            .get(&root)
+            .ok_or_else(|| format!("undefined variable `{root}` for compound assignment"))?;
+        for k in &path {
+            slot = match (slot, k) {
+                (Value::Dict(d), Value::Str(key)) => d
+                    .get(key)
+                    .ok_or_else(|| format!("dict has no key `{key}`"))?,
+                (Value::List(l), Value::Int(i)) => {
+                    let idx = if *i < 0 { l.len() as i64 + i } else { *i };
+                    if idx < 0 || idx as usize >= l.len() {
+                        return Err(format!("list index {i} out of range"));
+                    }
+                    &l[idx as usize]
+                }
+                (v, _) => return Err(format!("cannot index `{v}`")),
+            };
+        }
+        Ok(slot)
     }
 
     /// Evaluate `play|queue channel` operands: channel name, track path,
@@ -915,12 +973,15 @@ impl Vm {
         let mut out = Vec::new();
         for a in actions {
             out.push(match a {
-                crate::ast::ButtonAction::Jump(e) => {
-                    ScreenAction::Jump(self.eval_str(e)?)
-                }
-                crate::ast::ButtonAction::Set { name, value } => ScreenAction::SetVariable {
-                    name: name.clone(),
-                    value: self.eval(value)?,
+                crate::ast::ButtonAction::Jump(e) => ScreenAction::Jump(self.eval_str(e)?),
+                crate::ast::ButtonAction::Set { target, value } => match target {
+                    // Resolved node actions only carry variable names —
+                    // dict/list paths apply at click time instead.
+                    Expr::Var(name) => ScreenAction::SetVariable {
+                        name: name.clone(),
+                        value: self.eval(value)?,
+                    },
+                    _ => continue,
                 },
                 crate::ast::ButtonAction::Return(e) => ScreenAction::Return(match e {
                     Some(e) => self.eval(e)?,
@@ -947,12 +1008,7 @@ impl Vm {
                     let r = u8::from_str_radix(&h[0..2], 16).map_err(|_| "bad hex")?;
                     let g = u8::from_str_radix(&h[2..4], 16).map_err(|_| "bad hex")?;
                     let b = u8::from_str_radix(&h[4..6], 16).map_err(|_| "bad hex")?;
-                    Ok([
-                        r as f32 / 255.0,
-                        g as f32 / 255.0,
-                        b as f32 / 255.0,
-                        1.0,
-                    ])
+                    Ok([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0])
                 } else {
                     Err(format!("bad color `{s}`"))
                 }
@@ -993,9 +1049,9 @@ impl Vm {
                     self.state.pending_screen = None;
                     jumped = true;
                 }
-                crate::ast::ButtonAction::Set { name, value } => {
+                crate::ast::ButtonAction::Set { target, value } => {
                     if let Ok(v) = self.eval(value) {
-                        self.state.variables.insert(name.clone(), v);
+                        let _ = self.assign_target(target, v);
                     }
                 }
                 crate::ast::ButtonAction::Return(e) => {
@@ -1032,10 +1088,7 @@ impl Vm {
     /// Button actions are evaluated at click time (Ren'Py semantics);
     /// `ShowScreen`/`HideScreen` effects are returned for the runtime
     /// to apply to its `screens` list.
-    pub fn resume_screen(
-        &mut self,
-        idx: usize,
-    ) -> Vec<vnengine_core::screen::ScreenAction> {
+    pub fn resume_screen(&mut self, idx: usize) -> Vec<vnengine_core::screen::ScreenAction> {
         let Some(pending) = &self.state.pending_screen else {
             return Vec::new();
         };
@@ -1320,14 +1373,11 @@ impl Vm {
     }
 
     /// Evaluate `(prop-name, expr)` pairs into `(AnimProp, f32)` targets.
-    fn eval_atl_props(
-        &mut self,
-        props: &[(String, Expr)],
-    ) -> Result<Vec<(AnimProp, f32)>, String> {
+    fn eval_atl_props(&mut self, props: &[(String, Expr)]) -> Result<Vec<(AnimProp, f32)>, String> {
         let mut out = Vec::with_capacity(props.len());
         for (name, e) in props {
-            let prop = AnimProp::parse(name)
-                .ok_or_else(|| format!("unknown ATL property `{name}`"))?;
+            let prop =
+                AnimProp::parse(name).ok_or_else(|| format!("unknown ATL property `{name}`"))?;
             out.push((prop, self.eval_f32(e)?));
         }
         Ok(out)
@@ -1495,11 +1545,17 @@ impl Vm {
                     .transpose()?
                     .and_then(|(xv, yv)| Some((xv? as f32, yv? as f32)));
                 let scale = scale
-                    .map(|e| self.eval(&e).and_then(|v| v.as_float().ok_or("expected number".into())))
+                    .map(|e| {
+                        self.eval(&e)
+                            .and_then(|v| v.as_float().ok_or("expected number".into()))
+                    })
                     .transpose()?
                     .map(|f| f as f32);
                 let z = z
-                    .map(|e| self.eval(&e).and_then(|v| v.as_int().ok_or("expected number".into())))
+                    .map(|e| {
+                        self.eval(&e)
+                            .and_then(|v| v.as_int().ok_or("expected number".into()))
+                    })
                     .transpose()?
                     .map(|i| i as i32);
                 let layer = layer.map(|l| parse_layer(&l));
@@ -1615,141 +1671,135 @@ impl Vm {
                 let mut ast_choices = Vec::new();
                 for c in choices {
                     let selectable = match &c.condition {
-                        Some(expr) => self
-                            .eval(expr)
-                            .map(|v| v.is_truthy())
-                            .unwrap_or(true),
+                        Some(expr) => self.eval(expr).map(|v| v.is_truthy()).unwrap_or(true),
                         None => true,
                     };
                     if selectable {
-                    let interp_text = self.interpolate(&c.text);
-                    ast_choices.push(MenuChoiceAst {
-                        text: interp_text.clone(),
-                        condition: None,
-                        body: c.body.clone(),
-                    });
-                    filtered.push(MenuChoice {
-                        text: interp_text,
-                        condition: None,
-                    });
-                }
-            }
-            if filtered.is_empty() {
-                return Ok(ExecOutcome::Continue);
-            }
-            // `menu ... with <trans>`: play the transition first and
-            // present the menu on the next step.
-            if let Some(t) = transition {
-                if let Some(tr) = Transition::parse(&t.name, t.duration) {
-                    if tr.default_duration() > 0.0 {
-                        self.deferred.push_back(Deferred::Menu {
-                            prompt: prompt.clone(),
-                            set_var: set_var.clone(),
-                            choices: filtered,
-                            ast_choices,
+                        let interp_text = self.interpolate(&c.text);
+                        ast_choices.push(MenuChoiceAst {
+                            text: interp_text.clone(),
+                            condition: None,
+                            body: c.body.clone(),
                         });
-                        return Ok(ExecOutcome::Command(Command::PlayTransition(tr)));
+                        filtered.push(MenuChoice {
+                            text: interp_text,
+                            condition: None,
+                        });
+                    }
+                }
+                if filtered.is_empty() {
+                    return Ok(ExecOutcome::Continue);
+                }
+                // `menu ... with <trans>`: play the transition first and
+                // present the menu on the next step.
+                if let Some(t) = transition {
+                    if let Some(tr) = Transition::parse(&t.name, t.duration) {
+                        if tr.default_duration() > 0.0 {
+                            self.deferred.push_back(Deferred::Menu {
+                                prompt: prompt.clone(),
+                                set_var: set_var.clone(),
+                                choices: filtered,
+                                ast_choices,
+                            });
+                            return Ok(ExecOutcome::Command(Command::PlayTransition(tr)));
+                        }
+                    }
+                }
+                // Stash the AST choices for resume.
+                self.state.pending_menu = Some(PendingMenu {
+                    prompt: prompt.clone(),
+                    set_var,
+                    choices: ast_choices,
+                });
+                Ok(ExecOutcome::Menu {
+                    prompt,
+                    choices: filtered,
+                })
+            }
+            Stmt::Jump { label } => {
+                // A bare identifier is a literal label name (backward
+                // compatible); any other expression is evaluated to one.
+                let name = match &label {
+                    Expr::Var(n) => n.clone(),
+                    other => self.eval_str(other)?,
+                };
+                Ok(ExecOutcome::Jump(name))
+            }
+            Stmt::Call { label } => {
+                match &label {
+                    // `call f(args)` — bind parameters as variables, then run
+                    // the body as a call frame so blocking statements (`say`,
+                    // `menu`...) work. Parameters persist as regular
+                    // variables after the call, like Ren'Py's store.
+                    Expr::Call { name, args } => {
+                        if let Some(func) = self.functions.get(name).cloned() {
+                            if args.len() != func.params.len() {
+                                return Err(format!(
+                                    "function `{name}` expects {} argument(s), got {}",
+                                    func.params.len(),
+                                    args.len()
+                                ));
+                            }
+                            for (param, arg) in func.params.iter().zip(args.iter()) {
+                                let v = self.eval(arg)?;
+                                self.state.variables.insert(param.clone(), v);
+                            }
+                            let mut frame = Frame::block(func.body);
+                            frame.is_call = true;
+                            return Ok(ExecOutcome::Push(frame));
+                        }
+                        // `call label(arg, ...)` — bind the label's declared
+                        // parameters, then jump to it as a call frame.
+                        let label_params = self.script.find_label(name).map(|l| l.params.clone());
+                        if let Some(params) = label_params {
+                            if args.len() != params.len() {
+                                return Err(format!(
+                                    "label `{name}` expects {} argument(s), got {}",
+                                    params.len(),
+                                    args.len()
+                                ));
+                            }
+                            for (param, arg) in params.iter().zip(args.iter()) {
+                                let v = self.eval(arg)?;
+                                self.state.variables.insert(param.clone(), v);
+                            }
+                            return Ok(ExecOutcome::Call(name.clone()));
+                        }
+                        return Err(format!("unknown function or label `{name}`"));
+                    }
+                    // `call name` — zero-arg user function (frame-based, so
+                    // the body may contain blocking statements like `say`)
+                    // or a plain label.
+                    Expr::Var(name) => {
+                        if let Some(func) = self.functions.get(name).cloned() {
+                            let mut frame = Frame::block(func.body);
+                            frame.is_call = true;
+                            return Ok(ExecOutcome::Push(frame));
+                        }
+                        Ok(ExecOutcome::Call(name.clone()))
+                    }
+                    // Dynamic target: evaluate to a label name.
+                    other => {
+                        let name = self.eval_str(other)?;
+                        Ok(ExecOutcome::Call(name))
                     }
                 }
             }
-            // Stash the AST choices for resume.
-            self.state.pending_menu = Some(PendingMenu {
-                prompt: prompt.clone(),
-                set_var,
-                choices: ast_choices,
-            });
-            Ok(ExecOutcome::Menu {
-                prompt,
-                choices: filtered,
-            })
-        }
-        Stmt::Jump { label } => {
-            // A bare identifier is a literal label name (backward
-            // compatible); any other expression is evaluated to one.
-            let name = match &label {
-                Expr::Var(n) => n.clone(),
-                other => self.eval_str(other)?,
-            };
-            Ok(ExecOutcome::Jump(name))
-        }
-        Stmt::Call { label } => {
-            match &label {
-                // `call f(args)` — bind parameters as variables, then run
-                // the body as a call frame so blocking statements (`say`,
-                // `menu`...) work. Parameters persist as regular
-                // variables after the call, like Ren'Py's store.
-                Expr::Call { name, args } => {
-                    if let Some(func) = self.functions.get(name).cloned() {
-                        if args.len() != func.params.len() {
-                            return Err(format!(
-                                "function `{name}` expects {} argument(s), got {}",
-                                func.params.len(),
-                                args.len()
-                            ));
-                        }
-                        for (param, arg) in func.params.iter().zip(args.iter()) {
-                            let v = self.eval(arg)?;
-                            self.state.variables.insert(param.clone(), v);
-                        }
-                        let mut frame = Frame::block(func.body);
-                        frame.is_call = true;
-                        return Ok(ExecOutcome::Push(frame));
-                    }
-                    // `call label(arg, ...)` — bind the label's declared
-                    // parameters, then jump to it as a call frame.
-                    let label_params = self
-                        .script
-                        .find_label(name)
-                        .map(|l| l.params.clone());
-                    if let Some(params) = label_params {
-                        if args.len() != params.len() {
-                            return Err(format!(
-                                "label `{name}` expects {} argument(s), got {}",
-                                params.len(),
-                                args.len()
-                            ));
-                        }
-                        for (param, arg) in params.iter().zip(args.iter()) {
-                            let v = self.eval(arg)?;
-                            self.state.variables.insert(param.clone(), v);
-                        }
-                        return Ok(ExecOutcome::Call(name.clone()));
-                    }
-                    return Err(format!("unknown function or label `{name}`"));
-                }
-                // `call name` — zero-arg user function (frame-based, so
-                // the body may contain blocking statements like `say`)
-                // or a plain label.
-                Expr::Var(name) => {
-                    if let Some(func) = self.functions.get(name).cloned() {
-                        let mut frame = Frame::block(func.body);
-                        frame.is_call = true;
-                        return Ok(ExecOutcome::Push(frame));
-                    }
-                    Ok(ExecOutcome::Call(name.clone()))
-                }
-                // Dynamic target: evaluate to a label name.
-                other => {
-                    let name = self.eval_str(other)?;
-                    Ok(ExecOutcome::Call(name))
-                }
+            Stmt::Return => Ok(ExecOutcome::Return),
+            Stmt::ReturnValue { value } => {
+                // Inside a label `call` the value is discarded; inside a
+                // function body this statement never reaches exec_stmt
+                // (funcs::exec_stmt handles it). Evaluate for RNG parity.
+                let _ = self.eval(&value)?;
+                Ok(ExecOutcome::Return)
             }
-        }
-        Stmt::Return => Ok(ExecOutcome::Return),
-        Stmt::ReturnValue { value } => {
-            // Inside a label `call` the value is discarded; inside a
-            // function body this statement never reaches exec_stmt
-            // (funcs::exec_stmt handles it). Evaluate for RNG parity.
-            let _ = self.eval(&value)?;
-            Ok(ExecOutcome::Return)
-        }
-        Stmt::With { transition } => {
-            let trans = Transition::parse(&transition.name, transition.duration)
-                .unwrap_or(Transition::Cut);
-            Ok(ExecOutcome::Command(Command::PlayTransition(trans)))
-        }
-        Stmt::Break => Ok(ExecOutcome::Break),
-        Stmt::Continue => Ok(ExecOutcome::ContinueLoop),
+            Stmt::With { transition } => {
+                let trans = Transition::parse(&transition.name, transition.duration)
+                    .unwrap_or(Transition::Cut);
+                Ok(ExecOutcome::Command(Command::PlayTransition(trans)))
+            }
+            Stmt::Break => Ok(ExecOutcome::Break),
+            Stmt::Continue => Ok(ExecOutcome::ContinueLoop),
             Stmt::Shake {
                 intensity,
                 duration,
@@ -1776,11 +1826,7 @@ impl Vm {
                 else_branch,
             } => {
                 for (cond, body) in &branches {
-                    if self
-                        .eval(cond)
-                        .map(|v| v.is_truthy())
-                        .unwrap_or(false)
-                    {
+                    if self.eval(cond).map(|v| v.is_truthy()).unwrap_or(false) {
                         return Ok(ExecOutcome::Push(Frame::block(body.clone())));
                     }
                 }
@@ -1791,11 +1837,7 @@ impl Vm {
             }
             Stmt::Pause { seconds } => match seconds {
                 Some(e) => {
-                    let s = self
-                        .eval(&e)
-                        .ok()
-                        .and_then(|v| v.as_float())
-                        .unwrap_or(1.0) as f32;
+                    let s = self.eval(&e).ok().and_then(|v| v.as_float()).unwrap_or(1.0) as f32;
                     Ok(ExecOutcome::Command(Command::Pause { seconds: s }))
                 }
                 None => Ok(ExecOutcome::Command(Command::WaitInput)),
@@ -1814,22 +1856,20 @@ impl Vm {
                 Ok(ExecOutcome::Command(Command::PlayVoice { track }))
             }
             Stmt::StopVoice => Ok(ExecOutcome::Command(Command::StopVoice)),
-            Stmt::Assign { name, value } => {
+            Stmt::Assign { target, value } => {
                 let v = self
                     .eval(&value)
                     .map_err(|e| format!("assignment error: {e}"))?;
-                self.state.variables.insert(name, v);
+                self.assign_target(&target, v)?;
                 Ok(ExecOutcome::Continue)
             }
-            Stmt::AssignOp { name, op, value } => {
-                let current = self.state.variables.get(&name).cloned().ok_or_else(|| {
-                    format!("undefined variable `{name}` for compound assignment")
-                })?;
+            Stmt::AssignOp { target, op, value } => {
                 let rhs = self
                     .eval(&value)
                     .map_err(|e| format!("assignment error: {e}"))?;
+                let current = self.read_target(&target)?.clone();
                 let result = eval_binop_pub(op, current, rhs)?;
-                self.state.variables.insert(name, result);
+                self.assign_target(&target, result)?;
                 Ok(ExecOutcome::Continue)
             }
             Stmt::Default { name, value } => {
@@ -1881,11 +1921,7 @@ impl Vm {
                 }))
             }
             Stmt::While { cond, body } => {
-                if self
-                    .eval(&cond)
-                    .map(|v| v.is_truthy())
-                    .unwrap_or(false)
-                {
+                if self.eval(&cond).map(|v| v.is_truthy()).unwrap_or(false) {
                     let mut frame = Frame::block(body);
                     frame.while_loop = Some(cond);
                     return Ok(ExecOutcome::Push(frame));
@@ -1903,10 +1939,7 @@ impl Vm {
                 let items: Vec<Value> = match &iter_val {
                     Value::List(items) => items.clone(),
                     Value::Dict(map) => map.keys().cloned().map(Value::Str).collect(),
-                    Value::Str(s) => s
-                        .chars()
-                        .map(|c| Value::Str(c.to_string()))
-                        .collect(),
+                    Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
                     _ => return Err("for loop iterable must be a list, dict or string".into()),
                 };
                 if items.is_empty() {
@@ -2142,14 +2175,24 @@ impl Vm {
                         ))
                     }
                 };
-                Ok(ExecOutcome::Command(Command::FilterChannel { channel, filter }))
+                Ok(ExecOutcome::Command(Command::FilterChannel {
+                    channel,
+                    filter,
+                }))
+            }
+            Stmt::Grant { name } => {
+                let name = self.eval_str(&name)?;
+                if self.script.find_achievement(&name).is_none() {
+                    return Err(format!(
+                        "unknown achievement `{name}` (declare it with `achievement`)"
+                    ));
+                }
+                Ok(ExecOutcome::Command(Command::Grant { name }))
             }
             Stmt::ShowScreen { screen } => {
                 let name = self.eval_screen_name(&screen)?;
                 let (inst, raw) = self.resolve_screen(&name)?;
-                self.state
-                    .shown_screen_actions
-                    .insert(name, raw);
+                self.state.shown_screen_actions.insert(name, raw);
                 Ok(ExecOutcome::Command(Command::ShowScreen(inst)))
             }
             Stmt::HideScreen { screen } => {
@@ -2309,11 +2352,7 @@ pub(crate) fn eval_expr_ctx(
                 _ => Err("`.` attribute access only works on dicts".into()),
             }?
         }
-        Expr::MethodCall {
-            object,
-            name,
-            args,
-        } => {
+        Expr::MethodCall { object, name, args } => {
             let obj = eval_expr_ctx(object, vars, fns, rng)?;
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
@@ -2407,7 +2446,9 @@ fn slice_value(coll: &Value, start: Option<i64>, end: Option<i64>) -> Result<Val
         Value::Str(s) => {
             let chars: Vec<char> = s.chars().collect();
             let (s, e) = bounds(chars.len() as i64, start, end);
-            Ok(Value::Str(chars[s.min(e)..e.min(chars.len())].iter().collect()))
+            Ok(Value::Str(
+                chars[s.min(e)..e.min(chars.len())].iter().collect(),
+            ))
         }
         _ => Err("cannot slice non-collection".into()),
     }
@@ -2447,7 +2488,10 @@ fn eval_method(obj: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 if args.len() != 2 {
                     return Err(format!("str.{name}() takes 2 arguments"));
                 }
-                let (old, new) = (args[0].as_str().unwrap_or_default(), args[1].as_str().unwrap_or_default());
+                let (old, new) = (
+                    args[0].as_str().unwrap_or_default(),
+                    args[1].as_str().unwrap_or_default(),
+                );
                 Ok(Value::Str(s.replace(old.as_str(), new.as_str())))
             }
             "startswith" | "endswith" => {
@@ -2526,9 +2570,8 @@ fn eval_method(obj: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     // Dict methods.
     if let Value::Dict(map) = obj {
         return match name {
-            "keys" => no_args(name, args).map(|_| {
-                Value::List(map.keys().cloned().map(Value::Str).collect())
-            }),
+            "keys" => no_args(name, args)
+                .map(|_| Value::List(map.keys().cloned().map(Value::Str).collect())),
             "values" => no_args(name, args).map(|_| Value::List(map.values().cloned().collect())),
             "items" => no_args(name, args).map(|_| {
                 Value::List(
@@ -2590,7 +2633,10 @@ fn eval_builtin(
         if args.len() == n {
             Ok(())
         } else {
-            Err(format!("{name}() takes {n} argument(s), got {}", args.len()))
+            Err(format!(
+                "{name}() takes {n} argument(s), got {}",
+                args.len()
+            ))
         }
     };
     match name {
@@ -2601,8 +2647,12 @@ fn eval_builtin(
         "randint" => {
             arity(2)?;
             let vals = eval_args(args, vars, fns, rng)?;
-            let lo = vals[0].as_int().ok_or("randint() bounds must be integers")?;
-            let hi = vals[1].as_int().ok_or("randint() bounds must be integers")?;
+            let lo = vals[0]
+                .as_int()
+                .ok_or("randint() bounds must be integers")?;
+            let hi = vals[1]
+                .as_int()
+                .ok_or("randint() bounds must be integers")?;
             if lo > hi {
                 return Err(format!("randint() invalid range {lo}..{hi}"));
             }
@@ -2612,9 +2662,7 @@ fn eval_builtin(
         "srand" => {
             arity(1)?;
             let vals = eval_args(args, vars, fns, rng)?;
-            let seed = vals[0]
-                .as_int()
-                .ok_or("srand() seed must be an integer")?;
+            let seed = vals[0].as_int().ok_or("srand() seed must be an integer")?;
             *rng = (seed as u64) | 1;
             Ok(Value::Int(seed))
         }
@@ -2791,9 +2839,7 @@ fn eval_builtin(
             match &vals[0] {
                 Value::List(items) => {
                     let mut sorted = items.clone();
-                    sorted.sort_by(|a, b| {
-                        value_cmp(a, b).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    sorted.sort_by(|a, b| value_cmp(a, b).unwrap_or(std::cmp::Ordering::Equal));
                     Ok(Value::List(sorted))
                 }
                 _ => Err("sorted() argument must be a list".into()),
@@ -2817,9 +2863,7 @@ fn eval_builtin(
             let vals = eval_args(args, vars, fns, rng)?;
             match &vals[0] {
                 Value::Dict(map) => Ok(match name {
-                    "keys" => Value::List(
-                        map.keys().cloned().map(Value::Str).collect(),
-                    ),
+                    "keys" => Value::List(map.keys().cloned().map(Value::Str).collect()),
                     "values" => Value::List(map.values().cloned().collect()),
                     _ => Value::List(
                         map.iter()
@@ -2835,7 +2879,9 @@ fn eval_builtin(
             let vals = eval_args(args, vars, fns, rng)?;
             match (&vals[0], &vals[1]) {
                 (Value::Dict(map), Value::Str(k)) => Ok(Value::Bool(map.contains_key(k))),
-                (Value::List(items), v) => Ok(Value::Bool(items.iter().any(|i| values_eq_pub(i, v)))),
+                (Value::List(items), v) => {
+                    Ok(Value::Bool(items.iter().any(|i| values_eq_pub(i, v))))
+                }
                 (Value::Str(s), Value::Str(sub)) => Ok(Value::Bool(s.contains(sub.as_str()))),
                 _ => Err("has() unsupported operand types".into()),
             }
@@ -2858,8 +2904,8 @@ fn eval_builtin(
         }
         // String helpers (also available as methods): first argument is
         // the receiver, the rest are method arguments.
-        "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "split" | "replace"
-        | "startswith" | "endswith" | "count" | "find" | "index" | "join" => {
+        "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "split" | "replace" | "startswith"
+        | "endswith" | "count" | "find" | "index" | "join" => {
             let vals = eval_args(args, vars, fns, rng)?;
             let Some((obj, rest)) = vals.split_first() else {
                 return Err(format!("{name}() takes at least 1 argument"));
@@ -2883,8 +2929,12 @@ fn value_cmp(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
         (Value::Float(x), Value::Float(y)) => Ok(x.partial_cmp(y).unwrap_or(Ordering::Equal)),
-        (Value::Int(x), Value::Float(y)) => Ok((*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)),
-        (Value::Float(x), Value::Int(y)) => Ok(x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)),
+        (Value::Int(x), Value::Float(y)) => {
+            Ok((*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal))
+        }
+        (Value::Float(x), Value::Int(y)) => {
+            Ok(x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal))
+        }
         (Value::Str(x), Value::Str(y)) => Ok(x.cmp(y)),
         (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
         (Value::List(x), Value::List(y)) => {

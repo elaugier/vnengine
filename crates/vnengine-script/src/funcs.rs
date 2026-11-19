@@ -98,19 +98,16 @@ fn exec_stmt(
     budget: &mut usize,
 ) -> Result<FnFlow, String> {
     match stmt {
-        Stmt::Assign { name, value } => {
+        Stmt::Assign { target, value } => {
             let v = eval_expr_ctx(value, scope, Some(fns), rng)?;
-            scope.insert(name.clone(), v);
+            assign_target_fn(target, v, scope, fns, rng)?;
             Ok(FnFlow::Normal)
         }
-        Stmt::AssignOp { name, op, value } => {
-            let current = scope
-                .get(name)
-                .cloned()
-                .ok_or_else(|| format!("undefined variable `{name}` for compound assignment"))?;
+        Stmt::AssignOp { target, op, value } => {
+            let current = read_target_fn(target, scope, fns, rng)?;
             let rhs = eval_expr_ctx(value, scope, Some(fns), rng)?;
             let result = eval_binop_pub(*op, current, rhs)?;
-            scope.insert(name.clone(), result);
+            assign_target_fn(target, result, scope, fns, rng)?;
             Ok(FnFlow::Normal)
         }
         Stmt::Default { name, value } => {
@@ -178,6 +175,81 @@ fn exec_stmt(
 
 /// Materialize an iterable into items: lists, dict keys (as strings)
 /// and strings (as chars).
+/// Resolve an assignment target to `(root_variable, path_keys)` in a
+/// pure-function scope (index exprs evaluated before borrowing).
+fn resolve_target_fn(
+    target: &Expr,
+    scope: &HashMap<String, Value>,
+    fns: &HashMap<String, FunctionDef>,
+    rng: &mut u64,
+) -> Result<(String, Vec<Value>), String> {
+    match target {
+        Expr::Var(n) => Ok((n.clone(), Vec::new())),
+        Expr::Attr { object, name } => {
+            let (root, mut path) = resolve_target_fn(object, scope, fns, rng)?;
+            path.push(Value::Str(name.clone()));
+            Ok((root, path))
+        }
+        Expr::Index { collection, index } => {
+            let (root, mut path) = resolve_target_fn(collection, scope, fns, rng)?;
+            let k = eval_expr_ctx(index, scope, Some(fns), rng)?;
+            path.push(k);
+            Ok((root, path))
+        }
+        _ => Err("invalid assignment target (expected name, .attr or [index])".into()),
+    }
+}
+
+fn assign_target_fn(
+    target: &Expr,
+    v: Value,
+    scope: &mut HashMap<String, Value>,
+    fns: &HashMap<String, FunctionDef>,
+    rng: &mut u64,
+) -> Result<(), String> {
+    let (root, path) = resolve_target_fn(target, scope, fns, rng)?;
+    if path.is_empty() {
+        scope.insert(root, v);
+        return Ok(());
+    }
+    let mut slot = scope
+        .get_mut(&root)
+        .ok_or_else(|| format!("undefined variable `{root}` in assignment"))?;
+    for k in &path {
+        slot = slot.path_mut(k)?;
+    }
+    *slot = v;
+    Ok(())
+}
+
+fn read_target_fn(
+    target: &Expr,
+    scope: &mut HashMap<String, Value>,
+    fns: &HashMap<String, FunctionDef>,
+    rng: &mut u64,
+) -> Result<Value, String> {
+    let (root, path) = resolve_target_fn(target, scope, fns, rng)?;
+    let mut slot = scope
+        .get(&root)
+        .ok_or_else(|| format!("undefined variable `{root}` for compound assignment"))?;
+    for k in &path {
+        slot = match (slot, k) {
+            (Value::Dict(d), Value::Str(key)) => d
+                .get(key)
+                .ok_or_else(|| format!("dict has no key `{key}`"))?,
+            (Value::List(l), Value::Int(i)) => {
+                let idx = if *i < 0 { l.len() as i64 + i } else { *i };
+                if idx < 0 || idx as usize >= l.len() {
+                    return Err(format!("list index {i} out of range"));
+                }
+                &l[idx as usize]
+            }
+            (v, _) => return Err(format!("cannot index `{v}`")),
+        };
+    }
+    Ok(slot.clone())
+}
+
 fn iterable_items(v: &Value) -> Result<Vec<Value>, String> {
     match v {
         Value::List(items) => Ok(items.clone()),
@@ -214,6 +286,7 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
         Stmt::StopAll { .. } => "stop all",
         Stmt::VolumeChannel { .. } => "volume channel",
         Stmt::FilterChannel { .. } => "filter channel",
+        Stmt::Grant { .. } => "grant",
         Stmt::Assign { .. } | Stmt::AssignOp { .. } | Stmt::Default { .. } => "assignment",
         Stmt::While { .. } => "while",
         Stmt::For { .. } => "for",

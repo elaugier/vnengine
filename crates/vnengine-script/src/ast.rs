@@ -22,6 +22,9 @@ pub struct Script {
     /// Declarative screen definitions (`screen name:`).
     #[serde(default)]
     pub screens: Vec<ScreenDef>,
+    /// Achievement definitions (`achievement <name> ["desc"]`).
+    #[serde(default)]
+    pub achievements: Vec<AchievementDef>,
 }
 
 impl Script {
@@ -39,6 +42,20 @@ impl Script {
     pub fn find_screen(&self, name: &str) -> Option<&ScreenDef> {
         self.screens.iter().find(|s| s.name == name)
     }
+
+    /// Find an achievement definition by name.
+    pub fn find_achievement(&self, name: &str) -> Option<&AchievementDef> {
+        self.achievements.iter().find(|a| a.name == name)
+    }
+}
+
+/// An achievement registered at top level and granted via `grant`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AchievementDef {
+    pub name: String,
+    /// Optional human-readable description (toast/UI).
+    #[serde(default)]
+    pub desc: Option<String>,
 }
 
 /// A declarative screen: `screen <name>: <body>`. The body compiles to
@@ -103,8 +120,9 @@ pub enum ScreenStmt {
 pub enum ButtonAction {
     /// `jump <expr>` — abandon the stack, jump to a label.
     Jump(Expr),
-    /// `set <var> = <expr>` — set a variable, screen stays up.
-    Set { name: String, value: Expr },
+    /// `set <target> = <expr>` — set a variable or dict/list path,
+    /// screen stays up.
+    Set { target: Expr, value: Expr },
     /// `return [<expr>]` — end a `call screen` with a value.
     Return(Option<Expr>),
     /// `show screen <expr>` — show another screen, stays up.
@@ -161,7 +179,10 @@ pub enum AtlStmt {
     /// `parallel:` — the block compiles to an extra concurrent track.
     Parallel { body: Vec<AtlStmt> },
     /// `choice [weight]:` — pick one child via the seeded PRNG.
-    Choice { weight: Option<Expr>, body: Vec<AtlStmt> },
+    Choice {
+        weight: Option<Expr>,
+        body: Vec<AtlStmt>,
+    },
     /// `repeat [n]` — wraps the *preceding* sibling list; the parser
     /// turns it into a track-level repeat.
     Repeat { count: Option<Expr> },
@@ -353,11 +374,14 @@ pub enum Stmt {
         kind: String,
         params: Vec<(String, Expr)>,
     },
-    /// `$ <name> = <expr>` or `set <name> = <expr>`
-    Assign { name: String, value: Expr },
-    /// `$ <name> += <expr>` etc.
+    /// `grant <name>` — grant a declared achievement.
+    Grant { name: Expr },
+    /// `$ <target> = <expr>` or `set <target> = <expr>` — target is a
+    /// `Var` or a `Var.attr`/`Var[expr]` path (dict/list lvalues).
+    Assign { target: Expr, value: Expr },
+    /// `$ <target> += <expr>` etc.
     AssignOp {
-        name: String,
+        target: Expr,
         op: BinaryOp,
         value: Expr,
     },

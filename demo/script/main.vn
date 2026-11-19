@@ -13,6 +13,9 @@ define nv = Character(None, kind="nvl")
 default eileen_affection = 0
 default met_eileen = False
 
+achievement true_end "Reach the true ending"
+achievement all_endings "See every possible ending"
+
 # User-defined function: display a formatted thought
 def thought:
     n "{i}A quiet thought crosses my mind...{/i}"
@@ -343,12 +346,20 @@ label ending:
         n "...was the first of many."
         n ""
         n "THE END - True Ending"
+        grant true_end
+        $ persistent.true_end = True
+        $ persistent.endings_seen = persistent.get("endings_seen", 0) + 1
+        if persistent.endings_seen >= 3:
+            grant all_endings
     elif eileen_affection >= 0:
         n "That day was one I wouldn't soon forget."
         n "Eileen and I remained friends, though nothing more."
         n "Sometimes I wonder what would have happened if I'd made different choices."
         n ""
         n "THE END - Normal Ending"
+        $ persistent.endings_seen = persistent.get("endings_seen", 0) + 1
+        if persistent.endings_seen >= 3:
+            grant all_endings
     else:
         n "That day ended quietly."
         n "Eileen and I drifted apart after that."
@@ -356,6 +367,9 @@ label ending:
         n "Some moments only come once."
         n ""
         n "THE END - Bad Ending"
+        $ persistent.endings_seen = persistent.get("endings_seen", 0) + 1
+        if persistent.endings_seen >= 3:
+            grant all_endings
 
     pause 2.0
     end
@@ -374,5 +388,8 @@ label ending_sad:
     n "Maybe next time."
     n ""
     n "THE END - Lonely Ending"
+    $ persistent.endings_seen = persistent.get("endings_seen", 0) + 1
+    if persistent.endings_seen >= 3:
+        grant all_endings
     pause 2.0
     end

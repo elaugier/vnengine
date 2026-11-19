@@ -576,7 +576,7 @@ label start:
     let script = Parser::parse(src).unwrap();
     let body = &script.labels[0].body;
     assert!(
-        matches!(&body[1], Stmt::AssignOp { name, op, .. } if name == "x" && *op == BinaryOp::Add)
+        matches!(&body[1], Stmt::AssignOp { target, op, .. } if matches!(target, Expr::Var(n) if n == "x") && *op == BinaryOp::Add)
     );
 }
 
@@ -591,7 +591,7 @@ label start:
     let script = Parser::parse(src).unwrap();
     let body = &script.labels[0].body;
     assert!(
-        matches!(&body[1], Stmt::AssignOp { name, op, .. } if name == "x" && *op == BinaryOp::Sub)
+        matches!(&body[1], Stmt::AssignOp { target, op, .. } if matches!(target, Expr::Var(n) if n == "x") && *op == BinaryOp::Sub)
     );
 }
 
@@ -606,7 +606,7 @@ label start:
     let script = Parser::parse(src).unwrap();
     let body = &script.labels[0].body;
     assert!(
-        matches!(&body[1], Stmt::AssignOp { name, op, .. } if name == "x" && *op == BinaryOp::Mul)
+        matches!(&body[1], Stmt::AssignOp { target, op, .. } if matches!(target, Expr::Var(n) if n == "x") && *op == BinaryOp::Mul)
     );
 }
 
@@ -621,7 +621,7 @@ label start:
     let script = Parser::parse(src).unwrap();
     let body = &script.labels[0].body;
     assert!(
-        matches!(&body[1], Stmt::AssignOp { name, op, .. } if name == "x" && *op == BinaryOp::Div)
+        matches!(&body[1], Stmt::AssignOp { target, op, .. } if matches!(target, Expr::Var(n) if n == "x") && *op == BinaryOp::Div)
     );
 }
 
@@ -2040,7 +2040,13 @@ label start:
     }
     assert!(matches!(t.body[2], AtlStmt::Parallel { .. }));
     assert!(matches!(t.body[4], AtlStmt::Choice { weight: None, .. }));
-    assert!(matches!(t.body[5], AtlStmt::Choice { weight: Some(_), .. }));
+    assert!(matches!(
+        t.body[5],
+        AtlStmt::Choice {
+            weight: Some(_),
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -2305,7 +2311,6 @@ label start:
             assert_eq!(spec.anims[0].repeats, None); // infinite
         }
         other => panic!("expected Show, got {other:?}"),
- 
     }
 }
 
@@ -2425,7 +2430,9 @@ label start:
     match &script.screens[0].body[0] {
         ScreenStmt::Button { actions, .. } => {
             assert_eq!(actions.len(), 2);
-            assert!(matches!(&actions[0], ButtonAction::Set { name, .. } if name == "picked"));
+            assert!(
+                matches!(&actions[0], ButtonAction::Set { target, .. } if matches!(target, Expr::Var(n) if n == "picked"))
+            );
             assert!(matches!(actions[1], ButtonAction::Return(_)));
         }
         other => panic!("expected Button, got {other:?}"),
@@ -2443,10 +2450,7 @@ label start:
     let script = Parser::parse(src).unwrap();
     match &script.definitions[0] {
         Definition::Character {
-            voice,
-            image,
-            kind,
-            ..
+            voice, image, kind, ..
         } => {
             assert!(voice.is_some());
             assert!(image.is_some());
@@ -2685,14 +2689,25 @@ label start:
     let script = Parser::parse(src).unwrap();
     let b = &script.labels[0].body;
     match &b[0] {
-        Stmt::PlayChannel { channel, volume, fade, loop_, .. } => {
+        Stmt::PlayChannel {
+            channel,
+            volume,
+            fade,
+            loop_,
+            ..
+        } => {
             assert!(matches!(channel, Expr::Str(n) if n == "amb"));
             assert!(volume.is_some() && fade.is_some() && *loop_);
         }
         other => panic!("expected PlayChannel, got {other:?}"),
     }
     match &b[1] {
-        Stmt::QueueChannel { channel, track, loop_, .. } => {
+        Stmt::QueueChannel {
+            channel,
+            track,
+            loop_,
+            ..
+        } => {
             assert!(matches!(channel, Expr::Str(n) if n == "amb"));
             assert!(matches!(track, Expr::Str(t) if t == "rain.ogg"));
             assert!(!*loop_);
@@ -2741,7 +2756,13 @@ label start:
     let script = Parser::parse(src).unwrap();
     let mut vm = Vm::new(script);
     match step_until_command(&mut vm) {
-        Command::PlayChannel { channel, track, volume, fade, loop_ } => {
+        Command::PlayChannel {
+            channel,
+            track,
+            volume,
+            fade,
+            loop_,
+        } => {
             assert_eq!(channel, "amb");
             assert_eq!(track, "wind.ogg");
             assert!((volume - 0.5).abs() < 1e-6);
@@ -2758,7 +2779,9 @@ label start:
         other => panic!("expected QueueChannel, got {other:?}"),
     }
     match step_until_command(&mut vm) {
-        Command::VolumeChannel { channel, volume, .. } => {
+        Command::VolumeChannel {
+            channel, volume, ..
+        } => {
             assert_eq!(channel, "amb");
             assert!((volume - 0.7).abs() < 1e-6);
         }
@@ -2768,7 +2791,9 @@ label start:
         Command::FilterChannel { channel, filter } => {
             assert_eq!(channel, "amb");
             match filter {
-                vnengine_core::command::ChannelFilter::Filter { mode, cutoff, mix, .. } => {
+                vnengine_core::command::ChannelFilter::Filter {
+                    mode, cutoff, mix, ..
+                } => {
                     assert_eq!(mode, "lowpass");
                     assert!((cutoff - 800.0).abs() < 1e-6);
                     assert!((mix - 0.9).abs() < 1e-6);
@@ -2777,5 +2802,143 @@ label start:
             }
         }
         other => panic!("expected FilterChannel, got {other:?}"),
+    }
+}
+
+// ---------- Phase 5: lvalues, persistent, achievements ----------
+
+#[test]
+fn parse_lvalue_assignments() {
+    let src = r##"
+label start:
+    $ d.k = 1
+    $ d["key"] = 2
+    $ list[0] += 3
+    set persistent.unlocked = True
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let b = &script.labels[0].body;
+    match &b[0] {
+        Stmt::Assign { target, .. } => {
+            assert!(matches!(target, Expr::Attr { name, .. } if name == "k"));
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+    assert!(matches!(
+        &b[1],
+        Stmt::Assign {
+            target: Expr::Index { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        &b[2],
+        Stmt::AssignOp {
+            target: Expr::Index { .. },
+            ..
+        }
+    ));
+    match &b[3] {
+        Stmt::Assign { target, .. } => match target {
+            Expr::Attr { object, name } => {
+                assert!(matches!(&**object, Expr::Var(n) if n == "persistent"));
+                assert_eq!(name, "unlocked");
+            }
+            other => panic!("expected Attr target, got {other:?}"),
+        },
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_lvalue_assignments() {
+    let src = r##"
+label start:
+    $ d = { "k": 1 }
+    $ d.k += 4
+    $ d.new = "hi"
+    $ l = [1, 2, 3]
+    $ l[1] = 20
+    $ l[-1] += 5
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    loop {
+        if matches!(vm.step(), StepResult::Finished) {
+            break;
+        }
+    }
+    let d = vm.state.variables.get("d").unwrap();
+    match d {
+        Value::Dict(m) => {
+            assert_eq!(m.get("k"), Some(&Value::Int(5)));
+            assert_eq!(m.get("new"), Some(&Value::Str("hi".into())));
+        }
+        other => panic!("expected dict, got {other:?}"),
+    }
+    match vm.state.variables.get("l").unwrap() {
+        Value::List(items) => {
+            assert_eq!(items[1], Value::Int(20));
+            assert_eq!(items[2], Value::Int(8));
+        }
+        other => panic!("expected list, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_achievement_and_grant() {
+    let src = r##"
+achievement endings "See every ending"
+achievement speed
+
+label start:
+    grant endings
+    grant ["ach_" + "custom"]
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    assert_eq!(script.achievements.len(), 2);
+    assert_eq!(script.achievements[0].name, "endings");
+    assert_eq!(
+        script.achievements[0].desc.as_deref(),
+        Some("See every ending")
+    );
+    assert!(script.achievements[1].desc.is_none());
+    assert!(matches!(&script.labels[0].body[0], Stmt::Grant { .. }));
+}
+
+#[test]
+fn vm_grant_known_achievement() {
+    let src = r##"
+achievement win "You won"
+
+label start:
+    grant win
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    match step_until_command(&mut vm) {
+        Command::Grant { name } => assert_eq!(name, "win"),
+        other => panic!("expected Grant, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_grant_unknown_achievement_errors() {
+    let src = r##"
+label start:
+    grant nope
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let mut vm = Vm::new(script);
+    // The VM error propagates as a Panic/StepResult error or finished —
+    // assert it does not produce a Grant command.
+    match vm.step() {
+        StepResult::Command(Command::Grant { .. }) => panic!("unknown grant should error"),
+        _ => {}
     }
 }

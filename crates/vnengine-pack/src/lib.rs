@@ -28,6 +28,8 @@ use vnengine_script::ast::Script;
 use vnengine_script::Parser as ScriptParser;
 use zip::write::SimpleFileOptions;
 
+pub mod lint;
+
 /// Package format version written by [`build`].
 pub const MANIFEST_FORMAT: u32 = 2;
 
@@ -222,6 +224,22 @@ pub fn validate(project: &Path) -> Result<()> {
             assets.push(fs_path.to_path_buf());
             Ok(())
         })?;
+    }
+    // Lint: normalized `dir/file` index, `/`-separated.
+    let asset_set: std::collections::BTreeSet<String> = assets
+        .iter()
+        .filter_map(|p| {
+            p.strip_prefix(project)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+        })
+        .collect();
+    let warnings = lint::lint_script(&script, &config, &asset_set);
+    for warn in &warnings {
+        println!("warning: {warn}");
+    }
+    if !warnings.is_empty() {
+        println!("lint: {} warning(s)", warnings.len());
     }
     let licenses = license_files(project);
     println!("valid project: {}", config.title);
