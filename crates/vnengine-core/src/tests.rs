@@ -549,6 +549,22 @@ fn gallery_unlock_and_check() {
 }
 
 #[test]
+fn persistent_store_replaces_a_previous_version() {
+    use crate::save::PersistentStore;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("persistent.json");
+    let mut store = PersistentStore::default();
+    store.save(&path).unwrap();
+    store.achievements.insert("first".into());
+    store.save(&path).unwrap();
+    assert_eq!(
+        PersistentStore::load(&path).achievements,
+        store.achievements
+    );
+}
+
+#[test]
 fn gallery_save_load_roundtrip() {
     let tmp = std::env::temp_dir().join("vnengine_gallery.json");
     let _ = std::fs::remove_file(&tmp);
@@ -786,11 +802,28 @@ fn atl_track_time_sync_waits_for_absolute() {
             targets: vec![(AnimProp::XPos, 0.9)],
             at: None,
         },
+        AnimStep {
+            duration: 1.0,
+            warper: "linear".into(),
+            targets: vec![(AnimProp::Alpha, 0.0)],
+            at: None,
+        },
+        AnimStep {
+            duration: 1.0,
+            warper: "linear".into(),
+            targets: vec![(AnimProp::Alpha, 1.0)],
+            at: None,
+        },
     ]);
     track.tick(0.5, &mut s); // elapsed 0.5 < 1.0: still waiting
     assert_eq!(s.position.unwrap().0, 0.0);
-    track.tick(0.6, &mut s); // elapsed 1.1 >= 1.0: runs through
+    track.tick(0.6, &mut s);
     assert!((s.position.unwrap().0 - 0.9).abs() < 1e-4);
+    assert!((s.opacity - 0.9).abs() < 1e-4);
+    track.tick(1.2, &mut s);
+    assert!((s.opacity - 0.3).abs() < 1e-4);
+    assert!(!track.finished());
+    track.tick(0.8, &mut s);
     assert!(track.finished());
 }
 

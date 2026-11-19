@@ -142,7 +142,9 @@ impl SpriteTrack {
     /// continues within the same call, so a sequence of instant sets
     /// never takes extra frames.
     pub fn tick(&mut self, dt: f32, sprite: &mut ActiveSprite) {
+        let mut cursor = self.elapsed;
         self.elapsed += dt;
+        let mut remaining = dt;
         let mut guard = 0usize;
         loop {
             guard += 1;
@@ -154,6 +156,10 @@ impl SpriteTrack {
             if let Some(at) = step.at {
                 if self.elapsed < at {
                     break;
+                }
+                if cursor < at {
+                    remaining = (remaining - (at - cursor)).max(0.0);
+                    cursor = at;
                 }
             }
             if !self.primed {
@@ -169,14 +175,18 @@ impl SpriteTrack {
                 self.advance();
                 continue;
             }
-            self.step_elapsed += dt;
+            let needed = (step.duration - self.step_elapsed).max(0.0);
+            let consumed = remaining.min(needed);
+            self.step_elapsed += consumed;
+            remaining -= consumed;
+            cursor += consumed;
             let t = (self.step_elapsed / step.duration).min(1.0);
             let w = warp(&step.warper, t);
             for (prop, v) in &step.targets {
                 let from = *self.from.get(&(*prop as u8)).unwrap_or(v);
                 set_prop(sprite, *prop, from + (v - from) * w);
             }
-            if self.step_elapsed >= step.duration {
+            if consumed >= needed {
                 for (prop, v) in &step.targets {
                     set_prop(sprite, *prop, *v);
                 }

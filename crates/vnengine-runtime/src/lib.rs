@@ -144,6 +144,7 @@ pub struct Runtime {
     /// scripts mutate is `vm.state.variables["persistent"]`; the host
     /// diffs via `persistent_dirty`/`mark_persistent_clean`.
     persistent: Value,
+    achievements_dirty: bool,
     rollback_stack: Vec<RollbackSnapshot>,
     rollforward_stack: Vec<RollbackSnapshot>,
     /// True while re-executing a restored snapshot. Suppresses clearing
@@ -175,6 +176,7 @@ impl Runtime {
             channels: std::collections::BTreeMap::new(),
             achievements: std::collections::BTreeSet::new(),
             persistent: Value::Dict(Default::default()),
+            achievements_dirty: false,
             rollback_stack: Vec::new(),
             rollforward_stack: Vec::new(),
             replaying: false,
@@ -213,6 +215,7 @@ impl Runtime {
     ) {
         self.persistent = Value::Dict(vars);
         self.achievements = achievements;
+        self.achievements_dirty = false;
         self.sync_persistent_vars();
     }
 
@@ -224,6 +227,10 @@ impl Runtime {
             .state
             .variables
             .insert("persistent".into(), self.persistent.clone());
+        self.sync_achievements();
+    }
+
+    fn sync_achievements(&mut self) {
         let achieved: Vec<Value> = self
             .achievements
             .iter()
@@ -247,12 +254,13 @@ impl Runtime {
     /// Whether the live `persistent` var differs from the last-flushed
     /// copy (host uses this to decide when to write the store file).
     pub fn persistent_dirty(&self) -> bool {
-        self.persistent() != &self.persistent
+        self.achievements_dirty || self.persistent() != &self.persistent
     }
 
     /// Mark the live store as flushed to disk.
     pub fn mark_persistent_clean(&mut self) {
         self.persistent = self.persistent().clone();
+        self.achievements_dirty = false;
     }
 
     /// Record a `grant` achievement; returns `true` on first grant
@@ -261,7 +269,8 @@ impl Runtime {
     pub fn grant_achievement(&mut self, name: &str) -> bool {
         let first = self.achievements.insert(name.to_string());
         if first {
-            self.sync_persistent_vars();
+            self.achievements_dirty = true;
+            self.sync_achievements();
         }
         first
     }
@@ -518,7 +527,7 @@ impl Runtime {
         let mut rt = Self::new(script);
         let mut ji = 0;
         for _ in 0..100_000 {
-            match rt.step() {
+            match rt.resume_display() {
                 RuntimeEvent::Menu { choices, .. } => {
                     let Some(&JournalEntry::Menu(choice)) = journal.get(ji) else {
                         return Err(format!("journal exhausted at menu #{ji}"));
@@ -553,17 +562,17 @@ impl Runtime {
                     ji += 1;
                     rt.resume_confirm(yes);
                 }
-                RuntimeEvent::Finished => break,
+                RuntimeEvent::Finished if ji == journal.len() => return Ok(rt),
+                RuntimeEvent::Finished => {
+                    return Err(format!(
+                        "journal has {} unplayed entries",
+                        journal.len() - ji
+                    ));
+                }
                 RuntimeEvent::Effect(_) | RuntimeEvent::Blocking(_) => {}
             }
         }
-        if ji != journal.len() {
-            return Err(format!(
-                "journal has {} unplayed entries",
-                journal.len() - ji
-            ));
-        }
-        Ok(rt)
+        Err("replay exceeded its step limit".into())
     }
 
     /// Roll back to the previous blocking point (dialogue line or menu),
@@ -635,7 +644,7 @@ impl Runtime {
         match next {
             Some(t) => {
                 st.queue.remove(0);
-                st.current = Some(t.clone());
+                st.start(t.clone());
                 Some(t)
             }
             None => {
@@ -698,21 +707,24 @@ impl Runtime {
                         // Without `onlayer` the default stage is reset:
                         // the background swaps and foreground sprites
                         // (where characters live) exit.
+                        let sprite_layer = layer.unwrap_or(vnengine_core::model::Layer::Foreground);
                         let layer = layer.unwrap_or(vnengine_core::model::Layer::Background);
-                        let sprite_layer = if layer == vnengine_core::model::Layer::Background {
-                            vnengine_core::model::Layer::Foreground
-                        } else {
-                            layer
-                        };
                         self.scene
                             .hide_sprites_on_layer(sprite_layer, transition.clone());
                         if layer == vnengine_core::model::Layer::Background {
                             let duration = transition.default_duration();
-                            if duration > 0.0 && self.scene.background.is_some() {
+                            let has_background =
+                                self.scene.background.is_some() || !self.scene.bg_layers.is_empty();
+                            if duration > 0.0 && has_background {
                                 self.scene.prev_background = self.scene.background.take();
+                                self.scene.prev_bg_layers =
+                                    std::mem::take(&mut self.scene.bg_layers);
                                 self.scene.prev_bg_opacity = 1.0;
                                 self.scene.bg_opacity = 0.0;
                             } else {
+                                self.scene.prev_background = None;
+                                self.scene.prev_bg_layers.clear();
+                                self.scene.prev_bg_opacity = 0.0;
                                 self.scene.bg_opacity = 1.0;
                             }
                             self.scene.background = image.clone();
@@ -842,23 +854,14 @@ impl Runtime {
                         fade,
                         loop_,
                     } => {
-                        self.channels.insert(
-                            channel.clone(),
-                            ChannelState {
-                                current: Some(ChannelTrack {
-                                    track: track.clone(),
-                                    volume,
-                                    fade,
-                                    loop_,
-                                }),
-                                queue: Vec::new(),
-                                ..self
-                                    .channels
-                                    .get(channel.as_str())
-                                    .cloned()
-                                    .unwrap_or_default()
-                            },
-                        );
+                        let state = self.channels.entry(channel.clone()).or_default();
+                        state.queue.clear();
+                        state.start(ChannelTrack {
+                            track: track.clone(),
+                            volume,
+                            fade,
+                            loop_,
+                        });
                         return RuntimeEvent::Effect(cmd);
                     }
                     Command::QueueChannel {
@@ -876,7 +879,7 @@ impl Runtime {
                         };
                         let st = self.channels.entry(channel.clone()).or_default();
                         if st.current.is_none() {
-                            st.current = Some(ct);
+                            st.start(ct);
                         } else {
                             st.queue.push(ct);
                         }

@@ -1564,6 +1564,22 @@ fn expr_dict_literal_and_access() {
 }
 
 #[test]
+fn expr_string_repeat_rejects_oversized_output() {
+    use crate::vm::eval_expr;
+    use std::collections::HashMap;
+    use vnengine_core::Value;
+
+    let vars = HashMap::new();
+    let expr = Parser::parse_expr(r#""abc" * 9223372036854775807"#);
+    assert_eq!(
+        eval_expr(&expr, &vars).unwrap_err(),
+        "string repetition too large"
+    );
+    let expr = Parser::parse_expr(r#""é" * 3"#);
+    assert_eq!(eval_expr(&expr, &vars).unwrap(), Value::Str("ééé".into()));
+}
+
+#[test]
 fn expr_slicing() {
     use crate::vm::eval_expr;
     use std::collections::HashMap;

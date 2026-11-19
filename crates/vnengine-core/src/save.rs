@@ -60,6 +60,9 @@ pub struct ChannelState {
     /// Currently playing track, if any.
     #[serde(default)]
     pub current: Option<ChannelTrack>,
+    /// Changes whenever the channel starts a new playback.
+    #[serde(default)]
+    pub playback_id: u64,
     /// Pending queue — consumed by `Runtime::channel_advance` when the
     /// host reports the current track ended.
     #[serde(default)]
@@ -73,6 +76,13 @@ pub struct ChannelState {
     pub filter: Option<crate::command::ChannelFilter>,
 }
 
+impl ChannelState {
+    pub fn start(&mut self, track: ChannelTrack) {
+        self.playback_id = self.playback_id.wrapping_add(1);
+        self.current = Some(track);
+    }
+}
+
 fn one_f32() -> f32 {
     1.0
 }
@@ -81,6 +91,7 @@ impl Default for ChannelState {
     fn default() -> Self {
         Self {
             current: None,
+            playback_id: 0,
             queue: Vec::new(),
             volume: 1.0,
             filter: None,
@@ -212,7 +223,14 @@ impl PersistentStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        serde_json::to_writer_pretty(file.as_file_mut(), self)?;
+        file.as_file().sync_all()?;
+        file.persist(path)?;
         Ok(())
     }
 }

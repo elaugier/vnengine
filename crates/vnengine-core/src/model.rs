@@ -189,6 +189,8 @@ pub struct Scene {
     pub bg_opacity: f32,
     /// Previous background kept around during a transition.
     pub prev_background: Option<String>,
+    #[serde(default)]
+    pub prev_bg_layers: Vec<SpriteLayer>,
     pub prev_bg_opacity: f32,
     /// Background zoom factor (1.0 = fitted). Animated by `zoom`.
     #[serde(default = "default_zoom")]
@@ -244,6 +246,7 @@ impl Default for Scene {
             background: None,
             bg_opacity: 0.0,
             prev_background: None,
+            prev_bg_layers: Vec::new(),
             prev_bg_opacity: 0.0,
             bg_zoom: 1.0,
             prev_bg_zoom: 1.0,

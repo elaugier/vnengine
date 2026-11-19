@@ -446,6 +446,7 @@ impl App {
             match cmd {
                 Command::Scene { .. } => {
                     scene.prev_background = None;
+                    scene.prev_bg_layers.clear();
                     scene.prev_bg_opacity = 0.0;
                     scene.bg_opacity = 1.0;
                     scene.bg_zoom = 1.0;
@@ -481,15 +482,20 @@ impl App {
             }
         }
         match cmd {
-            Command::Scene { transition, .. } => {
+            Command::Scene {
+                transition,
+                layer: Some(vnengine_core::model::Layer::Background),
+                ..
+            } => {
                 let duration = transition.default_duration();
-                if duration > 0.0 && self.runtime.scene.prev_background.is_some() {
-                    self.transition = Some(ActiveTransition {
-                        transition,
-                        elapsed: 0.0,
-                        duration,
-                    });
-                }
+                let scene = &self.runtime.scene;
+                self.transition = (duration > 0.0
+                    && (scene.prev_background.is_some() || !scene.prev_bg_layers.is_empty()))
+                .then_some(ActiveTransition {
+                    transition,
+                    elapsed: 0.0,
+                    duration,
+                });
             }
             // PlayMusic/StopMusic are handled by `resync_music`, which
             // follows `runtime.music` and also covers load/rollback.
@@ -509,17 +515,20 @@ impl App {
                     .and_then(|a| a.desc.clone())
                     .unwrap_or_else(|| name.clone());
                 self.ach_toast = Some((format!("Achievement unlocked: {title}"), 4.0));
-                self.flush_persistent();
+                let _ = self.flush_persistent();
             }
             Command::StopAll { fade } => self.audio.stop_all(fade),
-            // PlayChannel/QueueChannel/StopChannel/VolumeChannel/
-            // FilterChannel are handled by `resync_channels`, which
-            // diffs `runtime.channels` every frame — also covering
-            // queue advance, load and rollback.
+            Command::StopChannel { ref channel, fade } => self.audio.stop_channel(channel, fade),
+            Command::VolumeChannel {
+                ref channel,
+                volume,
+                fade,
+            } => {
+                self.audio.set_channel_volume(channel, volume, fade);
+            }
+            // Playback, queue advancement and filters follow runtime state.
             Command::PlayChannel { .. }
             | Command::QueueChannel { .. }
-            | Command::StopChannel { .. }
-            | Command::VolumeChannel { .. }
             | Command::FilterChannel { .. } => {}
             Command::PlayTransition(transition) => {
                 let duration = transition.default_duration();
@@ -781,7 +790,7 @@ impl App {
 
         // Flush the persistent store when scripts changed it.
         if self.runtime.persistent_dirty() {
-            self.flush_persistent();
+            let _ = self.flush_persistent();
         }
         if let Some((_, t)) = &mut self.ach_toast {
             *t -= dt;
@@ -882,6 +891,7 @@ impl App {
             }
             if t.elapsed >= t.duration {
                 self.runtime.scene.prev_background = None;
+                self.runtime.scene.prev_bg_layers.clear();
                 self.runtime.scene.prev_bg_opacity = 0.0;
                 self.runtime.scene.bg_opacity = 1.0;
                 self.runtime.scene.bg_zoom = 1.0;
@@ -2573,7 +2583,7 @@ impl App {
 
     /// Write `<save_dir>/persistent.json` with the live persistent vars
     /// and granted achievements, then mark the runtime copy clean.
-    fn flush_persistent(&mut self) {
+    fn flush_persistent(&mut self) -> anyhow::Result<PersistentStore> {
         let vars = match self.runtime.persistent() {
             Value::Dict(d) => d.clone(),
             _ => Default::default(),
@@ -2586,16 +2596,18 @@ impl App {
             .save_root
             .join(&self.config.save_dir)
             .join("persistent.json");
-        if let Err(e) = store.save(&path) {
+        store.save(&path).map_err(|e| {
             log::warn!("failed to write persistent store: {e}");
-        }
+            e
+        })?;
         self.runtime.mark_persistent_clean();
+        Ok(store)
     }
 
     /// Load the game from a slot.
     pub fn load(&mut self, slot: u32) -> anyhow::Result<()> {
         // Preserve in-session persistent data before overwriting state.
-        self.flush_persistent();
+        let persistent = self.flush_persistent()?;
         let save_dir = self.save_root.join(&self.config.save_dir);
         let state = SaveState::read(&save_dir, slot)?;
         let vm_state: vnengine_script::vm::VmState = serde_json::from_slice(&state.vm_state)?;
@@ -2613,14 +2625,6 @@ impl App {
                 window_mode: state.window_mode,
                 channels: state.channels,
             },
-        );
-        // persistent.* vars and achievements live outside save slots —
-        // re-inject the on-disk copy into the restored runtime.
-        let persistent = PersistentStore::load(
-            &self
-                .save_root
-                .join(&self.config.save_dir)
-                .join("persistent.json"),
         );
         self.runtime
             .set_persistent(persistent.vars, persistent.achievements);
@@ -2711,7 +2715,7 @@ impl winit::application::ApplicationHandler for AppHandler {
                 }
             }
             winit::event::WindowEvent::CloseRequested => {
-                app.flush_persistent();
+                let _ = app.flush_persistent();
                 event_loop.exit();
             }
             winit::event::WindowEvent::RedrawRequested => {

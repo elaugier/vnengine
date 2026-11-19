@@ -15,7 +15,7 @@ use kira::{
 use std::time::Duration;
 use vnengine_core::assets::{AssetSource, AUDIO_EXTS};
 use vnengine_core::command::ChannelFilter;
-use vnengine_core::save::ChannelState;
+use vnengine_core::save::{ChannelState, ChannelTrack};
 use vnengine_core::settings::UserSettings;
 
 /// A looping adaptive-music stem layered over the base BGM.
@@ -33,8 +33,9 @@ struct StemLayer {
 struct ChannelAudio {
     track: TrackHandle,
     playing: Option<kira::sound::static_sound::StaticSoundHandle>,
-    /// Track path loaded in `playing` — drives the resync diff.
-    playing_track: String,
+    /// Playback identity and settings last applied to the channel.
+    playback: Option<(u64, ChannelTrack)>,
+    gain: Option<f64>,
     filter: FilterHandle,
     reverb: ReverbHandle,
     /// Last applied effect config (idempotent resync).
@@ -289,7 +290,7 @@ impl AudioEngine {
     /// refuses the track (resource limit) — logged.
     fn ensure_channel(&mut self, name: &str) -> Option<&mut ChannelAudio> {
         if !self.channels.contains_key(name) {
-            let mut builder = TrackBuilder::new();
+            let mut builder = TrackBuilder::new().persist_until_sounds_finish(true);
             let filter = builder.add_effect(FilterBuilder::new().mix(Mix(0.0)));
             let reverb = builder.add_effect(ReverbBuilder::new().mix(Mix(0.0)));
             match self.manager.add_sub_track(builder) {
@@ -299,7 +300,8 @@ impl AudioEngine {
                         ChannelAudio {
                             track,
                             playing: None,
-                            playing_track: String::new(),
+                            playback: None,
+                            gain: None,
                             filter,
                             reverb,
                             applied_filter: None,
@@ -350,16 +352,23 @@ impl AudioEngine {
             };
             // Channel gain rides on the sub-track; per-sound volume is
             // baked into the sound settings.
-            ch.track
-                .set_volume(db_from_linear(sfx_vol * st.volume as f64), Tween::default());
+            ch.set_gain(sfx_vol * st.volume as f64, Tween::default());
             match &st.current {
-                Some(ct) if ch.playing_track != ct.track => {
+                Some(ct)
+                    if ch
+                        .playback
+                        .as_ref()
+                        .is_none_or(|(id, track)| *id != st.playback_id || track != ct) =>
+                {
                     if let Some(mut h) = ch.playing.take() {
                         h.stop(tween_of(ct.fade));
                     }
-                    ch.playing_track.clear();
+                    ch.playback = Some((st.playback_id, ct.clone()));
                     let mut settings =
                         StaticSoundSettings::new().volume(db_from_linear(ct.volume as f64));
+                    if ct.fade > 0.0 {
+                        settings = settings.fade_in_tween(tween_of(ct.fade));
+                    }
                     if ct.loop_ {
                         settings = settings.loop_region(0.0..);
                     }
@@ -367,7 +376,6 @@ impl AudioEngine {
                         Ok(data) => match ch.track.play(data) {
                             Ok(h) => {
                                 ch.playing = Some(h);
-                                ch.playing_track = ct.track.clone();
                             }
                             Err(e) => {
                                 log::warn!(
@@ -387,22 +395,21 @@ impl AudioEngine {
                 None => {
                     if let Some(mut h) = ch.playing.take() {
                         h.stop(tween_of(0.3));
-                        ch.playing_track.clear();
                     }
+                    ch.playback = None;
                 }
                 _ => {}
             }
             // Report a finished non-looping current so the caller can
             // advance the queue (or drop the stale `current`).
             if let Some(ct) = &st.current {
-                if !ct.loop_ {
-                    let done = match &ch.playing {
-                        Some(h) => h.state() == PlaybackState::Stopped,
-                        None => false,
-                    };
-                    if done {
-                        finished.push(name.clone());
-                    }
+                let done = match &ch.playing {
+                    Some(h) => !ct.loop_ && h.state() == PlaybackState::Stopped,
+                    None => true, // A failed track must not stall the queue.
+                };
+                if done {
+                    ch.playback = None;
+                    finished.push(name.clone());
                 }
             }
             // Apply effect config only when it changed.
@@ -418,11 +425,38 @@ impl AudioEngine {
     pub fn stop_all(&mut self, fade: f32) {
         self.stop_music(fade);
         self.stop_voice();
-        for (_, ch) in self.channels.iter_mut() {
-            if let Some(mut h) = ch.playing.take() {
-                h.stop(tween_of(fade));
-                ch.playing_track.clear();
-            }
+        for ch in self.channels.values_mut() {
+            ch.stop(fade);
+        }
+    }
+
+    pub fn stop_channel(&mut self, name: &str, fade: f32) {
+        if let Some(ch) = self.channels.get_mut(name) {
+            ch.stop(fade);
+            ch.gain = None;
+        }
+    }
+
+    pub fn set_channel_volume(&mut self, name: &str, volume: f32, fade: f32) {
+        let gain = self.settings.sfx_volume * f64::from(volume);
+        if let Some(ch) = self.ensure_channel(name) {
+            ch.set_gain(gain, tween_of(fade));
+        }
+    }
+}
+
+impl ChannelAudio {
+    fn stop(&mut self, fade: f32) {
+        if let Some(mut h) = self.playing.take() {
+            h.stop(tween_of(fade));
+        }
+        self.playback = None;
+    }
+
+    fn set_gain(&mut self, gain: f64, tween: Tween) {
+        if self.gain != Some(gain) {
+            self.track.set_volume(db_from_linear(gain), tween);
+            self.gain = Some(gain);
         }
     }
 }

@@ -718,9 +718,9 @@ label start:
     for _ in 0..10 {
         rt.update(0.5);
     }
-    // Infinite repeat: the track never retires.
+    // Five seconds across two half-second steps per iteration.
     assert_eq!(rt.scene.sprites[0].anims.len(), 1);
-    assert!(rt.scene.sprites[0].anims[0].iteration >= 9);
+    assert_eq!(rt.scene.sprites[0].anims[0].iteration, 5);
 }
 
 #[test]
@@ -889,6 +889,30 @@ label start:
     assert_eq!(rt.scene.sprites[0].layers[1].image, "b.png");
 }
 
+#[test]
+fn scene_transition_keeps_the_outgoing_composite_and_targets_the_explicit_layer() {
+    let mut rt = runtime(
+        r#"
+image duo:
+    "a.png"
+    "b.png"
+
+label start:
+    scene duo
+    show e happy at center
+    show tree at left layer=background
+    scene park with blinds onlayer background
+    "arrived"
+"#,
+    );
+    assert_eq!(blocking_text(&next_block(&mut rt)), "arrived");
+    assert_eq!(rt.scene.background.as_deref(), Some("park"));
+    assert_eq!(rt.scene.prev_bg_layers.len(), 2);
+    assert_eq!(rt.scene.prev_bg_layers[1].image, "b.png");
+    assert_eq!(rt.scene.sprites.len(), 1);
+    assert_eq!(rt.scene.sprites[0].character, "e");
+}
+
 // ============ Phase 3: screens / input / confirm / nvl / window ============
 
 #[test]
@@ -961,8 +985,7 @@ label start:
 
 #[test]
 fn call_screen_set_action_stays_up() {
-    let mut rt = runtime(
-        r##"
+    let src = r##"
 screen counter:
     button "Add" x=0.2 y=0.4:
         set count = count + 1
@@ -973,8 +996,8 @@ label start:
     $ count = 0
     call screen counter
     "final [count]"
-"##,
-    );
+"##;
+    let mut rt = runtime(src);
     match next_block(&mut rt) {
         RuntimeEvent::Screen { .. } => {}
         other => panic!("expected Screen, got {other:?}"),
@@ -986,6 +1009,10 @@ label start:
     rt.resume_screen(1); // "Done" — dismisses.
     assert!(!rt.is_on_screen());
     assert_eq!(blocking_text(&next_block(&mut rt)), "final 2");
+
+    let replay = Runtime::replay(Parser::parse(src).unwrap(), &rt.journal).unwrap();
+    assert_eq!(replay.vm.state.variables["count"], Value::Int(2));
+    assert_eq!(replay.history.last().unwrap().text, "final 2");
 }
 
 #[test]
@@ -1018,7 +1045,7 @@ label start:
     let journal = rt.journal.clone();
     assert_eq!(journal.len(), 2);
     let script = Parser::parse(src).unwrap();
-    let mut rt2 = Runtime::replay(script, &journal).unwrap();
+    let rt2 = Runtime::replay(script, &journal).unwrap();
     // Same variable state → the same line was produced.
     assert_eq!(
         rt2.history.last().map(|h| h.text.as_str()),
@@ -1125,7 +1152,7 @@ label target:
     loop {
         match rt.step() {
             RuntimeEvent::Effect(_) => {}
-            ev => break,
+            _ => break,
         }
     }
     assert_eq!(rt.screens.len(), 1);
@@ -1144,7 +1171,7 @@ fn channel_play_queue_and_advance() {
 label start:
     play channel amb "wind.ogg" loop
     queue channel amb "rain.ogg"
-    queue channel amb "storm.ogg"
+    queue channel amb "rain.ogg"
     "hold"
 "##,
     );
@@ -1170,11 +1197,9 @@ label start:
     );
     assert_eq!(rt.channels["amb"].queue.len(), 1);
 
-    rt.channel_advance("amb");
-    assert_eq!(
-        rt.channels["amb"].current.as_ref().unwrap().track,
-        "storm.ogg"
-    );
+    let first_rain_id = rt.channels["amb"].playback_id;
+    assert_eq!(rt.channel_advance("amb").unwrap(), next);
+    assert_ne!(rt.channels["amb"].playback_id, first_rain_id);
     // Last track finished, queue empty → channel state released.
     assert!(rt.channel_advance("amb").is_none());
     assert!(!rt.channels.contains_key("amb"));
@@ -1311,6 +1336,32 @@ label start:
         Some(Value::Dict(m)) => assert_eq!(m.get("count"), Some(&Value::Int(1))),
         other => panic!("persistent not injected, got {other:?}"),
     }
+}
+
+#[test]
+fn achievement_keeps_unflushed_persistent_values() {
+    let mut rt = runtime(
+        r#"
+achievement first
+label start:
+    $ persistent.score = 42
+    grant first
+    end
+"#,
+    );
+    drive_to_end(&mut rt);
+    assert!(rt.achieved("first"));
+    assert!(rt.persistent_dirty());
+    let Value::Dict(vars) = rt.persistent() else {
+        panic!("expected a dict")
+    };
+    assert_eq!(vars["score"], Value::Int(42));
+
+    rt.mark_persistent_clean();
+    rt.grant_achievement("second");
+    assert!(rt.persistent_dirty());
+    rt.mark_persistent_clean();
+    assert!(!rt.persistent_dirty());
 }
 
 #[test]

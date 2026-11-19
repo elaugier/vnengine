@@ -3022,7 +3022,24 @@ pub(crate) fn eval_binop_pub(op: BinaryOp, l: Value, r: Value) -> Result<Value, 
                 if *n <= 0 {
                     Value::Str(String::new())
                 } else {
-                    Value::Str(s.repeat(*n as usize))
+                    // Keep a single expression from allocating an unbounded string.
+                    const MAX_REPEAT_BYTES: usize = 16 * 1024 * 1024;
+                    let count = usize::try_from(*n).map_err(|_| "string repetition too large")?;
+                    let bytes = s
+                        .len()
+                        .checked_mul(count)
+                        .filter(|&bytes| bytes <= MAX_REPEAT_BYTES)
+                        .ok_or("string repetition too large")?;
+                    let mut repeated = String::new();
+                    repeated
+                        .try_reserve_exact(bytes)
+                        .map_err(|_| "cannot allocate repeated string")?;
+                    if !s.is_empty() {
+                        for _ in 0..count {
+                            repeated.push_str(s);
+                        }
+                    }
+                    Value::Str(repeated)
                 }
             }
             _ => num_op(l, r, |a, b| a * b, |a, b| a * b)?,

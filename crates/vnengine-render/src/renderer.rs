@@ -254,7 +254,7 @@ impl Renderer {
                     self.textures.ensure_loaded(src, image_dir, &l.image);
                 }
             }
-            for l in &scene.bg_layers {
+            for l in scene.bg_layers.iter().chain(&scene.prev_bg_layers) {
                 self.textures.ensure_loaded(src, image_dir, &l.image);
             }
             for lb in scene.layer_bgs.values() {
@@ -295,85 +295,57 @@ impl Renderer {
                 .map(|(t, p)| FxParams::of(t, *p))
                 .unwrap_or(FxParams::NONE);
             let immediates = self.immediates;
-            // Background.
-            if let Some(bg) = &scene.background {
-                if let Some(img) = self.textures.get(bg) {
-                    let mut quad =
-                        full_screen_quad(img.width, img.height, screen_aspect, scene.bg_opacity);
-                    quad.hw *= scene.bg_zoom;
-                    quad.hh *= scene.bg_zoom;
-                    quad.offset = scene.bg_offset;
-                    apply_camera(&mut quad, BG_PARALLAX, &scene.camera);
-                    let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
-                    draw_textured(
-                        &mut pass,
-                        &self.textured_pipeline,
-                        &self.device,
-                        &self.bind_group_layout,
-                        &self.sampler,
-                        img,
-                        &verts,
-                        frame_fx,
-                        immediates,
-                    );
-                }
-            }
-            // Composite layers of the default background.
-            for l in &scene.bg_layers {
-                if let Some(img) = self.textures.get(&l.image) {
-                    let mut quad = full_screen_quad(
-                        img.width,
-                        img.height,
-                        screen_aspect,
-                        scene.bg_opacity * l.alpha,
-                    );
-                    quad.hw *= scene.bg_zoom * l.zoom;
-                    quad.hh *= scene.bg_zoom * l.zoom;
-                    quad.offset = [
-                        scene.bg_offset[0] + l.offset[0],
-                        scene.bg_offset[1] + l.offset[1],
-                    ];
-                    apply_camera(&mut quad, BG_PARALLAX, &scene.camera);
-                    let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
-                    draw_textured(
-                        &mut pass,
-                        &self.textured_pipeline,
-                        &self.device,
-                        &self.bind_group_layout,
-                        &self.sampler,
-                        img,
-                        &verts,
-                        frame_fx,
-                        immediates,
-                    );
-                }
-            }
-            // Previous background (for cross-fades) — the outgoing
-            // frame is never masked.
-            if let Some(bg) = &scene.prev_background {
-                if let Some(img) = self.textures.get(bg) {
-                    let mut quad = full_screen_quad(
-                        img.width,
-                        img.height,
-                        screen_aspect,
-                        scene.prev_bg_opacity,
-                    );
-                    quad.hw *= scene.prev_bg_zoom;
-                    quad.hh *= scene.prev_bg_zoom;
-                    quad.offset = scene.prev_bg_offset;
-                    apply_camera(&mut quad, BG_PARALLAX, &scene.camera);
-                    let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
-                    draw_textured(
-                        &mut pass,
-                        &self.textured_pipeline,
-                        &self.device,
-                        &self.bind_group_layout,
-                        &self.sampler,
-                        img,
-                        &verts,
-                        FxParams::NONE,
-                        immediates,
-                    );
+            let current = (
+                scene.background.as_deref(),
+                scene.bg_layers.as_slice(),
+                scene.bg_opacity,
+                scene.bg_zoom,
+                scene.bg_offset,
+                frame_fx,
+            );
+            let previous = (
+                scene.prev_background.as_deref(),
+                scene.prev_bg_layers.as_slice(),
+                scene.prev_bg_opacity,
+                scene.prev_bg_zoom,
+                scene.prev_bg_offset,
+                FxParams::NONE,
+            );
+            // Masked transitions reveal the incoming background over the outgoing one.
+            let backgrounds = if scene.trans_fx.is_some() {
+                [previous, current]
+            } else {
+                [current, previous]
+            };
+            for (image, layers, opacity, zoom, offset, fx) in backgrounds {
+                let layer_quads = layers
+                    .iter()
+                    .map(|layer| (layer.image.as_str(), layer.alpha, layer.zoom, layer.offset));
+                for (path, alpha, scale, shift) in image
+                    .map(|path| (path, 1.0, 1.0, [0.0, 0.0]))
+                    .into_iter()
+                    .chain(layer_quads)
+                {
+                    if let Some(img) = self.textures.get(path) {
+                        let mut quad =
+                            full_screen_quad(img.width, img.height, screen_aspect, opacity * alpha);
+                        quad.hw *= zoom * scale;
+                        quad.hh *= zoom * scale;
+                        quad.offset = [offset[0] + shift[0], offset[1] + shift[1]];
+                        apply_camera(&mut quad, BG_PARALLAX, &scene.camera);
+                        let verts = quad_vertices_lit(&quad, &scene.lights, scene.ambient);
+                        draw_textured(
+                            &mut pass,
+                            &self.textured_pipeline,
+                            &self.device,
+                            &self.bind_group_layout,
+                            &self.sampler,
+                            img,
+                            &verts,
+                            fx,
+                            immediates,
+                        );
+                    }
                 }
             }
 

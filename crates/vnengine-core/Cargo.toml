@@ -11,3 +11,4 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 glam = { workspace = true }
 log = { workspace = true }
+tempfile = "3"
