@@ -23,6 +23,11 @@ pub struct EngineConfig {
     pub audio_dir: String,
     /// Directory containing voice assets.
     pub voice_dir: String,
+    /// Directory containing font files (.ttf, .otf).
+    /// Loaded into the text engine at startup; families can be selected
+    /// with `font default "<family>"` in the script or `font=` on screens.
+    #[serde(default = "default_font_dir")]
+    pub font_dir: String,
     /// Directory for save files.
     pub save_dir: String,
     /// Default text speed in characters per second (0 = instant).
@@ -30,6 +35,10 @@ pub struct EngineConfig {
     /// Names of characters for the script `define` block, keyed by id.
     #[serde(default)]
     pub characters: Vec<CharacterDef>,
+}
+
+fn default_font_dir() -> String {
+    "fonts".to_string()
 }
 
 /// A character definition (id -> display name + color).
@@ -53,6 +62,7 @@ impl Default for EngineConfig {
             image_dir: "images".to_string(),
             audio_dir: "audio".to_string(),
             voice_dir: "voice".to_string(),
+            font_dir: default_font_dir(),
             save_dir: "saves".to_string(),
             text_speed: 40.0,
             characters: Vec::new(),

@@ -25,6 +25,9 @@ pub struct Script {
     /// Achievement definitions (`achievement <name> ["desc"]`).
     #[serde(default)]
     pub achievements: Vec<AchievementDef>,
+    /// Default font family (`font default "<family>"` at top level).
+    #[serde(default)]
+    pub font_default: Option<String>,
 }
 
 impl Script {
@@ -78,13 +81,15 @@ pub enum ScreenStmt {
         h: Expr,
         color: Option<Expr>,
     },
-    /// `text <expr> x=<e> y=<e> [size=<e>] [color=<e>]`
+    /// `text <expr> x=<e> y=<e> [size=<e>] [color=<e>] [font=<e>]`
     Text {
         text: Expr,
         x: Expr,
         y: Expr,
         size: Option<Expr>,
         color: Option<Expr>,
+        #[serde(default)]
+        font: Option<Expr>,
     },
     /// `image <expr> x=<e> y=<e> [w=<e>] [h=<e>] [alpha=<e>]`
     Image {
@@ -95,7 +100,7 @@ pub enum ScreenStmt {
         h: Option<Expr>,
         alpha: Option<Expr>,
     },
-    /// `button <label-expr> x=<e> y=<e> [w=<e>] [h=<e>]: <actions>`
+    /// `button <label-expr> x=<e> y=<e> [w=<e>] [h=<e>] [color=<e>] [font=<e>]: <actions>`
     Button {
         label: Expr,
         x: Expr,
@@ -103,6 +108,8 @@ pub enum ScreenStmt {
         w: Option<Expr>,
         h: Option<Expr>,
         color: Option<Expr>,
+        #[serde(default)]
+        font: Option<Expr>,
         actions: Vec<ButtonAction>,
     },
     /// `if <expr>:` — children emit only when truthy.

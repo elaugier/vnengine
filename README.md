@@ -5,7 +5,7 @@ A cross-platform visual novel engine written in Rust, inspired by Ren'Py.
 ## Features
 
 - **Custom DSL** (`.vn` files) for writing visual novels with a Ren'Py-like syntax
-- **Cross-platform** rendering via wgpu (Desktop, Web, Mobile)
+- **Cross-platform desktop** rendering via wgpu (Windows, Linux, macOS). Web and mobile are planned targets — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the roadmap.
 - **Text rendering** with glyphon (cosmic-text + wgpu) supporting Unicode and emoji
 - **Audio** engine (BGM, SFX, voice) powered by kira
 - **Save/load** system with multiple slots

@@ -2958,3 +2958,62 @@ label start:
         _ => {}
     }
 }
+
+#[test]
+fn parse_font_default_top_level() {
+    let src = r##"
+font default "MyCustomFont"
+label start:
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    assert_eq!(script.font_default.as_deref(), Some("MyCustomFont"));
+}
+
+#[test]
+fn parse_screen_text_and_button_font_kwarg() {
+    let src = r##"
+screen s:
+    text "hello" x=0.1 y=0.1 font="DisplayFont"
+    button "ok" x=0.1 y=0.5 font="ButtonFont":
+        return
+label start:
+    end
+"##;
+    let script = Parser::parse(src).unwrap();
+    let screen = &script.screens[0];
+    match &screen.body[0] {
+        crate::ast::ScreenStmt::Text { font, .. } => {
+            assert!(font.is_some());
+        }
+        _ => panic!("expected Text"),
+    }
+    match &screen.body[1] {
+        crate::ast::ScreenStmt::Button { font, .. } => {
+            assert!(font.is_some());
+        }
+        _ => panic!("expected Button"),
+    }
+    // Resolve the screen and check the font_family lands on UiNodes.
+    let mut vm = Vm::new(script);
+    let (inst, _) = vm.resolve_screen("s").unwrap();
+    assert_eq!(inst.nodes[0].font_family.as_deref(), Some("DisplayFont"));
+    assert_eq!(inst.nodes[1].font_family.as_deref(), Some("ButtonFont"));
+}
+
+#[test]
+fn font_default_rejects_trailing_tokens() {
+    assert!(Parser::parse("font default \"Font\" extra\nlabel start:\n    end\n").is_err());
+}
+
+#[test]
+fn legacy_screen_nodes_deserialize_without_font() {
+    let script = Parser::parse("screen s:\n    text \"hello\" x=0 y=0\n    button \"ok\" x=0 y=0:\n        return\nlabel start:\n    end\n").unwrap();
+    let mut json = serde_json::to_value(&script).unwrap();
+    let nodes = json["screens"][0]["body"].as_array_mut().unwrap();
+    for node in nodes {
+        let fields = node.as_object_mut().unwrap().values_mut().next().unwrap();
+        fields.as_object_mut().unwrap().remove("font");
+    }
+    assert!(serde_json::from_value::<crate::ast::Script>(json).is_ok());
+}

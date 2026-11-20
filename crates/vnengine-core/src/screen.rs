@@ -64,6 +64,9 @@ pub struct UiNode {
     /// Whether `text` contains rich-text tags.
     #[serde(default)]
     pub rich: bool,
+    /// Optional font family override for `Text`/`Button` labels.
+    #[serde(default)]
+    pub font_family: Option<String>,
 }
 
 fn default_color() -> [f32; 4] {

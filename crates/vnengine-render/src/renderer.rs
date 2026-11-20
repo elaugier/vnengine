@@ -105,6 +105,9 @@ pub struct Renderer {
     /// Whether the device supports `set_immediates` (masked
     /// transitions). False degrades masks to plain draws.
     pub immediates: bool,
+    /// Default font family for all UI text (set from the script's
+    /// `font default "..."`). `None` = system sans-serif.
+    pub default_font: Option<String>,
 }
 
 impl Renderer {
@@ -185,6 +188,7 @@ impl Renderer {
             color_pipeline,
             bind_group_layout,
             immediates,
+            default_font: None,
         })
     }
 
@@ -697,13 +701,17 @@ impl Renderer {
         // --- Text pass ---
         {
             let mut buffers: Vec<glyphon::Buffer> = Vec::new();
+            let default_font = self.default_font.as_deref();
             for t in &ui.text {
                 let mut buf = self.text.new_buffer(t.font_size, self.config.width);
+                let fam = t.font_family.as_deref();
                 if t.rich {
                     let segments = crate::richtext::parse_rich_text(&t.text);
-                    self.text.set_rich_text(&mut buf, &segments, t.color);
+                    self.text
+                        .set_rich_text(&mut buf, &segments, t.color, fam, default_font);
                 } else {
-                    self.text.set_text(&mut buf, &t.text, t.color);
+                    self.text
+                        .set_text(&mut buf, &t.text, t.color, fam, default_font);
                 }
                 buffers.push(buf);
             }
@@ -761,6 +769,9 @@ pub struct UiText {
     /// If true, the text contains formatting tags ({b}, {i}, {color=}, etc.)
     /// and will be parsed as rich text.
     pub rich: bool,
+    /// Font family override (e.g. "MyFont"). When `None`, the renderer's
+    /// `default_font` is used, falling back to the system sans-serif.
+    pub font_family: Option<String>,
 }
 
 /// An image to render in the UI layer.

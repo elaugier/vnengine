@@ -231,6 +231,36 @@ impl Parser {
                     script.screens.push(def);
                     idx += consumed;
                 }
+                Token::Ident(s) if s == "font" => {
+                    // `font default "<family>"` — set the default UI font.
+                    match line.tokens.get(1).map(|t| &t.token) {
+                        Some(Token::Default) => {}
+                        _ => {
+                            return Err(err(
+                                line.line_no,
+                                "expected `font default \"<family>\"`".to_string(),
+                            ))
+                        }
+                    }
+                    let family = match line.tokens.get(2).map(|t| &t.token) {
+                        Some(Token::StringLit(f)) => f.clone(),
+                        Some(Token::Ident(f)) => f.clone(),
+                        _ => {
+                            return Err(err(
+                                line.line_no,
+                                "expected font family name (string)".to_string(),
+                            ))
+                        }
+                    };
+                    if line.tokens.len() != 3 {
+                        return Err(err(
+                            line.line_no,
+                            "unexpected tokens after font family".to_string(),
+                        ));
+                    }
+                    script.font_default = Some(family);
+                    idx += 1;
+                }
                 Token::Ident(s) if s == "achievement" => {
                     // `achievement <name> ["description"]`
                     let name = expect_ident(&line.tokens[1], line.line_no, "achievement name")
@@ -1893,6 +1923,7 @@ impl Parser {
                     let (text, used) = parse_expr_with_len(&toks[1..], line_no)?;
                     let mut size = None;
                     let mut color = None;
+                    let mut font = None;
                     let mut x = None;
                     let mut y = None;
                     for (k, vt) in kv_pairs(toks, 1 + used, line_no)? {
@@ -1901,6 +1932,7 @@ impl Parser {
                             "y" => y = Some(self.parse_expr_tokens(&vt, line_no)?),
                             "size" => size = Some(self.parse_expr_tokens(&vt, line_no)?),
                             "color" => color = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "font" => font = Some(self.parse_expr_tokens(&vt, line_no)?),
                             _ => return Err(err(line_no, format!("unknown text property `{k}`"))),
                         }
                     }
@@ -1914,6 +1946,7 @@ impl Parser {
                             y,
                             size,
                             color,
+                            font,
                         },
                         1,
                     ))
@@ -1965,6 +1998,7 @@ impl Parser {
                     let mut w = None;
                     let mut h = None;
                     let mut color = None;
+                    let mut font = None;
                     for (k, vt) in kv_pairs(&toks[rest_start..end], 0, line_no)? {
                         match k.as_str() {
                             "x" => x = Some(self.parse_expr_tokens(&vt, line_no)?),
@@ -1972,6 +2006,7 @@ impl Parser {
                             "w" => w = Some(self.parse_expr_tokens(&vt, line_no)?),
                             "h" => h = Some(self.parse_expr_tokens(&vt, line_no)?),
                             "color" => color = Some(self.parse_expr_tokens(&vt, line_no)?),
+                            "font" => font = Some(self.parse_expr_tokens(&vt, line_no)?),
                             _ => {
                                 return Err(err(line_no, format!("unknown button property `{k}`")))
                             }
@@ -1993,6 +2028,7 @@ impl Parser {
                             w,
                             h,
                             color,
+                            font,
                             actions,
                         },
                         consumed,

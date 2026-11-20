@@ -148,6 +148,8 @@ pub struct App {
     play_time: f32,
     /// Last frame time.
     last_frame: Instant,
+    /// Smoothed frame time in milliseconds (EMA, alpha ≈ 0.1).
+    frame_ms: f32,
     /// Auto-advance timer.
     auto_timer: f32,
     /// Whether auto-advance is on.
@@ -281,13 +283,34 @@ impl App {
             );
 
         let window_size = window.inner_size();
-        let renderer = Renderer::new(
+        let mut renderer = Renderer::new(
             device,
             queue,
             surface,
             (window_size.width, window_size.height),
             format,
         )?;
+
+        // Load custom font files from the project's font directory into
+        // the text engine, so `font default "..."` and screen `font=` can
+        // reference them by family name.
+        const FONT_EXTS: &[&str] = &["ttf", "otf"];
+        let font_dir = config.font_dir.clone();
+        for rel in assets.list(&font_dir) {
+            if let Some(ext) = rel.rsplit('.').next() {
+                if FONT_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
+                    if let Ok(bytes) = assets.read(&rel) {
+                        if !renderer.text.load_font_data(&bytes) {
+                            log::warn!("failed to decode font file `{rel}`");
+                        }
+                    } else {
+                        log::warn!("failed to read font file `{rel}`");
+                    }
+                }
+            }
+        }
+        // Apply the script's `font default "..."` as the renderer default.
+        renderer.default_font = script.font_default.clone();
 
         // Load settings.
         let settings_path = save_root.join(&config.save_dir).join("settings.json");
@@ -341,6 +364,7 @@ impl App {
             plugins,
             play_time: 0.0,
             last_frame: Instant::now(),
+            frame_ms: 0.0,
             auto_timer: 0.0,
             auto_advance: false,
             skip: false,
@@ -730,6 +754,7 @@ impl App {
         {
             Ok(script) => {
                 self.runtime.reload_script(script.clone());
+                self.renderer.default_font = script.font_default.clone();
                 self.script = script;
                 // Edited image files reload too.
                 self.renderer.textures.clear();
@@ -1666,6 +1691,7 @@ impl App {
                                     color: [1.0, 1.0, 1.0],
                                     bounds: None,
                                     rich: node.rich,
+                                    font_family: node.font_family.clone(),
                                 });
                             }
                         }
@@ -1680,6 +1706,7 @@ impl App {
                                 color: [node.color[0], node.color[1], node.color[2]],
                                 bounds: None,
                                 rich: node.rich,
+                                font_family: node.font_family.clone(),
                             });
                         }
                     }
@@ -1742,6 +1769,7 @@ impl App {
                             color: [1.0, 1.0, 1.0],
                             bounds: None,
                             rich: true,
+                            font_family: None,
                         });
                         top += 44.0;
                     }
@@ -1764,6 +1792,7 @@ impl App {
                             color: [1.0, 1.0, 0.9],
                             bounds: None,
                             rich: true,
+                            font_family: None,
                         });
                     }
                 } else if let Some(b) = &self.blocking {
@@ -1781,6 +1810,7 @@ impl App {
                             color: [1.0, 1.0, 1.0],
                             bounds: None,
                             rich: true,
+                            font_family: None,
                         });
                     } else {
                         // Dialogue box background.
@@ -1825,6 +1855,7 @@ impl App {
                                 color: [1.0, 1.0, 0.6],
                                 bounds: None,
                                 rich: true,
+                                font_family: None,
                             });
                         }
 
@@ -1841,6 +1872,7 @@ impl App {
                             color: [1.0, 1.0, 1.0],
                             bounds: None,
                             rich: true,
+                            font_family: None,
                         });
                     }
                 }
@@ -1864,6 +1896,7 @@ impl App {
                         color: [0.8, 0.8, 0.8],
                         bounds: None,
                         rich: false,
+                        font_family: None,
                     });
                 }
             }
@@ -1891,6 +1924,7 @@ impl App {
                         color: [1.0, 1.0, 1.0],
                         bounds: None,
                         rich: true,
+                        font_family: None,
                     });
                 }
 
@@ -1919,6 +1953,7 @@ impl App {
                         color: [1.0, 1.0, 1.0],
                         bounds: None,
                         rich: true,
+                        font_family: None,
                     });
                 }
             }
@@ -1941,6 +1976,7 @@ impl App {
                     color: [1.0, 1.0, 0.6],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
 
                 // Buttons.
@@ -1975,6 +2011,7 @@ impl App {
                         },
                         bounds: None,
                         rich: false,
+                        font_family: None,
                     });
                 }
             }
@@ -2001,6 +2038,7 @@ impl App {
                     color: [1.0, 1.0, 0.6],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
 
                 // Save slots grid (3x3).
@@ -2044,6 +2082,7 @@ impl App {
                         color: [1.0, 1.0, 1.0],
                         bounds: None,
                         rich: false,
+                        font_family: None,
                     });
                 }
 
@@ -2056,6 +2095,7 @@ impl App {
                     color: [0.6, 0.6, 0.6],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
             }
             Screen::Settings { selected } => {
@@ -2076,6 +2116,7 @@ impl App {
                     color: [1.0, 1.0, 0.6],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
 
                 let labels = [
@@ -2125,6 +2166,7 @@ impl App {
                         color: [1.0, 1.0, 1.0],
                         bounds: None,
                         rich: false,
+                        font_family: None,
                     });
                 }
 
@@ -2136,6 +2178,7 @@ impl App {
                     color: [0.6, 0.6, 0.6],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
             }
             Screen::Gallery { selected } => {
@@ -2156,6 +2199,7 @@ impl App {
                     color: [1.0, 1.0, 0.6],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
 
                 if self.runtime.gallery.unlocked.is_empty() {
@@ -2167,6 +2211,7 @@ impl App {
                         color: [0.6, 0.6, 0.6],
                         bounds: None,
                         rich: false,
+                        font_family: None,
                     });
                 } else {
                     let cols = 4;
@@ -2201,6 +2246,7 @@ impl App {
                             color: [0.8, 0.8, 0.8],
                             bounds: None,
                             rich: false,
+                            font_family: None,
                         });
                     }
                 }
@@ -2213,6 +2259,7 @@ impl App {
                     color: [0.6, 0.6, 0.6],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
             }
             Screen::Backlog { scroll } => {
@@ -2233,6 +2280,7 @@ impl App {
                     color: [1.0, 1.0, 0.6],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
 
                 // Show last N entries.
@@ -2253,6 +2301,7 @@ impl App {
                             color: [0.9, 0.9, 0.9],
                             bounds: None,
                             rich: true,
+                            font_family: None,
                         });
                     } else {
                         ui.text.push(UiText {
@@ -2263,6 +2312,7 @@ impl App {
                             color: [0.7, 0.7, 0.7],
                             bounds: None,
                             rich: true,
+                            font_family: None,
                         });
                     }
                 }
@@ -2297,6 +2347,7 @@ impl App {
                     color: [1.0, 1.0, 1.0],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
 
                 // Yes/No buttons.
@@ -2335,6 +2386,7 @@ impl App {
                     color: [1.0, 1.0, 1.0],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
                 ui.text.push(UiText {
                     text: "No".to_string(),
@@ -2344,6 +2396,7 @@ impl App {
                     color: [1.0, 1.0, 1.0],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
             }
             Screen::Input { prompt, buffer } => {
@@ -2364,6 +2417,7 @@ impl App {
                         color: [1.0, 1.0, 1.0],
                         bounds: None,
                         rich: true,
+                        font_family: None,
                     });
                 }
                 ui.boxes.push(UiBox {
@@ -2381,6 +2435,7 @@ impl App {
                     color: [1.0, 1.0, 1.0],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
             }
             Screen::End => {
@@ -2392,6 +2447,7 @@ impl App {
                     color: [1.0, 1.0, 1.0],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
                 ui.text.push(UiText {
                     text: "Press Space to return to title".to_string(),
@@ -2401,6 +2457,7 @@ impl App {
                     color: [0.6, 0.6, 0.6],
                     bounds: None,
                     rich: false,
+                    font_family: None,
                 });
             }
         }
@@ -2440,6 +2497,7 @@ impl App {
                 color: [1.0 * fade, 0.9 * fade, 0.4 * fade],
                 bounds: None,
                 rich: false,
+                font_family: None,
             });
         }
         // Accessibility: global text scale (settings.text_scale).
@@ -2469,6 +2527,20 @@ impl App {
         // Normalize to pixels for text placement.
         let line_h = 16.0;
         let mut lines: Vec<String> = Vec::new();
+        // Performance metrics (estimated, see TextureCache::stats).
+        let (tex_count, tex_bytes) = self.renderer.textures.stats();
+        let tex_mb = tex_bytes as f64 / (1024.0 * 1024.0);
+        lines.push(format!(
+            "frame: {:.2} ms  ~{:.0} fps  | textures: {} ({:.1} MB est.)",
+            self.frame_ms,
+            if self.frame_ms > 0.0 {
+                1000.0 / self.frame_ms
+            } else {
+                0.0
+            },
+            tex_count,
+            tex_mb
+        ));
         if let Some(f) = self.runtime.vm.state.stack.last() {
             let label = match &f.body {
                 vnengine_script::vm::FrameBody::Label(l) => l.clone(),
@@ -2524,6 +2596,7 @@ impl App {
                 color: [0.7, 0.95, 0.7],
                 bounds: None,
                 rich: false,
+                font_family: None,
             });
         }
     }
@@ -2720,8 +2793,18 @@ impl winit::application::ApplicationHandler for AppHandler {
             }
             winit::event::WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = now.duration_since(app.last_frame).as_secs_f32().min(0.1);
+                let elapsed = now.duration_since(app.last_frame).as_secs_f32();
+                let dt = elapsed.min(0.1);
                 app.last_frame = now;
+                // Update frame-time metrics (EMA) for the F8 overlay.
+                if elapsed > 0.0 {
+                    let ms = elapsed * 1000.0;
+                    app.frame_ms = if app.frame_ms == 0.0 {
+                        ms
+                    } else {
+                        app.frame_ms * 0.9 + ms * 0.1
+                    };
+                }
                 app.handle_input();
                 app.update(dt);
                 let ui = app.build_ui();

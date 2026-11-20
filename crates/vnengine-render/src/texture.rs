@@ -112,6 +112,18 @@ impl TextureCache {
         self.cache.get(rel)
     }
 
+    /// Simple resource counters for the debug overlay: number of cached
+    /// textures and an estimate of their GPU memory in bytes
+    /// (width × height × 4 bytes per RGBA8 texel, ignoring mip levels —
+    /// the cache currently uses a single level).
+    pub fn stats(&self) -> (usize, u64) {
+        let mut bytes = 0u64;
+        for img in self.cache.values() {
+            bytes += img.width as u64 * img.height as u64 * 4;
+        }
+        (self.cache.len(), bytes)
+    }
+
     /// Access the underlying device/queue (e.g. for creating samplers).
     pub fn device(&self) -> &wgpu::Device {
         &self.device

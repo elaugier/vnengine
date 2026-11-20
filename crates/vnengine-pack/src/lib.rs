@@ -188,11 +188,12 @@ impl AssetSource for Package {
 }
 
 /// Asset directories mirrored into `assets/` inside the package.
-fn asset_dirs(config: &EngineConfig) -> [&str; 4] {
+fn asset_dirs(config: &EngineConfig) -> [&str; 5] {
     [
         config.image_dir.as_str(),
         config.audio_dir.as_str(),
         config.voice_dir.as_str(),
+        config.font_dir.as_str(),
         "translations",
     ]
 }

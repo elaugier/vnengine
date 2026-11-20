@@ -218,6 +218,26 @@ label start:
     n "{b}Bold{/b} and {i}italic{/i} and {color=#ff4040}red{/color}."
 ```
 
+### Custom fonts
+
+Place `.ttf` / `.otf` files under the project's
+`fonts/` directory (configurable via `font_dir` in `project.toml`).
+All files are loaded at startup and shipped inside `.vnpkg` packages.
+Select the default font for all dialogue and UI with a top-level
+declaration, and override it per screen element with `font=`:
+
+```vn
+font default "MyDisplayFont"
+
+screen hud:
+    text "Score: [score]" x=0.02 y=0.015 size=18 font="MyMonoFont"
+    button "OK" x=0.8 y=0.5 font="MyDisplayFont":
+        return
+```
+
+When the named family is not found, the text falls back to the system
+sans-serif font.
+
 ### Text input and confirmations
 
 ```vn

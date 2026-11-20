@@ -40,6 +40,16 @@ impl TextState {
         self.viewport.update(queue, Resolution { width, height });
     }
 
+    /// Load a font file (TTF/OTF bytes) into the font system.
+    /// Call at startup for every file under the project's font directory.
+    /// Returns `true` if the font was accepted.
+    pub fn load_font_data(&mut self, bytes: &[u8]) -> bool {
+        let db = self.font_system.db_mut();
+        let before = db.faces().count();
+        db.load_font_data(bytes.to_vec());
+        db.faces().count() > before
+    }
+
     /// Create a new text buffer with the given font size (in pixels) and
     /// wrapping width (in pixels).
     pub fn new_buffer(&mut self, font_size: f32, width: u32) -> Buffer {
@@ -51,15 +61,33 @@ impl TextState {
         buffer
     }
 
+    /// Resolve a font family: explicit name if given, else the engine default.
+    fn family_of<'a>(family: Option<&'a str>, default: Option<&'a str>) -> Family<'a> {
+        if let Some(name) = family.or(default) {
+            Family::Name(name)
+        } else {
+            Family::SansSerif
+        }
+    }
+
     /// Set the text of a buffer, wrapping at its configured width.
-    pub fn set_text(&mut self, buffer: &mut Buffer, text: &str, color: [f32; 3]) {
+    /// `family` overrides the default font family when set.
+    pub fn set_text(
+        &mut self,
+        buffer: &mut Buffer,
+        text: &str,
+        color: [f32; 3],
+        family: Option<&str>,
+        default_family: Option<&str>,
+    ) {
+        let fam = Self::family_of(family, default_family);
         let attrs = Attrs::new()
             .color(Color::rgb(
                 (color[0] * 255.0) as u8,
                 (color[1] * 255.0) as u8,
                 (color[2] * 255.0) as u8,
             ))
-            .family(Family::SansSerif);
+            .family(fam);
         buffer.set_text(text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut self.font_system, false);
     }
@@ -71,9 +99,12 @@ impl TextState {
         buffer: &mut Buffer,
         segments: &[RichSegment],
         default_color: [f32; 3],
+        family: Option<&str>,
+        default_family: Option<&str>,
     ) {
         use glyphon::{Style, Weight};
 
+        let fam = Self::family_of(family, default_family);
         // Build owned strings and attrs list. We need the strings to stay alive
         // while we pass references to set_rich_text.
         let default_attrs = Attrs::new()
@@ -82,7 +113,7 @@ impl TextState {
                 (default_color[1] * 255.0) as u8,
                 (default_color[2] * 255.0) as u8,
             ))
-            .family(Family::SansSerif);
+            .family(fam);
 
         // Collect (String, Attrs) pairs.
         let pairs: Vec<(String, Attrs)> = segments

@@ -216,3 +216,24 @@ fn build_fails_on_bad_script() {
     assert!(build(&project, &out).is_err());
     let _ = fs::remove_dir_all(&project);
 }
+
+#[test]
+fn custom_font_directory_is_packaged() {
+    let project = fixture("font_dir");
+    let out = pkg_path("font_dir");
+    let config = fs::read_to_string(project.join("project.toml")).unwrap();
+    fs::write(
+        project.join("project.toml"),
+        format!("{config}\nfont_dir = \"typefaces\"\n"),
+    )
+    .unwrap();
+    fs::create_dir_all(project.join("typefaces/nested")).unwrap();
+    fs::write(project.join("typefaces/nested/test.ttf"), b"font data").unwrap();
+    build(&project, &out).unwrap();
+    let pkg = Package::open(&out).unwrap();
+    assert_eq!(pkg.config().font_dir, "typefaces");
+    assert_eq!(pkg.list("typefaces"), vec!["typefaces/nested/test.ttf"]);
+    assert_eq!(pkg.read("typefaces/nested/test.ttf").unwrap(), b"font data");
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_file(out);
+}

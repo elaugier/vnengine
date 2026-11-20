@@ -721,6 +721,7 @@ impl Vm {
                         font_size: 24.0,
                         action: Vec::new(),
                         rich: false,
+                        font_family: None,
                     });
                     out_actions.push(Vec::new());
                 }
@@ -730,6 +731,7 @@ impl Vm {
                     y,
                     size,
                     color,
+                    font,
                 } => {
                     let raw = self.eval_str(text)?;
                     out.push(UiNode {
@@ -747,6 +749,10 @@ impl Vm {
                         },
                         action: Vec::new(),
                         rich: true,
+                        font_family: match font {
+                            Some(f) => Some(self.eval_str(f)?),
+                            None => None,
+                        },
                     });
                     out_actions.push(Vec::new());
                 }
@@ -786,6 +792,7 @@ impl Vm {
                         font_size: 24.0,
                         action: Vec::new(),
                         rich: false,
+                        font_family: None,
                     });
                     out_actions.push(Vec::new());
                 }
@@ -796,6 +803,7 @@ impl Vm {
                     w,
                     h,
                     color,
+                    font,
                     actions,
                 } => {
                     let raw = self.eval_str(label)?;
@@ -824,6 +832,10 @@ impl Vm {
                         // `out_actions` are what actually run on click.
                         action: self.resolve_button_actions(actions)?,
                         rich: true,
+                        font_family: match font {
+                            Some(f) => Some(self.eval_str(f)?),
+                            None => None,
+                        },
                     });
                     out_actions.push(actions.clone());
                 }
