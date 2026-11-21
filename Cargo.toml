@@ -53,14 +53,14 @@ ahash = "0.8"
 walkdir = "2"
 
 # Internal crates
-vnengine-core = { path = "crates/vnengine-core" }
-vnengine-script = { path = "crates/vnengine-script" }
-vnengine-runtime = { path = "crates/vnengine-runtime" }
-vnengine-render = { path = "crates/vnengine-render" }
-vnengine-audio = { path = "crates/vnengine-audio" }
-vnengine-app = { path = "crates/vnengine-app" }
-vnengine-pack = { path = "crates/vnengine-pack" }
-vnengine-plugins = { path = "crates/vnengine-plugins" }
+vnengine-core = { path = "crates/vnengine-core", version = "0.1.0" }
+vnengine-script = { path = "crates/vnengine-script", version = "0.1.0" }
+vnengine-runtime = { path = "crates/vnengine-runtime", version = "0.1.0" }
+vnengine-render = { path = "crates/vnengine-render", version = "0.1.0" }
+vnengine-audio = { path = "crates/vnengine-audio", version = "0.1.0" }
+vnengine-app = { path = "crates/vnengine-app", version = "0.1.0" }
+vnengine-pack = { path = "crates/vnengine-pack", version = "0.1.0" }
+vnengine-plugins = { path = "crates/vnengine-plugins", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

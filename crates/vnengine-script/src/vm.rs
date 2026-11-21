@@ -16,6 +16,8 @@ use vnengine_core::model::{Layer, SpriteLayer};
 use vnengine_core::transition::Transition;
 use vnengine_core::Value;
 
+type AtlTracks = (Vec<SpriteTrack>, BTreeMap<String, Vec<SpriteTrack>>);
+
 /// What a frame executes: a named label in the script, or an inline
 /// statement block pushed by control flow (menu choice, `if` branch, loop
 /// body, function call). Inline bodies are serialized with the frame so a
@@ -1234,10 +1236,7 @@ impl Vm {
     /// are evaluated in the current variable context and `choice`
     /// branches draw from the serialized PRNG — the result is plain
     /// serializable data for the scene model.
-    fn compile_atl(
-        &mut self,
-        name: &str,
-    ) -> Result<(Vec<SpriteTrack>, BTreeMap<String, Vec<SpriteTrack>>), String> {
+    fn compile_atl(&mut self, name: &str) -> Result<AtlTracks, String> {
         let def = self
             .script
             .find_transform(name)
@@ -1313,10 +1312,7 @@ impl Vm {
                 AtlStmt::On { event, body } => {
                     let mut ev_tracks = Vec::new();
                     self.compile_atl_body(body, &mut ev_tracks, events)?;
-                    events
-                        .entry(event.clone())
-                        .or_insert_with(Vec::new)
-                        .extend(ev_tracks);
+                    events.entry(event.clone()).or_default().extend(ev_tracks);
                 }
                 AtlStmt::Choice { .. } => {
                     // Consecutive `choice` blocks form one group.
@@ -1580,7 +1576,7 @@ impl Vm {
                     let (tracks, events) = self.compile_atl(name)?;
                     anims.extend(tracks);
                     for (k, v) in events {
-                        anim_events.entry(k).or_insert_with(Vec::new).extend(v);
+                        anim_events.entry(k).or_default().extend(v);
                     }
                 }
                 Ok(ExecOutcome::Command(Command::Show(SpriteSpec {
@@ -1777,7 +1773,7 @@ impl Vm {
                             }
                             return Ok(ExecOutcome::Call(name.clone()));
                         }
-                        return Err(format!("unknown function or label `{name}`"));
+                        Err(format!("unknown function or label `{name}`"))
                     }
                     // `call name` — zero-arg user function (frame-based, so
                     // the body may contain blocking statements like `say`)
@@ -2566,10 +2562,10 @@ fn eval_method(obj: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 let parts: Vec<String> = items.iter().map(|v| v.to_string()).collect();
                 Ok(Value::Str(parts.join(sep.as_str())))
             }
-            "sorted" => no_args(name, args).and_then(|_| {
+            "sorted" => no_args(name, args).map(|_| {
                 let mut sorted = items.clone();
                 sorted.sort_by(|a, b| value_cmp(a, b).unwrap_or(std::cmp::Ordering::Equal));
-                Ok(Value::List(sorted))
+                Value::List(sorted)
             }),
             "reversed" => no_args(name, args).map(|_| {
                 let mut r = items.clone();

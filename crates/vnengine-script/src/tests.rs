@@ -141,6 +141,13 @@ label sub:
 }
 
 #[test]
+fn parse_windows_line_endings() {
+    let src = "label start:\r\n    $ x = 1\r\n    e \"Hello\"\r\n";
+    let script = Parser::parse(src).unwrap();
+    assert_eq!(script.labels[0].body.len(), 2);
+}
+
+#[test]
 fn parse_demo_script() {
     let src = include_str!("../../../demo/script/main.vn");
     let script = Parser::parse(src).unwrap();
@@ -2953,9 +2960,8 @@ label start:
     let mut vm = Vm::new(script);
     // The VM error propagates as a Panic/StepResult error or finished —
     // assert it does not produce a Grant command.
-    match vm.step() {
-        StepResult::Command(Command::Grant { .. }) => panic!("unknown grant should error"),
-        _ => {}
+    if let StepResult::Command(Command::Grant { .. }) = vm.step() {
+        panic!("unknown grant should error")
     }
 }
 

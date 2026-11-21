@@ -28,7 +28,6 @@ allow = [
 # Any license not in the allow list is denied. Copyleft found outside the
 # allow list is denied as well; weak copyleft that we deliberately accept
 # (MPL-2.0) is listed above.
-copyleft = "deny"
 unused-allowed-license = "warn"
 # Workspace crates are not published; still require them to carry the
 # workspace license (MIT OR Apache-2.0) so the check stays meaningful.

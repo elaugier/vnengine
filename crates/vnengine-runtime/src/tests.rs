@@ -1149,12 +1149,7 @@ label target:
 "##,
     );
     // show screen is an effect; the say blocks next.
-    loop {
-        match rt.step() {
-            RuntimeEvent::Effect(_) => {}
-            _ => break,
-        }
-    }
+    while let RuntimeEvent::Effect(_) = rt.step() {}
     assert_eq!(rt.screens.len(), 1);
     // Click the button: jump resets execution to `target`.
     let clicked = rt.screen_action(0, 0);
@@ -1290,9 +1285,8 @@ use vnengine_core::value::Value;
 
 fn drive_to_end(rt: &mut Runtime) {
     loop {
-        match rt.step() {
-            RuntimeEvent::Finished => return,
-            _ => {}
+        if let RuntimeEvent::Finished = rt.step() {
+            return;
         }
     }
 }

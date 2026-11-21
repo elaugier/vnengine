@@ -4,6 +4,8 @@ use crate::ast::*;
 use crate::lexer::{Lexer, Spanned, Token};
 use std::collections::HashSet;
 
+type SayTail = (Option<Expr>, Option<Expr>, Option<TransitionSpec>);
+
 #[derive(Debug)]
 pub enum ParseError {
     Generic {
@@ -2015,12 +2017,11 @@ impl Parser {
         }
         // A leading expression that isn't a property name is the duration.
         if !matches!(toks.get(i).map(|t| &t.token), Some(Token::Ident(n)) if vnengine_core::atl::AnimProp::parse(n).is_some())
+            && toks.get(i).is_some()
         {
-            if toks.get(i).is_some() {
-                let (e, used) = parse_expr_with_len(&toks[i..], line_no)?;
-                i += used;
-                duration = Some(e);
-            }
+            let (e, used) = parse_expr_with_len(&toks[i..], line_no)?;
+            i += used;
+            duration = Some(e);
         }
         let mut props = Vec::new();
         while i < toks.len() {
@@ -2740,7 +2741,7 @@ impl Parser {
         toks: &[Spanned],
         start: usize,
         line_no: usize,
-    ) -> Result<(Option<Expr>, Option<Expr>, Option<TransitionSpec>), ParseError> {
+    ) -> Result<SayTail, ParseError> {
         let mut voice = None;
         let mut side_image = None;
         let mut transition = None;

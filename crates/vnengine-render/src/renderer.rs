@@ -1075,6 +1075,7 @@ pub fn apply_camera(q: &mut Quad, depth: f32, cam: &vnengine_core::model::Camera
     q.hh *= zz;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_textured<'pass>(
     pass: &mut wgpu::RenderPass<'pass>,
     pipeline: &'pass RenderPipeline,

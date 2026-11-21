@@ -144,7 +144,7 @@ fn lex_error(line: usize, msg: impl Into<String>) -> LexError {
 impl Lexer {
     pub fn new(src: &str) -> Self {
         Self {
-            chars: src.chars().collect(),
+            chars: src.replace("\r\n", "\n").chars().collect(),
             pos: 0,
             line: 1,
             col: 1,
