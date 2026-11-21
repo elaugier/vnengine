@@ -237,3 +237,71 @@ fn custom_font_directory_is_packaged() {
     let _ = fs::remove_dir_all(project);
     let _ = fs::remove_file(out);
 }
+
+#[test]
+fn build_with_imports_merges_ast_and_ships_sources() {
+    let project = fixture("imports");
+    fs::create_dir_all(project.join("script/chapters")).unwrap();
+    fs::write(
+        project.join("script/main.vn"),
+        "import \"chapters/ch1.vn\"\ndefine e = Character(\"E\", color = \"#ffffff\")\nlabel start:\n    e \"hi\"\n    jump ch1\n    end\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("script/chapters/ch1.vn"),
+        "label ch1:\n    \"chapter 1\"\n    end\n",
+    )
+    .unwrap();
+    // A .vn file no import reaches must not be shipped.
+    fs::write(project.join("script/unused.vn"), "label unused:\n    end\n").unwrap();
+    let out = pkg_path("imports");
+    build(&project, &out).unwrap();
+    let pkg = Package::open(&out).unwrap();
+    let names: Vec<&str> = pkg
+        .script()
+        .labels
+        .iter()
+        .map(|l| l.name.as_str())
+        .collect();
+    assert!(names.contains(&"start"), "labels: {:?}", names);
+    assert!(names.contains(&"ch1"), "labels: {:?}", names);
+    assert_eq!(pkg.script().definitions.len(), 1);
+    // Raw .vn sources are shipped under script/ as plain archive members
+    // (not under assets/).
+    let file = fs::File::open(&out).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .collect();
+    assert!(names.contains(&"script/main.vn".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"script/chapters/ch1.vn".to_string()),
+        "{names:?}"
+    );
+    assert!(
+        !names.contains(&"script/unused.vn".to_string()),
+        "{names:?}"
+    );
+}
+
+#[test]
+fn check_reports_import_cycle_with_chain() {
+    let project = fixture("cycle");
+    fs::write(
+        project.join("script/main.vn"),
+        "import \"b.vn\"\nlabel start:\n    end\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("script/b.vn"),
+        "import \"main.vn\"\nlabel b:\n    end\n",
+    )
+    .unwrap();
+    let report = crate::check(&project).unwrap();
+    assert!(!report.ok);
+    let has_cycle = report
+        .diagnostics
+        .iter()
+        .any(|d| d.diagnostic.message.contains("import cycle detected"));
+    assert!(has_cycle, "diagnostics: {:?}", report.diagnostics);
+}

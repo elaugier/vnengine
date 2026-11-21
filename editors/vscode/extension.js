@@ -21,6 +21,8 @@ const timers = new Map();
 /** Asset-list cache: projectDir -> {time, list}. */
 const assetCache = new Map();
 const ASSET_CACHE_MS = 5000;
+/** Files the last WASM lint touched, per entry doc uri — for stale cleanup. */
+const wasmScope = new Map();
 /** Directories never scanned for assets. */
 const SKIP_DIRS = new Set(['.git', '.vscode', 'node_modules', 'saves', 'build', 'target']);
 
@@ -46,7 +48,10 @@ async function activate(context) {
     vscode.workspace.onDidSaveTextDocument((d) => {
       if (d.languageId === 'vn') runDiagnostics(d);
     }),
-    vscode.workspace.onDidCloseTextDocument((d) => collection.delete(d.uri)),
+    vscode.workspace.onDidCloseTextDocument((d) => {
+      collection.delete(d.uri);
+      wasmScope.delete(d.uri.toString());
+    }),
     vscode.commands.registerCommand('vnengine.run', cmdRun),
     vscode.commands.registerCommand('vnengine.validate', cmdValidate),
     vscode.commands.registerCommand('vnengine.package', cmdPackage)
@@ -91,16 +96,24 @@ async function runDiagnostics(doc) {
 }
 
 /**
- * Diagnostics via the embedded WASM linter. Synchronous over the
- * document text; `project.toml` and the asset list are supplied so the
- * engine can apply its full project-mode checks.
+ * Diagnostics via the embedded WASM linter. `import` directives are
+ * resolved in JS: the sources of every reachable file are shipped with
+ * the request (open documents first, then disk), and each returned
+ * diagnostic is spread onto the file it was found in.
  */
 async function wasmDiagnostics(doc) {
   if (!wasm) return;
   const version = doc.version;
-  const projectDir = findProjectDir(path.dirname(doc.uri.fsPath));
+  const docPath = doc.uri.fsPath;
+  const projectDir = findProjectDir(path.dirname(docPath));
+  const baseDir = projectDir || path.dirname(docPath);
+  const entryRel = projectDir
+    ? path.relative(projectDir, docPath).split(path.sep).join('/')
+    : path.basename(docPath);
   const request = {
     source: doc.getText(),
+    file: entryRel,
+    files: gatherSources(baseDir, entryRel, doc),
     project_toml: null,
     assets: [],
   };
@@ -116,7 +129,102 @@ async function wasmDiagnostics(doc) {
   if (doc.isClosed || doc.version !== version) return;
   const response = callLint(JSON.stringify(request));
   if (!response) return;
-  collection.set(doc.uri, response.diagnostics.map((d) => toVsDiagnostic(d)));
+
+  // Each diagnostic carries `file` (relative to baseDir). Set
+  // diagnostics on every linted file — including empty sets so stale
+  // entries clear — and drop files that left the import closure.
+  const scope = new Map(); // uriString -> {uri, diags}
+  const scopeEntry = (rel) => {
+    const uri = vscode.Uri.file(path.join(baseDir, ...rel.split('/')));
+    const key = uri.toString();
+    if (!scope.has(key)) scope.set(key, { uri, diags: [] });
+    return scope.get(key);
+  };
+  scopeEntry(entryRel);
+  for (const rel of Object.keys(request.files)) scopeEntry(rel);
+  for (const d of response.diagnostics || []) {
+    scopeEntry(d.file || entryRel).diags.push(toVsDiagnostic(d));
+  }
+  const docKey = doc.uri.toString();
+  for (const key of wasmScope.get(docKey) || []) {
+    if (!scope.has(key)) collection.delete(vscode.Uri.parse(key));
+  }
+  wasmScope.set(docKey, new Set(scope.keys()));
+  for (const { uri, diags } of scope.values()) collection.set(uri, diags);
+}
+
+/**
+ * Collect the `import` closure of `entryRel`: source text for every file
+ * reachable through top-level `import "..."` directives. Open documents
+ * win over disk so unsaved edits are linted; unreadable files are left
+ * out so the engine reports the missing import itself.
+ */
+function gatherSources(baseDir, entryRel, doc) {
+  const files = {};
+  const pending = [entryRel];
+  const seen = new Set(pending);
+  while (pending.length) {
+    const rel = pending.shift();
+    const src = rel === entryRel ? doc.getText() : readSource(baseDir, rel);
+    if (src === null) continue;
+    files[rel] = src;
+    for (const target of scanImports(src)) {
+      const resolved = resolveImport(rel, target);
+      if (!seen.has(resolved)) {
+        seen.add(resolved);
+        pending.push(resolved);
+      }
+    }
+  }
+  return files;
+}
+
+/** Live text for an open document, else disk content (null = unreadable). */
+function readSource(baseDir, rel) {
+  const abs = path.resolve(baseDir, ...rel.split('/'));
+  const open = vscode.workspace.textDocuments.find(
+    (d) => d.uri.scheme === 'file' && samePath(d.uri.fsPath, abs)
+  );
+  if (open) return open.getText();
+  try {
+    return fs.readFileSync(abs, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function samePath(a, b) {
+  const na = path.resolve(a);
+  const nb = path.resolve(b);
+  return process.platform === 'win32'
+    ? na.toLowerCase() === nb.toLowerCase()
+    : na === nb;
+}
+
+/** Top-level (unindented, non-comment) `import "<path>"` directives. */
+function scanImports(src) {
+  const out = [];
+  for (const line of src.split(/\r?\n/)) {
+    const m = line.match(/^import\s+"([^"]+)"/);
+    if (m) out.push(m[1]);
+  }
+  return out;
+}
+
+/**
+ * Resolve an `import` target relative to the importing file's directory —
+ * mirrors the parser's resolve_import_path (lexical, `/`-separated).
+ */
+function resolveImport(fromRel, target) {
+  const cut = fromRel.lastIndexOf('/');
+  const joined = (cut >= 0 ? fromRel.slice(0, cut + 1) : '') + target.replace(/\\/g, '/');
+  const parts = [];
+  for (const seg of joined.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') parts.pop();
+    else parts.push(seg);
+  }
+  return parts.join('/');
 }
 
 /**

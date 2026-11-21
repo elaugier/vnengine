@@ -117,6 +117,34 @@ label start:
 
 ---
 
+## Multi-file scripts: `import`
+
+Split a project into several `.vn` files with top-level `import`:
+
+```vn
+import "chapters/common.vn"
+import "chapters/ch1.vn"
+
+label start:
+    e "Hello!"
+    jump ch1_start
+    end
+```
+
+- The path is relative to the **file containing the import** (so
+  `script/chapters/ch1.vn` importing `"common.vn"` resolves to
+  `script/chapters/common.vn`).
+- Imports are resolved depth-first at parse time; the merged AST is what
+  runs. In `.vnpkg` packages, raw `.vn` sources ship under `script/` and
+  the merged AST under `script/main.vnb`.
+- A file imported twice (by canonical path) is included **once**
+  (include guard), so shared `define`/`default` blocks are safe.
+- Import cycles are a parse error with the full chain:
+  `import cycle detected: a.vn -> b.vn -> a.vn`.
+- Hot reload (dev mode) watches every imported file.
+
+---
+
 ## Story flow
 
 ```vn

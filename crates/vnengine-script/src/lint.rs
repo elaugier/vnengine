@@ -71,12 +71,15 @@ impl Diagnostic {
 /// A lint finding before position resolution. `needle` is the source token
 /// the warning is about (a label, asset path, speaker id, ...); `def_site`
 /// asks [`locate`] to prefer the token's *definition* line over its first
-/// use (used for "unreachable label" reports).
+/// use (used for "unreachable label" reports). `file` is the
+/// project-relative source file the warning originates from, when the
+/// script was parsed with `Parser::parse_multi`.
 #[derive(Debug, Clone)]
 pub struct LintWarning {
     pub message: String,
     pub needle: Option<String>,
     pub def_site: bool,
+    pub file: Option<String>,
 }
 
 impl LintWarning {
@@ -85,6 +88,7 @@ impl LintWarning {
             message,
             needle: Some(needle.into()),
             def_site: false,
+            file: None,
         }
     }
 
@@ -93,6 +97,7 @@ impl LintWarning {
             message,
             needle: Some(needle.into()),
             def_site: true,
+            file: None,
         }
     }
 }
@@ -151,6 +156,81 @@ pub fn check_source(
         .collect()
 }
 
+/// Multi-file variant of [`check_source`]: parses `entry_src` with
+/// `Parser::parse_multi`, resolving `import` directives through
+/// `resolver(resolved_path, importing_file)`. Returns diagnostics paired
+/// with the project-relative file they were found in (parse errors carry
+/// the file via [`crate::parser::ParseError::file`]; lint warnings carry
+/// the file their AST item was parsed from and are only searched for
+/// there).
+pub fn check_source_multi(
+    entry_src: &str,
+    entry_rel: &str,
+    mut resolver: impl FnMut(&str, &str) -> Result<String, String>,
+    config: &EngineConfig,
+    assets: Option<&BTreeSet<String>>,
+    opts: &LintOptions,
+) -> Vec<(String, Diagnostic)> {
+    // Record every source file the resolver reads so we can locate
+    // warning needles in the right file.
+    let mut sources: Vec<(String, String)> = vec![(
+        crate::parser::normalize_rel_path(entry_rel),
+        entry_src.to_string(),
+    )];
+    let mut recording = |resolved: &str, cur: &str| -> Result<String, String> {
+        let content = resolver(resolved, cur)?;
+        sources.push((resolved.to_string(), content.clone()));
+        Ok(content)
+    };
+    let script = match crate::Parser::parse_multi(entry_src, entry_rel, &mut recording) {
+        Ok(s) => s,
+        Err(e) => {
+            return vec![(
+                e.file().unwrap_or(entry_rel).to_string(),
+                Diagnostic::error(e.message(), Some(e.line())),
+            )];
+        }
+    };
+    lint_script(&script, config, assets, opts)
+        .into_iter()
+        .map(|w| {
+            let needle = w.needle.clone().unwrap_or_default();
+            // The warning's file of origin is authoritative — searching
+            // other files would misattribute needles that appear in
+            // several sources. Warnings without recorded provenance
+            // (single-file parses) scan the whole tree as before.
+            let found: Option<(String, usize, usize, usize)> = match &w.file {
+                Some(file) => sources
+                    .iter()
+                    .find(|(f, _)| f == file)
+                    .and_then(|(_, src)| locate(src, &needle, w.def_site))
+                    .map(|p| (file.clone(), p.0, p.1, p.2)),
+                None => sources.iter().find_map(|(file, src)| {
+                    locate(src, &needle, w.def_site).map(|p| (file.clone(), p.0, p.1, p.2))
+                }),
+            };
+            let (file, pos) = found
+                .map(|(f, l, c, s)| (f, (Some(l), Some(c), Some(s))))
+                .unwrap_or_else(|| {
+                    (
+                        w.file.clone().unwrap_or_else(|| entry_rel.to_string()),
+                        (None, None, None),
+                    )
+                });
+            (
+                file,
+                Diagnostic {
+                    severity: Severity::Warning,
+                    message: w.message,
+                    line: pos.0,
+                    col: pos.1,
+                    span: pos.2,
+                },
+            )
+        })
+        .collect()
+}
+
 /// Lint `script` against the optional asset set and engine config.
 /// `assets: None` disables all asset-existence checks.
 pub fn lint_script(
@@ -166,21 +246,35 @@ pub fn lint_script(
     let mut referenced: BTreeSet<String> = BTreeSet::new();
 
     for label in &script.labels {
+        let base = w.len();
         lint_body(&l, &label.body, &mut w, &mut referenced);
+        // Every statement in a body comes from the label's own file
+        // (`import` is top-level only), so warnings raised here inherit
+        // the label's recorded origin.
+        for warning in &mut w[base..] {
+            warning.file.clone_from(&label.file);
+        }
     }
     for screen in &script.screens {
+        let base = w.len();
         lint_screen_body(&l, &screen.body, &mut w, &mut referenced);
+        for warning in &mut w[base..] {
+            warning.file.clone_from(&screen.file);
+        }
     }
 
     for label in &script.labels {
         if label.name != "start" && !referenced.contains(&label.name) {
-            w.push(LintWarning::definition(
-                format!(
-                    "unreachable label `{}` (no jump/call targets it)",
-                    label.name
-                ),
-                label.name.clone(),
-            ));
+            w.push(LintWarning {
+                file: label.file.clone(),
+                ..LintWarning::definition(
+                    format!(
+                        "unreachable label `{}` (no jump/call targets it)",
+                        label.name
+                    ),
+                    label.name.clone(),
+                )
+            });
         }
     }
     w

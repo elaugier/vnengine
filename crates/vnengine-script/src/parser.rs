@@ -4,17 +4,45 @@ use crate::ast::*;
 use crate::lexer::{Lexer, Spanned, Token};
 use std::collections::HashSet;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ParseError {
-    #[error("line {line}: {message}")]
-    Generic { line: usize, message: String },
-    #[error("line {line}: unexpected token {got}, expected {expected}")]
+    Generic {
+        line: usize,
+        message: String,
+        /// Source file (project-relative) when parsed via `parse_multi`.
+        file: Option<String>,
+    },
     Unexpected {
         line: usize,
         got: String,
         expected: String,
     },
 }
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::Generic {
+                line,
+                message,
+                file,
+            } => match file {
+                Some(file) => write!(f, "{file}: line {line}: {message}"),
+                None => write!(f, "line {line}: {message}"),
+            },
+            ParseError::Unexpected {
+                line,
+                got,
+                expected,
+            } => write!(
+                f,
+                "line {line}: unexpected token {got}, expected {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 impl ParseError {
     /// 1-based source line where the error occurred.
@@ -32,6 +60,25 @@ impl ParseError {
                 format!("unexpected token {got}, expected {expected}")
             }
         }
+    }
+
+    /// Source file (project-relative) when parsed via `Parser::parse_multi`.
+    pub fn file(&self) -> Option<&str> {
+        match self {
+            ParseError::Generic { file, .. } => file.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Attach a source file name (used when wrapping errors from imported
+    /// files in `parse_multi`).
+    pub fn with_file(mut self, file: &str) -> Self {
+        if let ParseError::Generic { file: f, .. } = &mut self {
+            if f.is_none() {
+                *f = Some(file.to_string());
+            }
+        }
+        self
     }
 }
 
@@ -64,6 +111,103 @@ fn err(line: usize, msg: impl Into<String>) -> ParseError {
     ParseError::Generic {
         line,
         message: msg.into(),
+        file: None,
+    }
+}
+
+/// Normalize a project-relative path: unify separators and resolve
+/// `.` / `..` segments lexically (no filesystem access).
+pub fn normalize_rel_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
+}
+
+/// Directory portion of a relative path (`"script/ch/x.vn"` → `"script/ch"`).
+fn dir_of(rel: &str) -> &str {
+    match rel.rfind('/') {
+        Some(i) => &rel[..i],
+        None => "",
+    }
+}
+
+/// Resolve an `import "<path>"` target relative to the directory of the
+/// importing file, then normalize. `current_file` is project-relative.
+pub fn resolve_import_path(current_file: &str, import_path: &str) -> String {
+    let base = dir_of(current_file);
+    if base.is_empty() {
+        normalize_rel_path(import_path)
+    } else {
+        normalize_rel_path(&format!("{base}/{import_path}"))
+    }
+}
+
+/// Parse `src` as `file_rel` into `script`, resolving `import` directives
+/// through `ctx`. Handles cycle detection and dedup.
+fn parse_file(
+    src: &str,
+    file_rel: &str,
+    ctx: &mut ImportCtx,
+    script: &mut Script,
+) -> Result<(), ParseError> {
+    let canonical = normalize_rel_path(file_rel);
+    if ctx.stack.iter().any(|f| f == &canonical) {
+        let mut chain = ctx.stack.clone();
+        chain.push(canonical.clone());
+        return Err(err(
+            0,
+            format!("import cycle detected: {}", chain.join(" -> ")),
+        ));
+    }
+    if ctx.visited.contains(&canonical) {
+        return Ok(()); // already included — include guard
+    }
+    ctx.visited.insert(canonical.clone());
+    ctx.stack.push(canonical.clone());
+    let prev_file = std::mem::replace(&mut ctx.current_file, canonical.clone());
+
+    let tokens = Lexer::new(src)
+        .tokenize()
+        .map_err(|e| err(e.line(), e.to_string()).with_file(file_rel))?;
+    let mut p = Parser::new(tokens);
+    let result = p.parse_script_body(script, Some(ctx));
+
+    ctx.stack.pop();
+    ctx.current_file = prev_file;
+    result.map_err(|e| e.with_file(file_rel))
+}
+
+/// State for multi-file parsing: the resolver callback, the set of files
+/// already included (dedup), and the inclusion stack (cycle detection).
+pub struct ImportCtx<'a> {
+    /// Called with `(resolved_path, importing_file)`; must return the
+    /// file's source text.
+    pub resolver: &'a mut dyn FnMut(&str, &str) -> Result<String, String>,
+    /// Canonical paths of files already included.
+    pub visited: HashSet<String>,
+    /// Canonical paths of files currently being parsed (cycle detection).
+    pub stack: Vec<String>,
+    /// Canonical path of the file currently being parsed.
+    pub current_file: String,
+}
+
+impl<'a> ImportCtx<'a> {
+    pub fn new(resolver: &'a mut dyn FnMut(&str, &str) -> Result<String, String>) -> Self {
+        Self {
+            resolver,
+            visited: HashSet::new(),
+            stack: Vec::new(),
+            current_file: String::new(),
+        }
     }
 }
 
@@ -125,7 +269,27 @@ impl Parser {
             .tokenize()
             .map_err(|e| err(e.line(), e.to_string()))?;
         let mut p = Parser::new(tokens);
-        p.parse_script()
+        let mut script = Script::default();
+        p.parse_script_body(&mut script, None)?;
+        Ok(script)
+    }
+
+    /// Parse a script with multi-file `import "<path>"` support.
+    ///
+    /// `entry_rel` is the project-relative path of the entry file (e.g.
+    /// `"script/main.vn"`). `resolver(resolved_path, importing_file)` must
+    /// return the source text of the imported file. Imports are resolved
+    /// relative to the importing file's directory, deduplicated by
+    /// canonical path, and cycles are reported as errors.
+    pub fn parse_multi(
+        src: &str,
+        entry_rel: &str,
+        resolver: &mut dyn FnMut(&str, &str) -> Result<String, String>,
+    ) -> Result<Script, ParseError> {
+        let mut script = Script::default();
+        let mut ctx = ImportCtx::new(resolver);
+        parse_file(src, entry_rel, &mut ctx, &mut script)?;
+        Ok(script)
     }
 
     /// Parse a single expression string (for testing and REPL use).
@@ -184,8 +348,14 @@ impl Parser {
         t
     }
 
-    fn parse_script(&mut self) -> Result<Script, ParseError> {
-        let mut script = Script::default();
+    /// Parse the top-level body of a script into `script`. When `ctx` is
+    /// `Some`, `import "<path>"` declarations are resolved recursively via
+    /// the context's resolver.
+    fn parse_script_body(
+        &mut self,
+        script: &mut Script,
+        mut ctx: Option<&mut ImportCtx>,
+    ) -> Result<(), ParseError> {
         let lines = self.collect_lines()?;
 
         let mut idx = 0;
@@ -196,6 +366,37 @@ impl Parser {
                 continue;
             }
             match &line.tokens[0].token {
+                Token::Ident(s) if s == "import" => {
+                    let Some(ctx) = ctx.as_deref_mut() else {
+                        return Err(err(
+                            line.line_no,
+                            "import is only available with Parser::parse_multi",
+                        ));
+                    };
+                    let target = match line.tokens.get(1).map(|t| &t.token) {
+                        Some(Token::StringLit(t)) => t.clone(),
+                        _ => {
+                            return Err(err(
+                                line.line_no,
+                                "import requires a string path: import \"path/to/file.vn\"",
+                            ))
+                        }
+                    };
+                    let current = ctx.current_file.clone();
+                    let resolved = resolve_import_path(&current, &target);
+                    let content = (ctx.resolver)(&resolved, &current).map_err(|e| {
+                        err(
+                            line.line_no,
+                            format!("cannot import `{target}` (resolved `{resolved}`): {e}"),
+                        )
+                    })?;
+                    parse_file(&content, &resolved, ctx, script).map_err(|e| {
+                        // Errors from the imported file already carry its
+                        // name via with_file; attach ours if they don't.
+                        e.with_file(&current)
+                    })?;
+                    idx += 1;
+                }
                 Token::Define => {
                     let def = self.parse_definition(line)?;
                     script.definitions.push(def);
@@ -212,7 +413,8 @@ impl Parser {
                     idx += consumed;
                 }
                 Token::Label => {
-                    let (label, consumed) = self.parse_label(&lines[idx..])?;
+                    let (mut label, consumed) = self.parse_label(&lines[idx..])?;
+                    label.file = ctx.as_ref().map(|c| c.current_file.clone());
                     script.labels.push(label);
                     idx += consumed;
                 }
@@ -227,7 +429,8 @@ impl Parser {
                     idx += consumed;
                 }
                 Token::Ident(s) if s == "screen" => {
-                    let (def, consumed) = self.parse_screen_def(&lines[idx..])?;
+                    let (mut def, consumed) = self.parse_screen_def(&lines[idx..])?;
+                    def.file = ctx.as_ref().map(|c| c.current_file.clone());
                     script.screens.push(def);
                     idx += consumed;
                 }
@@ -286,7 +489,7 @@ impl Parser {
                 }
             }
         }
-        Ok(script)
+        Ok(())
     }
 
     /// Flatten the token stream into logical lines, each with its indent level.
@@ -498,7 +701,15 @@ impl Parser {
             body.push(stmt);
             consumed += extra;
         }
-        Ok((Label { name, params, body }, consumed))
+        Ok((
+            Label {
+                name,
+                params,
+                body,
+                file: None,
+            },
+            consumed,
+        ))
     }
 
     /// Parse a single statement starting at `lines[0]`, which has indent
@@ -1854,7 +2065,14 @@ impl Parser {
         if body.is_empty() {
             return Err(err(line_no, "screen block requires at least one node"));
         }
-        Ok((ScreenDef { name, body }, consumed))
+        Ok((
+            ScreenDef {
+                name,
+                body,
+                file: None,
+            },
+            consumed,
+        ))
     }
 
     /// Parse an indented screen-statement block (also the sub-block of

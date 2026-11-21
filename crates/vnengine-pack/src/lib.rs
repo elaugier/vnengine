@@ -6,6 +6,7 @@
 //! manifest.json      format version, engine, title, asset index (sha256)
 //! config.json        the project's EngineConfig
 //! script/main.vnb    the compiled script (JSON-serialized AST)
+//! <path>.vn          raw .vn sources actually parsed (entry + imports)
 //! assets/<dir>/...   images, audio, voice — mirroring the project dirs
 //! licenses/...       license and notice files, if present in the project
 //! ```
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use vnengine_core::assets::{sanitize_rel, AssetSource};
 use vnengine_core::EngineConfig;
 use vnengine_script::ast::Script;
-use vnengine_script::lint::{check_source, Diagnostic, LintOptions, Severity};
+use vnengine_script::lint::{Diagnostic, LintOptions, Severity};
 use vnengine_script::Parser as ScriptParser;
 use zip::write::SimpleFileOptions;
 
@@ -304,12 +305,32 @@ pub fn check(project: &Path) -> Result<CheckReport> {
         .collect();
 
     let mut labels = None;
-    let diags = check_source(&source, &config, Some(&asset_set), &LintOptions::default());
-    if !diags.iter().any(|d| d.severity == Severity::Error) {
-        labels = ScriptParser::parse(&source).ok().map(|s| s.labels.len());
+    // Multi-file lint: resolve imports against the project root so labels
+    // and assets referenced in imported files are checked too.
+    let root = project.to_path_buf();
+    let mut resolver = |resolved: &str, _cur: &str| -> Result<String, String> {
+        let p = root.join(resolved);
+        fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))
+    };
+    let diags = vnengine_script::lint::check_source_multi(
+        &source,
+        &script_rel,
+        &mut resolver,
+        &config,
+        Some(&asset_set),
+        &LintOptions::default(),
+    );
+    if !diags.iter().any(|(_, d)| d.severity == Severity::Error) {
+        let mut res2 = |resolved: &str, _cur: &str| -> Result<String, String> {
+            let p = root.join(resolved);
+            fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))
+        };
+        labels = ScriptParser::parse_multi(&source, &script_rel, &mut res2)
+            .ok()
+            .map(|s| s.labels.len());
     }
-    diagnostics.extend(diags.into_iter().map(|d| FileDiagnostic {
-        file: script_rel.clone(),
+    diagnostics.extend(diags.into_iter().map(|(file, d)| FileDiagnostic {
+        file,
         diagnostic: d,
     }));
 
@@ -373,10 +394,25 @@ pub fn validate(project: &Path) -> Result<()> {
 /// entries are sorted and timestamps fixed at the zip epoch.
 pub fn build(project: &Path, output: &Path) -> Result<()> {
     let config = load_config(project)?;
+    let entry_rel =
+        vnengine_script::parser::normalize_rel_path(&config.entry_script.replace('\\', "/"));
     let script_path = project.join(&config.entry_script);
     let source = fs::read_to_string(&script_path)
         .with_context(|| format!("failed to read {}", script_path.display()))?;
-    let script = ScriptParser::parse(&source)
+    // Multi-file parse: resolve `import` directives against the project
+    // root. The serialized .vnb is the merged AST, so packages run without
+    // re-parsing. The raw .vn sources the parse actually read are shipped
+    // alongside under their project-relative path, for traceability.
+    let root = project.to_path_buf();
+    let mut imported: Vec<String> = Vec::new();
+    let mut resolver = |resolved: &str, _cur: &str| -> Result<String, String> {
+        if !imported.iter().any(|r| r == resolved) {
+            imported.push(resolved.to_string());
+        }
+        let p = root.join(resolved);
+        fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))
+    };
+    let script = ScriptParser::parse_multi(&source, &entry_rel, &mut resolver)
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", script_path.display()))?;
     let script_bytes = serde_json::to_vec_pretty(&script)?;
     let config_bytes = serde_json::to_vec_pretty(&config)?;
@@ -394,6 +430,18 @@ pub fn build(project: &Path, output: &Path) -> Result<()> {
             members.insert(format!("assets/{dir}/{rel}"), fs::read(fs_path)?);
             Ok(())
         })?;
+    }
+    // Ship only the .vn sources the parse actually read (entry + resolved
+    // imports), under their project-relative paths. `or_insert` keeps a
+    // stray `.vn` import from clobbering a real member (e.g. assets/).
+    members
+        .entry(entry_rel.clone())
+        .or_insert_with(|| source.into_bytes());
+    for rel in &imported {
+        let path = root.join(rel);
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        members.entry(rel.clone()).or_insert(bytes);
     }
     // WASM plugins + their manifests ship under assets/plugins/.
     let plugins_root = project.join("plugins");

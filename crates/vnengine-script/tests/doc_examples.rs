@@ -23,10 +23,15 @@ fn extract_vn_blocks(md: &str) -> Vec<String> {
     blocks
 }
 
-/// Parse `src` as a complete script; if that fails, retry as the body of
-/// a synthetic label (most snippets are statements, not top-level items).
+/// Parse `src` as a complete script (with multi-file import support; the
+/// resolver rejects imports, which is fine — doc snippets only need to be
+/// syntactically valid); if that fails, retry as the body of a synthetic
+/// label (most snippets are statements, not top-level items).
 fn parse_snippet(src: &str) -> Result<(), String> {
-    if let Err(e) = Parser::parse(src) {
+    // Imports in doc snippets resolve to an empty file: only the syntax
+    // of the block itself is validated.
+    let mut empty_imports = |_: &str, _: &str| -> Result<String, String> { Ok(String::new()) };
+    if let Err(e) = Parser::parse_multi(src, "doc_snippet.vn", &mut empty_imports) {
         // Keep the original error for reporting if the body retry fails.
         let original = e.to_string();
         return parse_as_body(src)
@@ -46,7 +51,8 @@ fn parse_as_body(src: &str) -> Result<(), String> {
             wrapped.push('\n');
         }
     }
-    Parser::parse(&wrapped)
+    let mut empty_imports = |_: &str, _: &str| -> Result<String, String> { Ok(String::new()) };
+    Parser::parse_multi(&wrapped, "doc_snippet.vn", &mut empty_imports)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }

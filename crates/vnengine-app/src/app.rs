@@ -129,10 +129,13 @@ pub struct App {
     last_layers: std::collections::BTreeMap<String, vnengine_core::save::MusicLayerState>,
     /// Sandboxed WASM plugins (None if the project ships none).
     pub plugins: Option<vnengine_plugins::PluginHost>,
-    /// Script file to watch for hot reload (loose project only).
-    script_path: Option<PathBuf>,
-    /// Last seen modification time of `script_path`.
-    script_mtime: Option<std::time::SystemTime>,
+    /// Script files to watch for hot reload (entry first, then imports).
+    /// Empty = no hot reload (packages).
+    script_files: Vec<PathBuf>,
+    /// Project-relative path of the entry script (for re-parsing imports).
+    entry_rel: String,
+    /// Last seen modification times of `script_files`.
+    script_mtimes: Vec<std::time::SystemTime>,
     /// Polling accumulator for the file watcher.
     watch_timer: f32,
     /// Studio debug overlay (F8): variables, scene and audio state.
@@ -209,29 +212,47 @@ impl App {
     /// Create and run the application on a loose project directory.
     /// This blocks until the window closes.
     pub fn run(config: EngineConfig, project_root: PathBuf) -> anyhow::Result<()> {
+        let entry_rel = config.entry_script.replace('\\', "/");
         let script_path = project_root.join(&config.entry_script);
         let script_src = std::fs::read_to_string(&script_path)?;
-        let script = Parser::parse(&script_src)?;
+        // Multi-file parse: `import` directives are resolved relative to
+        // the project root. Record every imported file for hot reload.
+        let root = project_root.clone();
+        let mut imported: Vec<String> = Vec::new();
+        let mut resolver = |resolved: &str, _cur: &str| -> Result<String, String> {
+            if !imported.contains(&resolved.to_string()) {
+                imported.push(resolved.to_string());
+            }
+            let p = root.join(resolved);
+            std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))
+        };
+        let script = Parser::parse_multi(&script_src, &entry_rel, &mut resolver)?;
+        // Watch the entry first, then every imported file (absolute paths).
+        let mut watch = vec![script_path];
+        for rel in &imported {
+            watch.push(project_root.join(rel));
+        }
         let save_root = project_root.clone();
         Self::run_source(
             config,
             Box::new(DirAssets(project_root)),
             save_root,
             script,
-            Some(script_path),
+            watch,
         )
     }
 
     /// Create and run the application with an arbitrary asset source
     /// (directory or package) and an already-loaded script.
-    /// `watch` enables hot reload: when the given script file's mtime
-    /// changes, it is re-parsed and swapped into the runtime in place.
+    /// `watch` enables hot reload: when any of the given script files'
+    /// mtime changes, the entry script (and its import tree) is re-parsed
+    /// and swapped into the runtime in place. Empty = no hot reload.
     pub fn run_source(
         config: EngineConfig,
         assets: Box<dyn AssetSource>,
         save_root: PathBuf,
         script: Script,
-        watch: Option<PathBuf>,
+        watch: Vec<PathBuf>,
     ) -> anyhow::Result<()> {
         let event_loop = winit::event_loop::EventLoop::new()?;
         let title = config.title.clone();
@@ -336,6 +357,7 @@ impl App {
         plugins.init_all(&mut runtime.plugin_kv);
         let plugins = (!plugins.is_empty()).then_some(plugins);
 
+        let entry_rel = config.entry_script.replace('\\', "/");
         let app = App {
             config,
             assets,
@@ -351,12 +373,17 @@ impl App {
             transition: None,
             last_bgm: None,
             last_layers: std::collections::BTreeMap::new(),
-            script_mtime: watch
-                .as_ref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .and_then(|m| m.modified().ok()),
+            script_mtimes: watch
+                .iter()
+                .map(|p| {
+                    std::fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                })
+                .collect(),
             watch_timer: 0.0,
-            script_path: watch,
+            entry_rel,
+            script_files: watch,
             debug_overlay: false,
             debug_label: 0,
             locales: Vec::new(),
@@ -733,34 +760,93 @@ impl App {
     /// place when it changes. Parse errors keep the old script —
     /// development never crashes on a half-saved file.
     fn poll_hot_reload(&mut self, dt: f32) {
-        let Some(path) = &self.script_path else {
+        if self.script_files.is_empty() {
             return;
-        };
+        }
         self.watch_timer += dt;
         if self.watch_timer < 0.5 {
             return;
         }
         self.watch_timer = 0.0;
-        let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
-            return;
-        };
-        if self.script_mtime == Some(mtime) {
+        // Check every watched file (entry + imports) for mtime changes.
+        let mut changed = false;
+        for (i, path) in self.script_files.iter().enumerate() {
+            let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+                continue;
+            };
+            if self.script_mtimes.get(i) != Some(&mtime) {
+                self.script_mtimes[i] = mtime;
+                changed = true;
+            }
+        }
+        if !changed {
             return;
         }
-        self.script_mtime = Some(mtime);
-        match std::fs::read_to_string(path)
+        // Re-parse the whole import tree from the entry file.
+        let entry_path = self.script_files[0].clone();
+        let entry_rel = self.entry_rel.clone();
+        let root = self.save_root.clone();
+        let mut imported: Vec<String> = Vec::new();
+        let mut resolver = |resolved: &str, _cur: &str| -> Result<String, String> {
+            if !imported.contains(&resolved.to_string()) {
+                imported.push(resolved.to_string());
+            }
+            let p = root.join(resolved);
+            std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))
+        };
+        match std::fs::read_to_string(&entry_path)
             .map_err(|e| e.to_string())
-            .and_then(|src| Parser::parse(&src).map_err(|e| format!("{e:?}")))
-        {
+            .and_then(|src| {
+                Parser::parse_multi(&src, &entry_rel, &mut resolver).map_err(|e| format!("{e}"))
+            }) {
             Ok(script) => {
+                self.update_script_watch(&imported, false);
                 self.runtime.reload_script(script.clone());
                 self.renderer.default_font = script.font_default.clone();
                 self.script = script;
                 // Edited image files reload too.
                 self.renderer.textures.clear();
-                log::info!("hot reload: {}", path.display());
+                log::info!("hot reload: {}", entry_path.display());
             }
-            Err(e) => log::warn!("hot reload skipped — script error: {e}"),
+            Err(e) => {
+                // The parse died partway through the import tree: keep
+                // every file already watched AND follow the imports
+                // resolved before the error, so a newly added (still
+                // broken) `import` triggers a retry when edited.
+                self.update_script_watch(&imported, true);
+                log::warn!("hot reload skipped — script error: {e}");
+            }
+        }
+    }
+
+    /// Refresh the hot-reload watch list: entry file first, then each
+    /// project-relative path in `imported` resolved under `save_root`.
+    /// With `keep_missing`, currently watched files absent from
+    /// `imported` stay watched — used when a re-parse failed before it
+    /// could visit the whole import tree.
+    fn update_script_watch(&mut self, imported: &[String], keep_missing: bool) {
+        let mut watch = vec![self.script_files[0].clone()];
+        for rel in imported {
+            watch.push(self.save_root.join(rel));
+        }
+        if keep_missing {
+            for p in self.script_files.iter().skip(1) {
+                if !watch.contains(p) {
+                    watch.push(p.clone());
+                }
+            }
+        }
+        if watch != self.script_files {
+            self.script_files = watch;
+            self.script_mtimes = self
+                .script_files
+                .iter()
+                .map(|p| {
+                    std::fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                })
+                .collect();
         }
     }
 

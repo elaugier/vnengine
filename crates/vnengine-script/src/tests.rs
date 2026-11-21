@@ -3017,3 +3017,164 @@ fn legacy_screen_nodes_deserialize_without_font() {
     }
     assert!(serde_json::from_value::<crate::ast::Script>(json).is_ok());
 }
+
+#[test]
+fn parse_multi_simple_import() {
+    use std::collections::HashMap;
+    let mut files: HashMap<String, String> = HashMap::new();
+    files.insert(
+        "script/main.vn".to_string(),
+        r#"import "chapters/ch2.vn"
+label start:
+    end
+"#
+        .to_string(),
+    );
+    files.insert(
+        "script/chapters/ch2.vn".to_string(),
+        r#"label ch2:
+    end
+"#
+        .to_string(),
+    );
+    let mut resolver = |resolved: &str, _cur: &str| -> Result<String, String> {
+        files
+            .get(resolved)
+            .cloned()
+            .ok_or_else(|| format!("not found: {resolved}"))
+    };
+    let script = Parser::parse_multi(
+        files.get("script/main.vn").unwrap(),
+        "script/main.vn",
+        &mut resolver,
+    )
+    .unwrap();
+    let names: Vec<&str> = script.labels.iter().map(|l| l.name.as_str()).collect();
+    assert!(names.contains(&"start"));
+    assert!(names.contains(&"ch2"));
+}
+
+#[test]
+fn parse_multi_cycle_detected() {
+    use std::collections::HashMap;
+    let mut files: HashMap<String, String> = HashMap::new();
+    files.insert(
+        "a.vn".to_string(),
+        "import \"b.vn\"\nlabel a:\n    end\n".to_string(),
+    );
+    files.insert(
+        "b.vn".to_string(),
+        "import \"a.vn\"\nlabel b:\n    end\n".to_string(),
+    );
+    let mut resolver = |resolved: &str, _cur: &str| -> Result<String, String> {
+        files
+            .get(resolved)
+            .cloned()
+            .ok_or_else(|| format!("nf {resolved}"))
+    };
+    let err = Parser::parse_multi(files.get("a.vn").unwrap(), "a.vn", &mut resolver).unwrap_err();
+    assert!(err.message().contains("cycle"), "got: {}", err.message());
+}
+
+#[test]
+fn parse_multi_dedup_diamond() {
+    use std::collections::HashMap;
+    let mut files: HashMap<String, String> = HashMap::new();
+    files.insert(
+        "a.vn".to_string(),
+        "import \"b.vn\"\nimport \"c.vn\"\nlabel a:\n    end\n".to_string(),
+    );
+    files.insert(
+        "b.vn".to_string(),
+        "import \"d.vn\"\nlabel b:\n    end\n".to_string(),
+    );
+    files.insert(
+        "c.vn".to_string(),
+        "import \"d.vn\"\nlabel c:\n    end\n".to_string(),
+    );
+    files.insert("d.vn".to_string(), "label d:\n    end\n".to_string());
+    let mut resolver = |resolved: &str, _cur: &str| -> Result<String, String> {
+        files
+            .get(resolved)
+            .cloned()
+            .ok_or_else(|| format!("nf {resolved}"))
+    };
+    let script = Parser::parse_multi(files.get("a.vn").unwrap(), "a.vn", &mut resolver).unwrap();
+    let d_count = script.labels.iter().filter(|l| l.name == "d").count();
+    assert_eq!(d_count, 1, "d.vn must be included exactly once");
+}
+
+#[test]
+fn parse_multi_missing_file() {
+    let mut resolver = |resolved: &str, _cur: &str| -> Result<String, String> {
+        Err(format!("not found: {resolved}"))
+    };
+    let err = Parser::parse_multi(
+        "import \"nope.vn\"\nlabel start:\n    end\n",
+        "main.vn",
+        &mut resolver,
+    )
+    .unwrap_err();
+    assert!(
+        err.message().contains("cannot import"),
+        "got: {}",
+        err.message()
+    );
+    assert_eq!(err.file(), Some("main.vn"));
+}
+
+#[test]
+fn parse_single_file_import_is_error() {
+    let err = Parser::parse("import \"x.vn\"\nlabel start:\n    end\n").unwrap_err();
+    assert!(
+        err.message().contains("parse_multi"),
+        "got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn check_source_multi_attributes_warnings_to_origin_file() {
+    use std::collections::HashMap;
+    use vnengine_core::EngineConfig;
+    let mut files: HashMap<String, String> = HashMap::new();
+    // Both files jump to the same missing label — each warning must be
+    // reported in the file it was written in, not the first file whose
+    // source happens to contain the needle.
+    files.insert(
+        "a.vn".to_string(),
+        "import \"b.vn\"\nlabel start:\n    jump ghost\n    end\n".to_string(),
+    );
+    files.insert(
+        "b.vn".to_string(),
+        "label other:\n    jump ghost\n    end\n".to_string(),
+    );
+    let mut resolver = |resolved: &str, _cur: &str| -> Result<String, String> {
+        files
+            .get(resolved)
+            .cloned()
+            .ok_or_else(|| format!("nf {resolved}"))
+    };
+    let config = EngineConfig::default();
+    let diags = crate::lint::check_source_multi(
+        files.get("a.vn").unwrap(),
+        "a.vn",
+        &mut resolver,
+        &config,
+        None,
+        &crate::lint::LintOptions::default(),
+    );
+    let mut ghost: Vec<&str> = diags
+        .iter()
+        .filter(|(_, d)| d.message.contains("ghost"))
+        .map(|(f, _)| f.as_str())
+        .collect();
+    ghost.sort_unstable();
+    assert_eq!(ghost, ["a.vn", "b.vn"], "diagnostics: {diags:?}");
+    // The unreachable `other` label is reported in b.vn, where it is
+    // defined.
+    let other = diags
+        .iter()
+        .find(|(_, d)| d.message.contains("unreachable label `other`"));
+    assert_eq!(other.map(|(f, _)| f.as_str()), Some("b.vn"));
+}

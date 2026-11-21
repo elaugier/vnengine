@@ -67,6 +67,10 @@ pub struct AchievementDef {
 pub struct ScreenDef {
     pub name: String,
     pub body: Vec<ScreenStmt>,
+    /// Project-relative source file this screen was parsed from
+    /// (`Parser::parse_multi` only — `None` for single-file parses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// A statement inside a `screen` block. `if`/`for` are expanded at
@@ -253,6 +257,10 @@ pub struct Label {
     #[serde(default)]
     pub params: Vec<String>,
     pub body: Vec<Stmt>,
+    /// Project-relative source file this label was parsed from
+    /// (`Parser::parse_multi` only — `None` for single-file parses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// A statement.

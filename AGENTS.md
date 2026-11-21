@@ -25,7 +25,9 @@
 - `vnengine-plugins`: sandboxed WASM plugins (wasmtime 48)
 - `vnengine-lint-wasm`: no-bindgen `cdylib` exposing the linter to JS
   (`vn_alloc`/`vn_free`/`vn_lint`/`vn_result_ptr`/`vn_result_len`; JSON
-  in/out). Used by `editors/vscode`.
+  in/out). Used by `editors/vscode`. Request `file` + `files` (path →
+  source map) enable multi-file lint: `import` resolves through `files`
+  and each returned diagnostic carries its `file` of origin.
 
 ## Distribution
 - `scripts/package-kit.sh <bin_dir> <name> <exe_ext>` assembles the
@@ -37,8 +39,11 @@
 - `editors/vscode` is plain CommonJS (no build step): TextMate grammar,
   diagnostics via the embedded WASM linter (`vnengine.diagnostics=wasm`,
   default) or `vnengine-pack --check-only --json` (`binary`), and
-  Run/Validate/Package commands. Rebuild `media/vnengine-lint.wasm`
-  after changing `vnengine-script`'s parser or `lint`.
+  Run/Validate/Package commands. WASM mode gathers the `import` closure
+  in JS (open documents first, then disk) and sends a `files` source map;
+  per-file diagnostics are spread across documents. Rebuild
+  `media/vnengine-lint.wasm` after changing `vnengine-script`'s parser or
+  `lint`.
 - `crates/vnengine-script/tests/doc_examples.rs` parses every ```vn
   block in `docs/DSL_REFERENCE.md` — keep doc examples valid.
 
@@ -81,9 +86,10 @@
 - Named audio channels (Phase 4): `play channel <n> <track> [volume=<e>] [fade=<e>] [loop]` replaces the channel and clears its queue; `queue channel <n> <track> [...] ` appends (starts immediately when idle); `stop channel <n> [fade=<e>]`; `stop all [fade=<e>]` (channels + music + voice); `volume channel <n> <e> [fade=<e>]`; `filter channel <n> lowpass|highpass|bandpass|notch [cutoff=<e>] [resonance=<e>] [mix=<e>]` / `reverb [feedback=<e>] [damping=<e>] [width=<e>] [mix=<e>]` / `off`. Channel name is literal ident/string or `[expr]`. `Runtime::channels` (`ChannelState{current,queue,volume,filter}`) is serialized in saves/rollback; the app's per-frame `resync_channels` diffs it into kira sub-tracks (each carrying a bypassed filter+reverb retuned live via handles), and `Runtime::channel_advance` pops the queue when the host sees a non-looping track end. `settings.voice_duck` (0.5) ducks BGM+stems while a voice line plays (`AudioEngine::update`).
 - Lvalue assignment (Phase 5): `set`/`$` and `set <t> op= <e>` accept dict/list targets, not just names — `$ d.k = v`, `$ d["k"] = v`, `$ list[i] += 1`, `$ list[-1] = v` (index out of range errors). Screen-button `set` actions accept the same targets.
 - Persistent store & achievements (Phase 5): `persistent` is a dict auto-injected into VM variables — mutations via lvalue assigns live outside saves and are never reverted by rollback (the runtime re-injects it after every snapshot restore; `persistent_dirty`/`mark_persistent_clean` drive host flushing). `achievements` is an injected list of granted names (`in`/`has` checks). `achievement <name> ["desc"]` declares achievements at top level; `grant <name>` / `grant [expr]` emits `Command::Grant` (error on undeclared names), the runtime records it and the app shows a toast. The app loads `persistent.json` (`{vars, achievements}`) from `save_root/save_dir` at startup via `Runtime::set_persistent`, flushes when dirty and on close.
-- Lint (Phase 5): `--check-only`/build runs `vnengine_script::lint` — warns on missing `scene`/`show`/`play`/`screen`-image assets (literal paths only), `jump`/`call` to unknown labels (literal only), and unused screens/transforms/achievements/defaults; unknown `with` transitions and unknown `grant` names too. Warnings carry a `needle` resolved to `line`/`col`/`span` against the source (`check_source`); `--check-only --json` emits a `CheckReport` (`{ok,title,labels,assets,licenses,diagnostics}`) consumed by the VS Code extension's `binary` mode.
+- Multi-file scripts: top-level `import "<path>"` (string literal, `.vn` path relative to the importing file, normalized lexically — `..` cannot escape the project root). `Parser::parse_multi(src, entry_rel, resolver)` resolves recursively through `resolver(resolved, importer)`, dedups by canonical path (include guard), and reports cycles with the full chain; `Parser::parse` rejects `import`. `Label.file`/`ScreenDef.file` record the parsed-from path. Pack ships only the sources the parse actually read (under their project-relative paths); the app's watch list covers entry + imports.
+- Lint (Phase 5): `--check-only`/build runs `vnengine_script::lint` — warns on missing `scene`/`show`/`play`/`screen`-image assets (literal paths only), `jump`/`call` to unknown labels (literal only), and unused screens/transforms/achievements/defaults; unknown `with` transitions and unknown `grant` names too. Warnings carry a `needle` resolved to `line`/`col`/`span` against the source (`check_source`); `check_source_multi` attributes each warning to its AST item's file of origin (`LintWarning.file` ← `Label.file`/`ScreenDef.file`), never first-match across files. `--check-only --json` emits a `CheckReport` (`{ok,title,labels,assets,licenses,diagnostics}` with per-diagnostic `file`) consumed by the VS Code extension's `binary` mode.
 - Studio overlay: F8 (`Action::Debug`, `debug_panel`) shows frame/label, vars, camera/lights, sprites, music layers, plugin KV. `[`/`]` pick a label, F10 (`DebugJump`) calls `Runtime::jump_to_label` — stack reset to the label body, pause cleared, journal untouched (dev action, not replayable).
-- Hot reload: dir mode watches `entry_script` mtime (~2 Hz, `poll_hot_reload`); on change, `Runtime::reload_script` swaps the script while preserving the execution point (label frames re-resolve by name; parse errors keep the old script). Textures are invalidated via `TextureCache::clear`. `run_source` takes `watch: Option<PathBuf>` — packages pass `None`. Vertex lighting via `light_at`; `parallax(layer)` gives per-layer camera depth. All in `Scene` → serialized.
+- Hot reload: dir mode watches `entry_script` + every imported file's mtime (~2 Hz, `poll_hot_reload`); on change, the import tree is re-parsed and `Runtime::reload_script` swaps the script while preserving the execution point (label frames re-resolve by name; parse errors keep the old script). The watch list is rebuilt from the imports seen: replaced on success, unioned on failure so a newly added (still broken) `import` keeps triggering retries (`update_script_watch`). Textures are invalidated via `TextureCache::clear`. `run_source` takes `watch: Option<PathBuf>` — packages pass `None`. Vertex lighting via `light_at`; `parallax(layer)` gives per-layer camera depth. All in `Scene` → serialized.
 - Assets are read through `AssetSource` (`DirAssets` in dev, `Package` in .vnpkg) — never hardcode `project_root.join(...)` for assets; saves/settings still live under `save_root` on disk.
 - i18n/a11y: `translations/<lang>.json` maps original text → localized text (demo ships `fr.json`); `settings.language` cycles shipped locales, `App::tr` translates Say/Narrate/speaker/menu strings at dispatch (identity when absent). `settings.text_scale` scales every `UiText.font_size` in `build_ui`; `settings.reduce_motion` flattens scene/sprite/camera animations to their end state and drops `shake`/`PlayTransition` in `apply_effect`. Translation dirs are packed via `asset_dirs` in vnengine-pack.
 

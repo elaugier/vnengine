@@ -14,18 +14,24 @@
 //! ```json
 //! {
 //!   "source": "label start: ...",
+//!   "file": "script/main.vn (optional — enables multi-file lint)",
+//!   "files": {"script/ch1.vn": "label ch1: ... (import candidates)"},
 //!   "project_toml": "title = \"...\" (optional raw project.toml text)",
 //!   "assets": ["images/bg.png", "audio/theme.ogg"]
 //! }
 //! ```
-//! Response JSON: `{ "diagnostics": [Diagnostic, ...] }` where each entry
-//! is the [`vnengine_script::lint::Diagnostic`] shape (`severity`,
-//! `message`, optional `line`/`col`/`span`).
+//! When `file` is present, `import` directives resolve through `files`
+//! (the host gathers the import closure — open documents first, then
+//! disk). Response JSON: `{ "diagnostics": [Diagnostic, ...] }` where
+//! each entry is the [`vnengine_script::lint::Diagnostic`] shape
+//! (`severity`, `message`, optional `line`/`col`/`span`) plus, in
+//! multi-file mode, a `file` field naming the source it was found in.
 
 use serde::Deserialize;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use vnengine_core::EngineConfig;
-use vnengine_script::lint::{check_source, LintOptions};
+use vnengine_script::lint::{check_source, check_source_multi, LintOptions};
 
 thread_local! {
     static OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -35,6 +41,14 @@ thread_local! {
 struct LintRequest {
     /// Full text of the `.vn` file being edited.
     source: String,
+    /// Project-relative path of `source` (e.g. `script/main.vn`). When
+    /// present, `import` directives are resolved through `files`.
+    #[serde(default)]
+    file: Option<String>,
+    /// Import candidates gathered by the host: project-relative path →
+    /// source text. Missing entries fail the import with a parse error.
+    #[serde(default)]
+    files: BTreeMap<String, String>,
     /// Raw `project.toml` text, when the file lives inside a project.
     /// Absent → "loose file" mode: default config, speaker checks off.
     #[serde(default)]
@@ -132,7 +146,33 @@ fn run_lint(req: LintRequest) -> Vec<u8> {
     } else {
         None
     };
-    let diagnostics = check_source(&req.source, &config, asset_set, &opts);
+    let diagnostics: Vec<serde_json::Value> = match &req.file {
+        // Project mode: resolve `import` through the host-provided
+        // sources and report each diagnostic with its file of origin.
+        Some(entry) => {
+            let files = req.files;
+            let mut resolver = |resolved: &str, _cur: &str| -> Result<String, String> {
+                files
+                    .get(resolved)
+                    .cloned()
+                    .ok_or_else(|| format!("{resolved}: not provided by host"))
+            };
+            check_source_multi(&req.source, entry, &mut resolver, &config, asset_set, &opts)
+                .into_iter()
+                .map(|(file, d)| {
+                    let mut v = serde_json::to_value(&d).unwrap_or_default();
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("file".to_string(), file.into());
+                    }
+                    v
+                })
+                .collect()
+        }
+        None => check_source(&req.source, &config, asset_set, &opts)
+            .into_iter()
+            .map(|d| serde_json::to_value(&d).unwrap_or_default())
+            .collect(),
+    };
     serde_json::json!({ "diagnostics": diagnostics })
         .to_string()
         .into_bytes()
